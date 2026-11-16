@@ -12,6 +12,8 @@ All notable changes to this project are documented here. Versions follow `0.x.y`
 - Visible startup progress: the UI opens immediately, probes `sf` in the background with short
   timeouts, and caches the command catalog for seven days.
 - Key labels and an Actions bar on every screen, plus a simplified one-line catalog.
+- Responsive layout: compact panes below 105x30 and a single-column mode below 72x20 for
+  VS Code/Zed terminal panels; rendering verified down to 48x12.
 
 ### Fixed
 

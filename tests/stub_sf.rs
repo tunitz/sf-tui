@@ -180,12 +180,50 @@ fn every_screen_renders_without_panicking() {
         status: None,
         json: Some(serde_json::json!({"result":{"status":"ok"}})),
     });
-    let mut terminal = Terminal::new(TestBackend::new(120, 40)).expect("terminal");
-    for tab in app.tabs() {
-        app.tab = tab;
-        terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
-        let buffer = terminal.backend().buffer();
-        assert!(buffer.content.iter().any(|cell| cell.symbol() != " "));
+    for (width, height) in [(120, 40), (80, 24), (60, 16), (48, 12)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        for tab in app.tabs() {
+            app.tab = tab;
+            terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+            let buffer = terminal.backend().buffer();
+            let rendered: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(
+                rendered.trim().len() > 20,
+                "empty frame at {width}x{height} on {tab:?}"
+            );
+            if (width, height) == (60, 16) && tab == sftui::app::Tab::Home {
+                assert!(rendered.contains("[a] Log in"), "quick actions missing");
+                assert!(rendered.contains("Home"), "current tab missing");
+            }
+        }
+        for modal in [
+            sftui::app::Modal::Help,
+            sftui::app::Modal::Message {
+                title: "Notice".to_owned(),
+                message: "Synthetic modal".to_owned(),
+            },
+            sftui::app::Modal::Confirm {
+                title: "Confirm".to_owned(),
+                message: "Synthetic confirmation".to_owned(),
+                action: sftui::app::PendingAction::None,
+            },
+            sftui::app::Modal::Prompt {
+                title: "Prompt".to_owned(),
+                kind: sftui::app::PromptKind::TargetOrg,
+                fields: vec![
+                    sftui::app::PromptField::new("First", "value one"),
+                    sftui::app::PromptField::new("Second", "value two"),
+                    sftui::app::PromptField::new("Third", "value three"),
+                ],
+                focus: 0,
+            },
+        ] {
+            app.modal = Some(modal);
+            terminal
+                .draw(|frame| ui::draw(frame, &app))
+                .expect("draw modal");
+        }
+        app.modal = None;
     }
 }
 

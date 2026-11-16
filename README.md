@@ -56,6 +56,11 @@ For a nonstandard location, set `SFTUI_SF_PATH` to the full path of the executab
 Every screen shows a compact **Actions** bar with keys and labels. `Tab` cycles screens, digits
 `1`–`7` jump directly, `?` opens the full key map and `q` quits.
 
+The layout adapts to the terminal: below 105 columns or 30 rows it collapses side-by-side panes
+and trims the header; below 72 columns or 20 rows it becomes a single column with a one-line
+header and status bar, aimed at VS Code and Zed terminal panels. Rendering is tested down to
+48x12.
+
 | Screen | Keys |
 | --- | --- |
 | Home | `a` log in · `r` retrieve · `d` deploy · `t` run Apex tests · `g` get test results |

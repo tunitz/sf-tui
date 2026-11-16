@@ -35,7 +35,9 @@ description: How this repository structures its ratatui/crossterm event loop, ap
 - One top-level `draw()` splits the frame into header, active screen and status/footer, then draws
   a centered `Clear` overlay when a modal is open.
 - Never render outside the frame area. Derive all widths from `Rect` and clamp scroll offsets and
-  list selections before use.
+  list selections before use. Compute density from the frame: Roomy (>=105x30), Compact
+  (<105x30), Tiny (<72x20). Compact/Tiny collapse side panels into one column, shrink the header
+  and footer, and truncate secondary text; `draw` tests cover 120x40, 80x24, 60x16 and 48x12.
 - Highlight with one accent color from config; use dim gray for secondary information and reserve
   red for errors and yellow for warnings. Keep stderr in a distinct color.
 - Do not display credentials or tokens even when the CLI returns them; filter them in the parser.

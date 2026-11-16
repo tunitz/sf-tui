@@ -16,6 +16,36 @@ fn accent(app: &App) -> Color {
     app.accent()
 }
 
+/// Layout density for embedded terminals (VS Code, Zed, split panes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Density {
+    Tiny,
+    Compact,
+    Roomy,
+}
+
+fn density(area: Rect) -> Density {
+    if area.width < 72 || area.height < 20 {
+        Density::Tiny
+    } else if area.width < 105 || area.height < 30 {
+        Density::Compact
+    } else {
+        Density::Roomy
+    }
+}
+
+fn short_tab(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Home => "Home",
+        Tab::Catalog => "Cat",
+        Tab::Favorites => "Fav",
+        Tab::Orgs => "Orgs",
+        Tab::Deploy => "Dep",
+        Tab::Output => "Out",
+        Tab::Setup => "Setup",
+    }
+}
+
 fn block(title: impl Into<String>, app: &App) -> Block<'static> {
     Block::bordered()
         .title(title.into())
@@ -48,10 +78,16 @@ fn truncated(text: &str, max: usize) -> String {
 
 /// Draw the complete frame, including any modal overlay.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let density = density(frame.area());
+    let (header_height, footer_height) = match density {
+        Density::Roomy => (4, 3),
+        Density::Compact => (2, 2),
+        Density::Tiny => (1, 1),
+    };
     let layout = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(header_height),
+        Constraint::Min(1),
+        Constraint::Length(footer_height),
     ])
     .split(frame.area());
     draw_header(frame, layout[0], app);
@@ -64,13 +100,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tab::Output => draw_output(frame, layout[1], app),
         Tab::Setup => draw_setup(frame, layout[1], app),
     }
-    draw_footer(frame, layout[2], app);
+    draw_footer(frame, layout[2], app, density);
     if let Some(modal) = &app.modal {
         draw_modal(frame, modal, app);
     }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    if density != Density::Roomy {
+        draw_compact_header(frame, area, app, density);
+        return;
+    }
     let version = app.startup.version.as_deref().unwrap_or("detecting…");
     let project = app
         .deploy_state
@@ -130,7 +171,85 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(tabs, inner[1]);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, density: Density) {
+    let spinner = ["-", "\\", "|", "/"][app.spinner_tick() % 4];
+    let activity = if !app.startup_stage.done {
+        format!("{spinner} {}", app.startup_stage.label)
+    } else if app.busy() {
+        format!(
+            "{spinner} {}",
+            app.active_job_label()
+                .unwrap_or_else(|| "running".to_owned())
+        )
+    } else {
+        "ready".to_owned()
+    };
+    if density == Density::Tiny {
+        let text = format!(
+            "SFTUI {} | sf {} | {activity}",
+            short_tab(app.tab),
+            app.startup.version.as_deref().unwrap_or("...")
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(strong(
+                truncated(&text, area.width.saturating_sub(1) as usize),
+                accent(app),
+            ))),
+            area,
+        );
+        return;
+    }
+    let info = Line::from(vec![
+        strong("SFTUI", accent(app)),
+        faint(format!(
+            " v{} | sf {} | {activity}",
+            env!("CARGO_PKG_VERSION"),
+            app.startup.version.as_deref().unwrap_or("...")
+        )),
+    ]);
+    let mut tabs = vec![faint("Tab:").clone()];
+    for (index, tab) in app.tabs().into_iter().enumerate() {
+        if index > 0 {
+            tabs.push(faint(" ").clone());
+        }
+        let label = format!("[{}]{}", index + 1, short_tab(tab));
+        tabs.push(Span::styled(
+            label,
+            if tab == app.tab {
+                Style::default()
+                    .fg(accent(app))
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::default().fg(Color::Gray)
+            },
+        ));
+    }
+    frame.render_widget(Paragraph::new(info), Rect { height: 1, ..area });
+    frame.render_widget(
+        Paragraph::new(Line::from(tabs)),
+        Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        },
+    );
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
+    if density != Density::Roomy {
+        let style = if app.status_error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let text = if app.status.is_empty() {
+            key_hints(app)
+        } else {
+            truncated(&app.status, area.width.saturating_sub(1) as usize)
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+        return;
+    }
     let status_style = if app.status_error {
         Style::default().fg(Color::Red)
     } else {
@@ -185,6 +304,80 @@ fn action_bar<'a>(items: Vec<(&'a str, &'a str)>, app: &App) -> Line<'a> {
 }
 
 fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    if density != Density::Roomy {
+        let compact = density == Density::Compact;
+        let rows = Layout::vertical([
+            Constraint::Length(if compact { 3 } else { 7 }),
+            Constraint::Min(3),
+        ])
+        .split(area);
+        let items: Vec<ListItem> = crate::app::QUICK_ACTIONS
+            .iter()
+            .map(|action| {
+                let mut line = vec![
+                    strong(format!("[{}] ", action.key), accent(app)),
+                    strong(action.label, Color::White),
+                ];
+                if compact {
+                    line.push(faint(truncated(
+                        action.command.trim_start_matches("sf "),
+                        area.width.saturating_sub(26) as usize,
+                    )));
+                }
+                ListItem::new(Line::from(line))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(app.home_state.selected.min(QUICK_ACTIONS_LEN - 1)));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block("Home — a/r/d/t/g run a task", app))
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol(">"),
+            rows[1],
+            &mut state,
+        );
+        let project = app
+            .deploy_state
+            .project
+            .as_ref()
+            .map(|project| project.name())
+            .unwrap_or_else(|| "no project".to_owned());
+        let org = if app.org_target_hint().is_empty() {
+            "sf default".to_owned()
+        } else {
+            app.org_target_hint()
+        };
+        let mut context = if compact {
+            vec![
+                Line::from(faint(format!("project: {project} | org: {org}"))),
+                Line::from(faint(format!(
+                    "sf {} | ? help | Enter run selected",
+                    app.startup.version.as_deref().unwrap_or("detecting…")
+                ))),
+            ]
+        } else {
+            vec![Line::from(faint(truncated(
+                &format!("{project} | {org}"),
+                area.width.saturating_sub(2) as usize,
+            )))]
+        };
+        if !app.startup_stage.done {
+            let frames = ["-", "\\", "|", "/"];
+            context.push(Line::from(Span::styled(
+                format!(
+                    "{} {} ({}s) — usable now",
+                    frames[app.spinner_tick() % frames.len()],
+                    app.startup_stage.label,
+                    app.startup_stage.started.elapsed().as_secs()
+                ),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        frame.render_widget(Paragraph::new(Text::from(context)), rows[0]);
+        return;
+    }
     let columns =
         Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
     let items: Vec<ListItem> = crate::app::QUICK_ACTIONS
@@ -275,9 +468,83 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
 const QUICK_ACTIONS_LEN: usize = 5;
 
 fn draw_catalog(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    let rows = app.catalog_rows();
+    if density != Density::Roomy {
+        let sections = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(2),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        let query = if app.catalog_state.query.is_empty() {
+            "/ fuzzy search".to_owned()
+        } else {
+            format!("/ {}", app.catalog_state.query)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(strong(
+                truncated(&query, area.width.saturating_sub(1) as usize),
+                if app.catalog_state.search_focused {
+                    Color::Yellow
+                } else {
+                    accent(app)
+                },
+            ))),
+            sections[0],
+        );
+        let items: Vec<ListItem> = rows
+            .iter()
+            .map(|row| match row {
+                CatalogRow::Header(name) => {
+                    ListItem::new(Line::from(strong(truncated(name, 60), accent(app))))
+                }
+                CatalogRow::Command {
+                    id,
+                    summary,
+                    favorite,
+                    ..
+                } => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if *favorite { "*" } else { " " },
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(id.clone(), Style::default().fg(Color::White)),
+                    faint(truncated(
+                        &format!("  {summary}"),
+                        usize::from(area.width).saturating_sub(id.len() + 5),
+                    )),
+                ])),
+            })
+            .collect();
+        let selected = app.catalog_state.selected_id.as_ref().and_then(|id| {
+            rows.iter().position(
+                |row| matches!(row, CatalogRow::Command { id: row_id, .. } if row_id == id),
+            )
+        });
+        let mut state = ListState::default();
+        state.select(selected);
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block("commands", app))
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol(">"),
+            sections[1],
+            &mut state,
+        );
+        if let Some(command) = app.selected_command() {
+            frame.render_widget(
+                Paragraph::new(Line::from(faint(truncated(
+                    &format!("sf {} — Enter help | r run | ? keys", command.id),
+                    area.width.saturating_sub(1) as usize,
+                )))),
+                sections[2],
+            );
+        }
+        return;
+    }
     let columns =
         Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).split(area);
-    let rows = app.catalog_rows();
     let title = if app.catalog_state.search_focused {
         format!("commands — search: {}|", app.catalog_state.query)
     } else if app.catalog_state.query.is_empty() {
@@ -476,6 +743,46 @@ fn strong_line(text: &str, color: Color) -> Line<'static> {
 }
 
 fn draw_favorites(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    if density != Density::Roomy {
+        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(strong(
+                "Favorites — Enter run | e preset | x remove",
+                accent(app),
+            ))),
+            sections[0],
+        );
+        let items: Vec<ListItem> = app
+            .config
+            .favorites
+            .iter()
+            .enumerate()
+            .map(|(index, favorite)| {
+                let flags = favorite.preset_flags.join(" ");
+                ListItem::new(Line::from(vec![
+                    strong(format!("{} ", index + 1), accent(app)),
+                    Span::styled(favorite.id.clone(), Style::default().fg(Color::White)),
+                    faint(truncated(&format!("  {flags}"), 24)),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(if app.config.favorites.is_empty() {
+            None
+        } else {
+            Some(app.favorites_state.selected)
+        });
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block("starred", app))
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol(">"),
+            sections[1],
+            &mut state,
+        );
+        return;
+    }
     let columns =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
     let items: Vec<ListItem> = app
@@ -564,6 +871,61 @@ fn draw_favorites(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    if density != Density::Roomy {
+        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(strong(
+                "Orgs — Enter details | o open | l login | F5 refresh",
+                accent(app),
+            ))),
+            sections[0],
+        );
+        let rows: Vec<Row> = app
+            .org_state
+            .orgs
+            .iter()
+            .map(|org| {
+                let widths = usize::from(area.width);
+                Row::new(vec![
+                    if org.is_default { "*" } else { " " }.to_owned(),
+                    truncated(&org.label(), widths.saturating_sub(14).min(20)),
+                    if density == Density::Compact {
+                        truncated(&org.connected_status, 12)
+                    } else {
+                        String::new()
+                    },
+                ])
+            })
+            .collect();
+        let widths: Vec<Constraint> = if density == Density::Compact {
+            vec![
+                Constraint::Length(2),
+                Constraint::Min(12),
+                Constraint::Length(12),
+            ]
+        } else {
+            vec![Constraint::Length(2), Constraint::Min(12)]
+        };
+        let mut state = TableState::default();
+        state.select(if app.org_state.orgs.is_empty() {
+            None
+        } else {
+            Some(app.org_state.selected)
+        });
+        frame.render_stateful_widget(
+            Table::new(rows, widths)
+                .header(
+                    Row::new(vec!["", "Alias", "Status"]).style(Style::default().fg(accent(app))),
+                )
+                .block(block("orgs", app))
+                .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol(">"),
+            sections[1],
+            &mut state,
+        );
+        return;
+    }
     let columns =
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
     let rows: Vec<Row> = app
@@ -655,6 +1017,88 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    if density != Density::Roomy {
+        let sections = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(2),
+            Constraint::Length(2),
+        ])
+        .split(area);
+        let options = &app.deploy_state.options;
+        let preview = truncated(
+            &app.transfer_preview(),
+            usize::from(area.width).saturating_sub(1),
+        );
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(vec![
+                    strong(
+                        if options.retrieve {
+                            "RETRIEVE"
+                        } else {
+                            "DEPLOY"
+                        },
+                        accent(app),
+                    ),
+                    faint(format!("  {}", options.mode.label())),
+                ]),
+                Line::from(Span::styled(preview, Style::default().fg(accent(app)))),
+            ])),
+            sections[0],
+        );
+        let rows: Vec<Row> = app
+            .deploy_state
+            .items
+            .iter()
+            .map(|item| {
+                let selected = match options.mode {
+                    PayloadMode::Source => options.paths.contains(&item.path),
+                    PayloadMode::Manifest => {
+                        options.manifest.as_deref() == Some(item.path.as_str())
+                    }
+                    PayloadMode::Metadata => false,
+                };
+                Row::new(vec![
+                    if selected { "x" } else { " " }.to_owned(),
+                    truncated(&item.label, usize::from(area.width).saturating_sub(8)),
+                ])
+            })
+            .collect();
+        let mut state = TableState::default();
+        state.select(if app.deploy_state.items.is_empty() {
+            None
+        } else {
+            Some(app.deploy_state.selected)
+        });
+        frame.render_stateful_widget(
+            Table::new(rows, [Constraint::Length(2), Constraint::Min(8)])
+                .header(Row::new(vec!["", "Path"]).style(Style::default().fg(accent(app))))
+                .block(block("metadata — Space selects", app))
+                .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol(">"),
+            sections[1],
+            &mut state,
+        );
+        let status = if let Some(report) = &app.deploy_state.report {
+            format!(
+                "{}: {} ok / {} failed",
+                report.status, report.succeeded, report.failed
+            )
+        } else if let Some(job) = &app.deploy_state.job_id {
+            format!("polling {job}…")
+        } else {
+            "Space select · m mode · v validate · Enter run".to_owned()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(strong(
+                truncated(&status, usize::from(area.width).saturating_sub(1)),
+                accent(app),
+            ))),
+            sections[2],
+        );
+        return;
+    }
     let sections = Layout::vertical([
         Constraint::Length(5),
         Constraint::Min(4),
@@ -815,6 +1259,53 @@ fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    if density != Density::Roomy {
+        let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(2)]).split(area);
+        let records: Vec<ListItem> = app
+            .output_state
+            .records
+            .iter()
+            .map(|record| ListItem::new(Line::from(faint(truncated(&record.label(), 60)))))
+            .collect();
+        let mut state = ListState::default();
+        state.select(if records.is_empty() {
+            None
+        } else {
+            Some(app.output_state.selected)
+        });
+        frame.render_stateful_widget(
+            List::new(records)
+                .block(block("history", app))
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol(">"),
+            rows[0],
+            &mut state,
+        );
+        let text = app
+            .output_state
+            .records
+            .get(app.output_state.selected)
+            .map(|record| {
+                record
+                    .lines
+                    .iter()
+                    .rev()
+                    .take(usize::from(rows[1].height).saturating_sub(2))
+                    .rev()
+                    .map(|line| line.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_else(|| "No output yet — run a command from Home.".to_owned());
+        frame.render_widget(
+            Paragraph::new(text)
+                .block(block("output", app))
+                .wrap(Wrap { trim: false }),
+            rows[1],
+        );
+        return;
+    }
     let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(3)]).split(area);
     let records: Vec<ListItem> = app
         .output_state
@@ -889,6 +1380,39 @@ fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
+    let density = density(area);
+    if density != Density::Roomy {
+        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(area);
+        frame.render_widget(
+            Paragraph::new(Line::from(strong(
+                "Setup — Enter install | r re-probe | Tab leave",
+                accent(app),
+            ))),
+            sections[0],
+        );
+        let items: Vec<ListItem> = crate::sf::install_instructions()
+            .iter()
+            .enumerate()
+            .map(|(index, (name, command))| {
+                ListItem::new(Line::from(vec![
+                    strong(format!("{} ", index + 1), accent(app)),
+                    Span::styled((*name).to_owned(), Style::default().fg(Color::White)),
+                    faint(truncated(&format!("  {command}"), 40)),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(app.setup_selected));
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block("installers", app))
+                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                .highlight_symbol(">"),
+            sections[1],
+            &mut state,
+        );
+        return;
+    }
     let columns =
         Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
     let instructions = crate::sf::install_instructions();
@@ -961,8 +1485,10 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
         Modal::Help => {
             let area = centered(frame.area(), 86, 24);
             frame.render_widget(Clear, area);
+            let max_rows = usize::from(area.height.saturating_sub(2));
             let lines: Vec<Line> = HELP_ROWS
                 .iter()
+                .take(max_rows)
                 .map(|(keys, description)| {
                     Line::from(vec![
                         strong(format!("  {keys:<20}"), accent(app)),
@@ -1016,7 +1542,11 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                     format!("{} {:<28}", if active { "›" } else { " " }, field.label),
                     Style::default().fg(if active { accent(app) } else { Color::DarkGray }),
                 )];
-                for (byte_index, character) in field.value.char_indices() {
+                let visible = truncated(
+                    &field.value,
+                    usize::from(area.width).saturating_sub(field.label.len() + 8),
+                );
+                for (byte_index, character) in visible.char_indices() {
                     let is_cursor = active && byte_index == field.cursor;
                     spans.push(Span::styled(
                         character.to_string(),
@@ -1027,7 +1557,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                         },
                     ));
                 }
-                if active && field.cursor == field.value.len() {
+                if active && field.cursor >= visible.len() {
                     spans.push(Span::styled(
                         " ",
                         Style::default().bg(accent(app)).fg(Color::Black),
