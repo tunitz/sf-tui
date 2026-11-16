@@ -14,8 +14,17 @@ case "$*" in
   "org display --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"username":"test-scratch@example.invalid","instanceUrl":"https://example.invalid.my.salesforce.com","id":"00D000000000001","accessToken":"SYNTHETIC-DO-NOT-USE"}}'
     ;;
-  "project deploy start --source-path force-app --check-only --test-level NoTestRun --json")
+  "project deploy start --source-dir force-app --json" | "project deploy start --source-dir force-app --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Queued"}}'
+    ;;
+  "project retrieve start --metadata ApexClass --json")
+    printf '%s\n' '{"status":0,"result":{"id":"0Af000000000002","status":"Succeeded"}}'
+    ;;
+  "apex run test --result-format json --wait 10 --json")
+    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}'
+    ;;
+  "logic get test --test-run-id 08N000000000001 --json")
+    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}'
     ;;
   "project deploy report --job-id 0Af000000000001 --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}'

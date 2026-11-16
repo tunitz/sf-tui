@@ -1,8 +1,11 @@
 //! Generic command catalog: live `sf commands --json` data with an offline snapshot fallback.
 
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A flag accepted by an SF command.
@@ -46,13 +49,15 @@ impl CommandSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatalogSource {
     Live,
+    Cached,
     Snapshot,
 }
 
 impl CatalogSource {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Live => "sf commands --json",
+            Self::Live => "live commands",
+            Self::Cached => "cached commands",
             Self::Snapshot => "bundled snapshot",
         }
     }
@@ -79,6 +84,45 @@ impl Catalog {
     pub fn command(&self, id: &str) -> Option<&CommandSpec> {
         self.commands.iter().find(|command| command.id == id)
     }
+}
+
+/// Name of the optional catalog cache beside config.toml.
+pub const CACHE_FILE: &str = "catalog-cache.json";
+
+#[derive(Serialize, Deserialize)]
+struct CacheFile {
+    saved_at: u64,
+    json: String,
+}
+
+pub fn cache_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(CACHE_FILE)
+}
+
+/// Read a cached catalog only when it is newer than `max_age`.
+pub fn read_cache(path: &Path, max_age: Duration) -> Option<Vec<CommandSpec>> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    if modified.elapsed().unwrap_or_default() > max_age {
+        return None;
+    }
+    let cache: CacheFile = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    parse_commands_json(&cache.json).ok()
+}
+
+/// Store the raw `sf commands --json` response for the next launch.
+pub fn write_cache(path: &Path, raw_json: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let saved_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cache = CacheFile {
+        saved_at,
+        json: raw_json.to_owned(),
+    };
+    std::fs::write(path, serde_json::to_vec(&cache).unwrap_or_default())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -463,6 +507,17 @@ mod tests {
         assert!(flags[0].required);
         assert_eq!(flags[1].name, "json");
         assert!(!flags[1].required);
+    }
+
+    #[test]
+    fn catalog_cache_round_trips_and_expires() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = cache_path(dir.path());
+        let raw = r#"{"result":[{"id":"org list","summary":"List orgs"}]}"#;
+        write_cache(&path, raw).expect("write cache");
+        let commands = read_cache(&path, Duration::from_secs(60)).expect("fresh cache");
+        assert_eq!(commands[0].id, "org list");
+        assert!(read_cache(&path, Duration::ZERO).is_none());
     }
 
     #[test]

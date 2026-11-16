@@ -14,7 +14,8 @@ use detect::SfInstallation;
 
 use self::runner::{RunnerError, parse_json_document};
 
-/// Result of probing the CLI before the UI starts.
+/// Result of probing the CLI. The TUI now starts with a pending snapshot and fills this in
+/// through [`StartupEvent`]s, so a slow CLI never blocks the first frame.
 #[derive(Debug)]
 pub struct Startup {
     pub installation: Option<SfInstallation>,
@@ -24,90 +25,171 @@ pub struct Startup {
 }
 
 impl Startup {
+    pub fn pending() -> Self {
+        Self {
+            installation: None,
+            version: None,
+            catalog: catalog::snapshot(),
+            notices: Vec::new(),
+        }
+    }
+
     pub fn is_ready(&self) -> bool {
         self.installation.is_some()
     }
 }
 
-/// Detect the CLI, probe its version and refresh the command catalog. Failures degrade to
-/// the bundled snapshot so that the TUI still opens on an offline or broken installation.
-pub async fn startup() -> Startup {
-    let mut result = Startup {
-        installation: None,
-        version: None,
-        catalog: catalog::snapshot(),
-        notices: Vec::new(),
-    };
-    let Some(installation) = detect::detect() else {
-        result.notices.push(
-            "Salesforce CLI was not found. Open the Setup tab for install options.".to_owned(),
-        );
-        return result;
-    };
-    result.notices.push(format!(
-        "Found {} at {}",
-        installation.flavor.label(),
-        installation.executable.display()
-    ));
+/// Progress reported while the CLI is being detected and probed.
+#[derive(Debug)]
+pub enum StartupEvent {
+    Stage(&'static str),
+    Detected(SfInstallation),
+    Version(String),
+    Catalog(Catalog),
+    Notice(String),
+    Finished,
+}
 
-    let version_argv = installation.argv(&["version".to_owned(), "--json".to_owned()]);
-    match runner::capture(
-        &installation.executable,
-        &version_argv,
-        Duration::from_secs(12),
-    )
-    .await
-    {
-        Ok(outcome) => {
-            let combined = format!("{}{}", outcome.stdout, outcome.stderr);
-            result.version = parse_version(&combined);
-            if result.version.is_none() {
-                result
-                    .notices
-                    .push("Could not read the Salesforce CLI version.".to_owned());
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
+const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Stage the startup work so the UI can render immediately and show real progress.
+/// Version and catalog probes run concurrently with short, independent timeouts.
+pub async fn probe(
+    config_dir: std::path::PathBuf,
+    events: tokio::sync::mpsc::UnboundedSender<StartupEvent>,
+) -> Startup {
+    probe_with(config_dir, events, None).await
+}
+
+/// Same probe with a caller-supplied installation, used by tests and custom launchers.
+pub async fn probe_with(
+    config_dir: std::path::PathBuf,
+    events: tokio::sync::mpsc::UnboundedSender<StartupEvent>,
+    supplied: Option<SfInstallation>,
+) -> Startup {
+    let send = |event: StartupEvent| {
+        let _ = events.send(event);
+    };
+    let mut result = Startup::pending();
+    send(StartupEvent::Stage("Detecting Salesforce CLI"));
+    let installation = match supplied {
+        Some(installation) => installation,
+        None => match detect::detect() {
+            Some(installation) => installation,
+            None => {
+                send(StartupEvent::Notice(
+                    "Salesforce CLI not found; open Setup for install options".to_owned(),
+                ));
+                send(StartupEvent::Finished);
+                return result;
+            }
+        },
+    };
+    result.installation = Some(installation.clone());
+    send(StartupEvent::Detected(installation.clone()));
+
+    let version_probe = async {
+        send(StartupEvent::Stage("Reading Salesforce CLI version"));
+        let argv = installation.argv(&["version".to_owned(), "--json".to_owned()]);
+        match runner::capture_with_env(
+            &installation.executable,
+            &argv,
+            VERSION_TIMEOUT,
+            runner::sf_env(),
+        )
+        .await
+        {
+            Ok(outcome) => match parse_version(&format!("{}{}", outcome.stdout, outcome.stderr)) {
+                Some(version) => Some(version),
+                None => {
+                    send(StartupEvent::Notice(
+                        "Version unavailable; continuing with the snapshot catalog".to_owned(),
+                    ));
+                    None
+                }
+            },
+            Err(error) => {
+                send(StartupEvent::Notice(format!(
+                    "Version probe skipped: {error}"
+                )));
+                None
             }
         }
-        Err(error) => result
-            .notices
-            .push(format!("Version probe failed: {error}")),
-    }
+    };
 
-    if installation.flavor == detect::SfFlavor::Sf {
-        let commands_argv = installation.argv(&["commands".to_owned(), "--json".to_owned()]);
-        match runner::capture(
+    let catalog_probe = async {
+        let cache_path = catalog::cache_path(&config_dir);
+        if let Some(commands) = catalog::read_cache(&cache_path, CACHE_MAX_AGE) {
+            send(StartupEvent::Catalog(Catalog {
+                commands,
+                source: catalog::CatalogSource::Cached,
+            }));
+            return None;
+        }
+        if installation.flavor != detect::SfFlavor::Sf {
+            return None;
+        }
+        send(StartupEvent::Stage("Loading command catalog"));
+        let argv = installation.argv(&["commands".to_owned(), "--json".to_owned()]);
+        match runner::capture_with_env(
             &installation.executable,
-            &commands_argv,
-            Duration::from_secs(20),
+            &argv,
+            CATALOG_TIMEOUT,
+            runner::sf_env(),
         )
         .await
         {
             Ok(outcome) => match catalog::parse_commands_json(&outcome.stdout) {
                 Ok(commands) => {
-                    result.catalog = Catalog {
+                    let _ = catalog::write_cache(&cache_path, outcome.stdout.trim());
+                    Some(Catalog {
                         commands,
                         source: catalog::CatalogSource::Live,
-                    };
+                    })
                 }
-                Err(error) => result
-                    .notices
-                    .push(format!("Catalog refresh failed: {error}")),
+                Err(error) => {
+                    send(StartupEvent::Notice(format!(
+                        "Using bundled catalog: {error}"
+                    )));
+                    None
+                }
             },
             Err(RunnerError::TimedOut { .. }) => {
-                result
-                    .notices
-                    .push("Catalog refresh timed out; using bundled snapshot.".to_owned());
+                send(StartupEvent::Notice(
+                    "Catalog refresh timed out; using bundled snapshot".to_owned(),
+                ));
+                None
             }
-            Err(error) => result
-                .notices
-                .push(format!("Catalog refresh failed: {error}")),
+            Err(error) => {
+                send(StartupEvent::Notice(format!(
+                    "Using bundled catalog: {error}"
+                )));
+                None
+            }
         }
-    } else {
-        result
-            .notices
-            .push("Legacy sfdx detected; using bundled command catalog.".to_owned());
+    };
+
+    let (version, catalog) = tokio::join!(version_probe, catalog_probe);
+    if let Some(version) = version {
+        result.version = Some(version.clone());
+        send(StartupEvent::Version(version));
     }
-    result.installation = Some(installation);
+    if let Some(catalog) = catalog {
+        result.catalog = catalog.clone();
+        send(StartupEvent::Catalog(catalog));
+    }
+    send(StartupEvent::Finished);
     result
+}
+
+/// Convenience wrapper for tests and tools that do not need live progress.
+pub async fn startup(config_dir: std::path::PathBuf) -> Startup {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(probe(config_dir, tx));
+    while rx.recv().await.is_some() {}
+    task.await.unwrap_or_else(|_| Startup::pending())
 }
 
 fn parse_version(text: &str) -> Option<String> {

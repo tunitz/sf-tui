@@ -56,6 +56,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     .split(frame.area());
     draw_header(frame, layout[0], app);
     match app.tab {
+        Tab::Home => draw_home(frame, layout[1], app),
         Tab::Catalog => draw_catalog(frame, layout[1], app),
         Tab::Favorites => draw_favorites(frame, layout[1], app),
         Tab::Orgs => draw_orgs(frame, layout[1], app),
@@ -70,43 +71,58 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let version = app.startup.version.as_deref().unwrap_or("unknown");
-    let catalog_source = app.startup.catalog.source.label();
-    let busy = if app.busy() {
-        let frames = ["-", "\\", "|", "/"];
-        let spinner = frames[app.spinner_tick() % frames.len()];
-        format!("{spinner} running")
+    let version = app.startup.version.as_deref().unwrap_or("detecting…");
+    let project = app
+        .deploy_state
+        .project
+        .as_ref()
+        .map(|project| project.name())
+        .unwrap_or_else(|| "no project".to_owned());
+    let frames = ["-", "\\", "|", "/"];
+    let spinner = frames[app.spinner_tick() % frames.len()];
+    let activity = if !app.startup_stage.done {
+        format!("{spinner} {}", app.startup_stage.label)
+    } else if app.busy() {
+        format!(
+            "{spinner} running {}",
+            app.active_job_label().unwrap_or_default()
+        )
     } else {
-        "idle".to_owned()
+        "ready".to_owned()
     };
     let info = Line::from(vec![
         strong("SFTUI", accent(app)),
-        faint("  ·  sftui v0.1.0"),
-        faint(format!("  ·  sf {version}")),
-        faint(format!("  ·  catalog: {catalog_source}")),
+        faint(format!(" v{}", env!("CARGO_PKG_VERSION"))),
+        faint(format!("  |  sf {version}")),
+        faint(format!("  |  project {project}")),
         Span::styled(
-            format!("  ·  {busy}"),
-            Style::default().fg(if app.busy() {
-                Color::Yellow
-            } else {
+            format!("  |  {activity}"),
+            Style::default().fg(if app.startup_stage.done && !app.busy() {
                 Color::DarkGray
+            } else {
+                Color::Yellow
             }),
         ),
     ]);
-    let tabs = Tabs::new(app.tabs().into_iter().map(|tab| tab.label()))
-        .select(
-            app.tabs()
-                .iter()
-                .position(|tab| *tab == app.tab)
-                .unwrap_or(0),
-        )
-        .style(Style::default().fg(Color::Gray))
-        .highlight_style(
-            Style::default()
-                .fg(accent(app))
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )
-        .divider("│");
+    let tabs = Tabs::new(
+        app.tabs()
+            .into_iter()
+            .enumerate()
+            .map(|(index, tab)| format!("[{}] {}", index + 1, tab.label())),
+    )
+    .select(
+        app.tabs()
+            .iter()
+            .position(|tab| *tab == app.tab)
+            .unwrap_or(0),
+    )
+    .style(Style::default().fg(Color::Gray))
+    .highlight_style(
+        Style::default()
+            .fg(accent(app))
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+    )
+    .divider("│");
     let inner = Layout::vertical([Constraint::Length(1), Constraint::Length(1)])
         .split(block("sf-tui — Salesforce CLI control room", app).inner(area));
     frame.render_widget(block("sf-tui — Salesforce CLI control room", app), area);
@@ -137,21 +153,126 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn key_hints(app: &App) -> String {
-    let common = "Tab/1-5 switch · ? help · F5 refresh · y copy · q quit";
+    let common = "Tab next screen · ? help · q quit";
     let specific = match app.tab {
-        Tab::Catalog => "/ search · ↑↓ move · Enter help · r run · f favorite · e preset",
-        Tab::Favorites => "↑↓ move · Enter run · Ctrl+↑↓ reorder · e preset · x remove",
-        Tab::Orgs => {
-            "↑↓ move · Enter detail · o open · d/D default · x logout · l login · c scratch"
-        }
-        Tab::Deploy => {
-            "↑↓ move · Space select · m mode · v validate · t test · w warnings · o org · Enter run"
-        }
-        Tab::Output => "↑↓ records · j/k scroll · z JSON · Y copy output · Esc cancel job",
-        Tab::Setup => "↑↓ option · Enter run installer · r re-probe",
+        Tab::Home => "a login · r retrieve · d deploy · t test · g test results",
+        Tab::Catalog => "/ search · Enter help · r run · f favorite",
+        Tab::Favorites => "Enter run · Ctrl+↑↓ reorder · e preset",
+        Tab::Orgs => "Enter details · o open · d default · l login",
+        Tab::Deploy => "Space select · m payload · Enter run",
+        Tab::Output => "↑↓ records · j/k scroll · z JSON",
+        Tab::Setup => "Enter run installer · r re-probe",
     };
-    format!("{specific}     {common}")
+    format!("{specific}   |   {common}")
 }
+
+fn keycap(key: &str, label: &str, color: Color) -> Span<'static> {
+    Span::styled(
+        format!("[{key}] {label}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn action_bar<'a>(items: Vec<(&'a str, &'a str)>, app: &App) -> Line<'a> {
+    let mut spans = vec![faint("Actions  ")];
+    for (index, (key, label)) in items.iter().enumerate() {
+        if index > 0 {
+            spans.push(faint("  |  "));
+        }
+        spans.push(keycap(key, label, accent(app)));
+    }
+    Line::from(spans)
+}
+
+fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
+    let columns =
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
+    let items: Vec<ListItem> = crate::app::QUICK_ACTIONS
+        .iter()
+        .map(|action| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    strong(format!("[{}] ", action.key), accent(app)),
+                    strong(action.label, Color::White),
+                    Span::styled(
+                        format!("   {}", action.command.trim_start_matches("sf ")),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    format!("     {}", action.hint),
+                    Style::default().fg(Color::Gray),
+                )),
+            ])
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(app.home_state.selected.min(QUICK_ACTIONS_LEN - 1)));
+    let list = List::new(items)
+        .block(block(
+            "What do you want to do? Five keys cover most work.",
+            app,
+        ))
+        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
+        .highlight_symbol(">");
+    frame.render_stateful_widget(list, columns[0], &mut state);
+
+    let mut details = vec![
+        strong_line("CURRENT CONTEXT", accent(app)),
+        Line::from(faint(format!(
+            "project: {}",
+            app.deploy_state
+                .project
+                .as_ref()
+                .map(|project| project.name())
+                .unwrap_or_else(|| "none found".to_owned())
+        ))),
+        Line::from(faint(format!(
+            "default org: {}",
+            if app.org_target_hint().is_empty() {
+                "sf default (not loaded yet)".to_owned()
+            } else {
+                app.org_target_hint()
+            }
+        ))),
+        Line::from(faint(format!(
+            "cli: {}",
+            app.startup.version.as_deref().unwrap_or("detecting…")
+        ))),
+        Line::from(" "),
+        action_bar(
+            vec![
+                ("1-5", "go to screen"),
+                ("?", "all shortcuts"),
+                ("q", "quit"),
+            ],
+            app,
+        ),
+        Line::from(" "),
+        Line::from(faint(
+            "Paths and the default org are pre-filled; you only confirm or edit them.",
+        )),
+    ];
+    if !app.startup_stage.done {
+        let elapsed = app.startup_stage.started.elapsed().as_secs();
+        let frames = ["-", "\\", "|", "/"];
+        details.push(Line::from(Span::styled(
+            format!(
+                "{} {} ({}s) — the UI is usable now",
+                frames[app.spinner_tick() % frames.len()],
+                app.startup_stage.label,
+                elapsed
+            ),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(details)).block(block("context", app)),
+        columns[1],
+    );
+}
+
+const QUICK_ACTIONS_LEN: usize = 5;
 
 fn draw_catalog(frame: &mut Frame, area: Rect, app: &App) {
     let columns =
@@ -229,13 +350,11 @@ fn draw_catalog(frame: &mut Frame, area: Rect, app: &App) {
                         },
                     ));
                 }
-                ListItem::new(vec![
-                    Line::from(spans),
-                    Line::from(Span::styled(
-                        format!("      {summary}"),
-                        Style::default().fg(Color::DarkGray),
-                    )),
-                ])
+                spans.push(Span::styled(
+                    format!("  — {summary}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -330,8 +449,19 @@ fn draw_command_detail(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(faint(if show_help {
         "Flags from live --help"
     } else {
-        "Enter loads live --help · r run · f favorite"
+        "Enter loads live --help"
     })));
+    lines.push(Line::from(" "));
+    lines.push(action_bar(
+        vec![
+            ("/", "search"),
+            ("Enter", "help"),
+            ("r", "run"),
+            ("f", "favorite"),
+            ("c", "copy"),
+        ],
+        app,
+    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(block("command detail", app)),
         area,
@@ -418,9 +548,15 @@ fn draw_favorites(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
     lines.push(Line::from(" "));
-    lines.push(Line::from(faint(
-        "Ctrl+↑/↓ reorder · e edit flags · x remove · c copy command",
-    )));
+    lines.push(action_bar(
+        vec![
+            ("Enter", "run"),
+            ("e", "preset"),
+            ("x", "remove"),
+            ("c", "copy"),
+        ],
+        app,
+    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(block("favorite detail", app)),
         columns[1],
@@ -502,9 +638,16 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(faint("Credentials are never displayed.")));
     }
     lines.push(Line::from(" "));
-    lines.push(Line::from(faint(
-        "o open in browser · d default · D dev hub · x logout · l login · c scratch",
-    )));
+    lines.push(action_bar(
+        vec![
+            ("Enter", "details"),
+            ("o", "open"),
+            ("d", "default"),
+            ("l", "login"),
+            ("x", "logout"),
+        ],
+        app,
+    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(block("organization", app)),
         columns[1],
@@ -583,7 +726,7 @@ fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
             let selected = match options.mode {
                 PayloadMode::Source => options.paths.contains(&item.path),
                 PayloadMode::Manifest => options.manifest.as_deref() == Some(item.path.as_str()),
-                PayloadMode::TrackedChanges => false,
+                PayloadMode::Metadata => false,
             };
             Row::new(vec![
                 if selected { "✓" } else { " " }.to_owned(),
@@ -654,9 +797,17 @@ fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
             "Select metadata and press Enter to start. Progress is polled automatically.",
         )));
     }
-    lines.push(Line::from(faint(
-        "m payload · v validation · t test level · w warnings · r retrieve · o target org · p poll",
-    )));
+    lines.push(action_bar(
+        vec![
+            ("Space", "select"),
+            ("m", "payload"),
+            ("v", "validate"),
+            ("t", "test"),
+            ("o", "org"),
+            ("Enter", "run"),
+        ],
+        app,
+    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(block("monitor", app)),
         sections[2],
@@ -897,39 +1048,32 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
 }
 
 const HELP_ROWS: &[(&str, &str)] = &[
-    ("Tab / Shift+Tab", "cycle screens"),
-    ("1-6", "jump to a screen"),
-    ("?", "show this help"),
-    ("F5", "refresh orgs, project or command catalog"),
-    ("q", "quit sftui"),
-    ("Ctrl+C", "cancel the newest job, or quit when idle"),
-    ("/", "focus the catalog fuzzy search"),
+    ("a (Home)", "log in to an org with the browser flow"),
+    ("r (Home)", "retrieve using paths from sfdx-project.json"),
+    ("d (Home)", "deploy using paths from sfdx-project.json"),
     (
-        "Enter (catalog)",
-        "load live --help for the selected command",
+        "t (Home)",
+        "run Apex tests; leave org blank to use the default",
     ),
-    ("r (catalog)", "run a command with optional flags"),
-    ("f / e (catalog)", "toggle favorite / edit preset flags"),
-    ("Enter (favorites)", "run with preset flags"),
-    ("Ctrl+↑/↓", "reorder favorites"),
-    ("Enter (orgs)", "load org display details"),
-    ("d / D (orgs)", "set project default org / dev hub"),
+    ("g (Home)", "get results for a test run id"),
+    ("Tab / 1-7", "next screen / jump directly"),
+    ("Enter", "the highlighted action"),
+    ("?", "show this help; any key closes it"),
+    ("q / Ctrl+C", "quit / cancel the newest job"),
+    ("/ (Catalog)", "fuzzy search the full CLI catalog"),
+    ("f (Catalog)", "star the selected command"),
+    ("Enter (Orgs)", "show org display details"),
+    ("o / l (Orgs)", "open in browser / web login"),
+    ("Space (Deploy)", "select a source path"),
     (
-        "o / x / l / c",
-        "open / logout / login web / create scratch",
+        "m (Deploy)",
+        "cycle source path / manifest / metadata names",
     ),
-    ("Space (deploy)", "select metadata path"),
     (
-        "m / v / t / w",
-        "payload mode / validation / test level / warnings",
+        "v / t / w (Deploy)",
+        "validate / test level / ignore warnings",
     ),
-    ("r (deploy)", "toggle deploy vs retrieve"),
-    (
-        "Enter (deploy)",
-        "start transfer; poll reports automatically",
-    ),
-    ("z (output)", "toggle raw stream and parsed JSON table"),
-    ("Y (output)", "copy the selected command's output"),
+    ("z (Output)", "toggle raw stream and parsed JSON table"),
 ];
 
 #[cfg(test)]

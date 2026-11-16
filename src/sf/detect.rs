@@ -165,7 +165,8 @@ pub fn translate_legacy(parts: &[String]) -> Vec<String> {
             result.push(match part.as_str() {
                 "--target-org" => "--targetusername".to_owned(),
                 "--target-dev-hub" => "--targetdevhubusername".to_owned(),
-                "--check-only" => "--checkonly".to_owned(),
+                "--check-only" | "--dry-run" => "--checkonly".to_owned(),
+                "--source-dir" => "--sourcepath".to_owned(),
                 "--test-level" => "--testlevel".to_owned(),
                 "--definition-file" => "--definitionfile".to_owned(),
                 "--duration-days" => "--durationdays".to_owned(),
@@ -253,7 +254,7 @@ mod tests {
             "project".to_owned(),
             "deploy".to_owned(),
             "start".to_owned(),
-            "--check-only".to_owned(),
+            "--dry-run".to_owned(),
         ];
         assert_eq!(
             translate_legacy(&parts),

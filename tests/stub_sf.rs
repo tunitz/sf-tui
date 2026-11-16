@@ -7,10 +7,10 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use sftui::app::{App, OutputRecord};
 use sftui::config::Config;
-use sftui::sf::Startup;
 use sftui::sf::catalog::{Catalog, CatalogSource, CommandSpec};
 use sftui::sf::detect::{SfFlavor, SfInstallation};
 use sftui::sf::runner::{self, OutputStream, SfEvent};
+use sftui::sf::{Startup, StartupEvent};
 use sftui::ui;
 use tokio::sync::mpsc;
 
@@ -110,6 +110,40 @@ async fn runner_streams_stdout_and_reports_completion() {
 }
 
 #[tokio::test]
+async fn staged_startup_reports_progress_and_caches_the_catalog() {
+    assert_synthetic_environment();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (tx, mut rx) = mpsc::unbounded_channel::<StartupEvent>();
+    let task = tokio::spawn(sftui::sf::probe_with(
+        dir.path().to_path_buf(),
+        tx,
+        Some(stub_installation()),
+    ));
+    let mut saw_stage = false;
+    let mut saw_detected = false;
+    let mut saw_version = false;
+    let mut saw_catalog = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = rx.recv().await {
+            match event {
+                StartupEvent::Stage(_) => saw_stage = true,
+                StartupEvent::Detected(_) => saw_detected = true,
+                StartupEvent::Version(version) => saw_version = version == "99.0.0",
+                StartupEvent::Catalog(catalog) => saw_catalog = catalog.commands.len() == 1,
+                StartupEvent::Finished => break,
+                StartupEvent::Notice(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("startup probe finished");
+    let startup = task.await.expect("probe task");
+    assert!(saw_stage && saw_detected && saw_version && saw_catalog);
+    assert_eq!(startup.version.as_deref(), Some("99.0.0"));
+    assert!(dir.path().join(sftui::sf::catalog::CACHE_FILE).is_file());
+}
+
+#[tokio::test]
 async fn failed_stub_command_captures_stderr_and_exit_code() {
     assert_synthetic_environment();
     let outcome = runner::capture(
@@ -126,6 +160,8 @@ async fn failed_stub_command_captures_stderr_and_exit_code() {
 #[test]
 fn every_screen_renders_without_panicking() {
     assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
     let mut app = App::new(
         Startup {
             installation: None,
@@ -134,6 +170,7 @@ fn every_screen_renders_without_panicking() {
             notices: vec!["synthetic notice".to_owned()],
         },
         Config::default(),
+        std::path::PathBuf::from("/tmp/sftui-test"),
     );
     app.output_state.records.push(OutputRecord {
         id: 1,
@@ -155,6 +192,8 @@ fn every_screen_renders_without_panicking() {
 #[test]
 fn prompt_overlay_renders_with_a_cursor() {
     assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
     let mut app = App::new(
         Startup {
             installation: None,
@@ -163,6 +202,7 @@ fn prompt_overlay_renders_with_a_cursor() {
             notices: Vec::new(),
         },
         Config::default(),
+        std::path::PathBuf::from("/tmp/sftui-test"),
     );
     app.modal = Some(sftui::app::Modal::Prompt {
         title: "Synthetic prompt".to_owned(),

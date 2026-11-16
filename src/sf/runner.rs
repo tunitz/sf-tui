@@ -95,6 +95,16 @@ impl RunningJob {
     }
 }
 
+/// Environment settings that stop the Salesforce CLI doing network/update work on every call.
+/// This matters on Windows where each Node-based `sf` process is expensive to start.
+pub fn sf_env() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("SF_SKIP_NEW_VERSION_CHECK", "true"),
+        ("SF_DISABLE_TELEMETRY", "true"),
+        ("SFDX_DISABLE_AUTOUPDATE", "true"),
+    ]
+}
+
 /// Spawn an SF command, streaming every stdout/stderr line to `events`.
 pub fn spawn_sf(
     installation: &SfInstallation,
@@ -102,13 +112,29 @@ pub fn spawn_sf(
     job_id: u64,
     events: UnboundedSender<SfEvent>,
 ) -> Result<RunningJob, RunnerError> {
+    spawn_sf_mapped(installation, argv, job_id, events, std::convert::identity)
+}
+
+/// Spawn an SF command and map its events into the caller's event type.
+pub fn spawn_sf_mapped<E, F>(
+    installation: &SfInstallation,
+    argv: &[String],
+    job_id: u64,
+    events: UnboundedSender<E>,
+    map: F,
+) -> Result<RunningJob, RunnerError>
+where
+    E: Send + 'static,
+    F: Fn(SfEvent) -> E + Send + Clone + 'static,
+{
     let argv = installation.argv(argv);
-    spawn(
+    spawn_with_env(
         installation.executable.as_path(),
         &argv,
         job_id,
         events,
-        std::convert::identity,
+        map,
+        sf_env(),
     )
 }
 
@@ -124,6 +150,21 @@ where
     E: Send + 'static,
     F: Fn(SfEvent) -> E + Send + Clone + 'static,
 {
+    spawn_with_env(executable, argv, job_id, events, map, &[])
+}
+
+fn spawn_with_env<E, F>(
+    executable: &Path,
+    argv: &[String],
+    job_id: u64,
+    events: UnboundedSender<E>,
+    map: F,
+    env: &[(&str, &str)],
+) -> Result<RunningJob, RunnerError>
+where
+    E: Send + 'static,
+    F: Fn(SfEvent) -> E + Send + Clone + 'static,
+{
     let mut command = Command::new(executable);
     command
         .args(argv)
@@ -131,6 +172,9 @@ where
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
     let mut child = command.spawn().map_err(|source| RunnerError::Spawn {
         command: format!("{} {}", executable.display(), argv.join(" ")),
         source,
@@ -222,17 +266,30 @@ pub async fn capture(
     argv: &[String],
     timeout: Duration,
 ) -> Result<ProcessOutcome, RunnerError> {
-    let mut child = Command::new(executable)
+    capture_with_env(executable, argv, timeout, &[]).await
+}
+
+/// Run a short probe with explicit child-process environment settings and a hard timeout.
+pub async fn capture_with_env(
+    executable: &Path,
+    argv: &[String],
+    timeout: Duration,
+    env: &[(&str, &str)],
+) -> Result<ProcessOutcome, RunnerError> {
+    let mut command = Command::new(executable);
+    command
         .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| RunnerError::Spawn {
-            command: format!("{} {}", executable.display(), argv.join(" ")),
-            source,
-        })?;
+        .kill_on_drop(true);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().map_err(|source| RunnerError::Spawn {
+        command: format!("{} {}", executable.display(), argv.join(" ")),
+        source,
+    })?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let out_task = stdout.map(|mut pipe| {

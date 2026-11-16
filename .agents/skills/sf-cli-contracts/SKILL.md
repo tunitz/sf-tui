@@ -17,9 +17,9 @@ Fields absent in one CLI version must degrade to empty values rather than fail.
 | `<command> --help` | plain text | Flag lines such as `-o, --target-org <value> ... (required)` are parsed for the detail pane |
 | `org list --json` | `result.scratchOrgs[]`, `result.nonScratchOrgs[]` | `aliases` may be a string or array; flags `isDefaultUsername`, `isDefaultDevHubUsername` |
 | `org display --json` | `result{}` | Filter `accessToken`, `refreshToken`, `sfdxAuthUrl`, `password`, `clientSecret`, `privateKey` |
-| `project deploy start --json` | `result.id` | Job id drives `project deploy report --json --job-id <id>` |
+| `project deploy start --json` | `result.id` | Job id drives `project deploy report --json --job-id <id>`; flags: `--source-dir`, `--dry-run`, `--metadata`, `--test-level` |
 | `project deploy report --json` | `result.status`, `result.components` | `components` may be counters (`total`, `successes`, `failed`) or an array of per-component objects |
-| `project retrieve start/report --json` | same as deploy | Retrieve uses the equivalent `project retrieve` verbs |
+| `project retrieve start --json` | final result directly | There is no `project retrieve report`; run it with `--wait` and read the returned components |
 
 Never assume an org alias is a username. Keep the original username for all CLI invocations and
 use aliases only as labels.

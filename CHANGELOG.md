@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## Unreleased
+
+### Added
+
+- Home screen with five labelled shortcuts (org login, retrieve, deploy, Apex tests, test results)
+  and pre-filled project paths/default org.
+- Visible startup progress: the UI opens immediately, probes `sf` in the background with short
+  timeouts, and caches the command catalog for seven days.
+- Key labels and an Actions bar on every screen, plus a simplified one-line catalog.
+
+### Fixed
+
+- Deploy/retrieve flags now match the current CLI (`--source-dir`, `--dry-run`, repeated
+  `--metadata`; retrieve no longer calls a non-existent `project retrieve report`).
+- Disabled CLI telemetry and update checks in child processes to reduce startup latency.
+
 ## [0.1.0] - 2026-11-16
 
 ### Added

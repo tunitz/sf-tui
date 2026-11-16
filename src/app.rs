@@ -22,6 +22,7 @@ use crate::sf::{self, Startup};
 /// Screens shown in the tab bar. Setup is added only when no CLI was found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
+    Home,
     Catalog,
     Favorites,
     Orgs,
@@ -33,6 +34,7 @@ pub enum Tab {
 impl Tab {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Home => "Home",
             Self::Catalog => "Catalog",
             Self::Favorites => "Favorites",
             Self::Orgs => "Orgs",
@@ -77,7 +79,7 @@ impl JobPurpose {
 #[derive(Debug)]
 pub enum AppEvent {
     Sf(SfEvent),
-    Startup(Startup),
+    Startup(crate::sf::StartupEvent),
     Notice { text: String, error: bool },
 }
 
@@ -91,6 +93,68 @@ pub enum CatalogRow {
         matched: Option<Vec<usize>>,
         favorite: bool,
     },
+}
+
+const POPULAR_COMMAND_IDS: &[&str] = &[
+    "org login web",
+    "project retrieve start",
+    "project deploy start",
+    "apex run test",
+    "logic get test",
+];
+
+/// A task-oriented shortcut shown first on the Home screen.
+#[derive(Debug, Clone, Copy)]
+pub struct QuickAction {
+    pub key: char,
+    pub label: &'static str,
+    pub command: &'static str,
+    pub hint: &'static str,
+}
+
+pub const QUICK_ACTIONS: &[QuickAction] = &[
+    QuickAction {
+        key: 'a',
+        label: "Log in to an org",
+        command: "sf org login web",
+        hint: "Open the browser login flow",
+    },
+    QuickAction {
+        key: 'r',
+        label: "Retrieve metadata",
+        command: "sf project retrieve start",
+        hint: "Pre-filled from this project's source paths",
+    },
+    QuickAction {
+        key: 'd',
+        label: "Deploy metadata",
+        command: "sf project deploy start",
+        hint: "Pre-filled from this project's source paths",
+    },
+    QuickAction {
+        key: 't',
+        label: "Run Apex tests",
+        command: "sf apex run test",
+        hint: "Uses your default org unless you enter another",
+    },
+    QuickAction {
+        key: 'g',
+        label: "Get test results",
+        command: "sf logic get test",
+        hint: "Enter a test run id when prompted",
+    },
+];
+
+#[derive(Debug, Clone, Default)]
+pub struct HomeState {
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct StartupStage {
+    pub label: String,
+    pub started: Instant,
+    pub done: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -216,6 +280,11 @@ impl PromptField {
 #[derive(Debug, Clone)]
 pub enum PromptKind {
     RunFlags { id: String },
+    QuickRetrieve,
+    QuickDeploy,
+    RunApexTests,
+    GetTestResults,
+    MetadataNames,
     EditPreset { id: String },
     LoginWeb,
     CreateScratch,
@@ -266,6 +335,9 @@ pub struct App {
     pub startup: Startup,
     pub config: Config,
     pub tab: Tab,
+    pub startup_stage: StartupStage,
+    pub config_dir: PathBuf,
+    pub home_state: HomeState,
     pub should_quit: bool,
     pub status: String,
     pub status_error: bool,
@@ -285,7 +357,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(startup: Startup, config: Config) -> Self {
+    pub fn new(startup: Startup, config: Config, config_dir: PathBuf) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let selected_id = startup
             .catalog
@@ -295,7 +367,14 @@ impl App {
         let mut app = Self {
             startup,
             config,
-            tab: Tab::Catalog,
+            tab: Tab::Home,
+            startup_stage: StartupStage {
+                label: "Starting sftui".to_owned(),
+                started: Instant::now(),
+                done: false,
+            },
+            config_dir,
+            home_state: HomeState::default(),
             should_quit: false,
             status: String::new(),
             status_error: false,
@@ -317,25 +396,36 @@ impl App {
             next_job_id: 1,
         };
         app.reload_project();
-        if !app.startup.is_ready() {
-            app.tab = Tab::Setup;
-            app.status = "Salesforce CLI not found".to_owned();
-            app.status_error = true;
-        } else if !app.startup.notices.is_empty() {
-            app.status = app.startup.notices.first().cloned().unwrap_or_default();
-        }
+        app.status = "Starting sftui — the interface is ready while sf is probed".to_owned();
+        app.start_probe();
         app
+    }
+
+    fn start_probe(&mut self) {
+        let config_dir = self.config_dir.clone();
+        let app_tx = self.event_tx.clone();
+        self.probe_task = Some(tokio::spawn(async move {
+            let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<sf::StartupEvent>();
+            let probe = tokio::spawn(sf::probe(config_dir, probe_tx));
+            while let Some(event) = probe_rx.recv().await {
+                if app_tx.send(AppEvent::Startup(event)).is_err() {
+                    break;
+                }
+            }
+            let _ = probe.await;
+        }));
     }
 
     pub fn tabs(&self) -> Vec<Tab> {
         let mut tabs = vec![
+            Tab::Home,
             Tab::Catalog,
             Tab::Favorites,
             Tab::Orgs,
             Tab::Deploy,
             Tab::Output,
         ];
-        if !self.startup.is_ready() {
+        if self.startup_stage.done && !self.startup.is_ready() {
             tabs.push(Tab::Setup);
         }
         tabs
@@ -395,17 +485,39 @@ impl App {
 
     pub fn on_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Startup(startup) => {
-                let was_ready = self.startup.is_ready();
-                let tab_was_setup = self.tab == Tab::Setup;
-                self.startup = startup;
-                if self.startup.is_ready() && (tab_was_setup || !was_ready) {
-                    self.tab = Tab::Catalog;
-                    self.notice("Salesforce CLI is ready");
+            AppEvent::Startup(sf::StartupEvent::Stage(label)) => {
+                self.startup_stage = StartupStage {
+                    label: label.to_owned(),
+                    started: Instant::now(),
+                    done: false,
+                };
+            }
+            AppEvent::Startup(sf::StartupEvent::Detected(installation)) => {
+                self.startup.installation = Some(installation);
+            }
+            AppEvent::Startup(sf::StartupEvent::Version(version)) => {
+                self.startup.version = Some(version);
+            }
+            AppEvent::Startup(sf::StartupEvent::Catalog(catalog)) => {
+                self.startup.catalog = catalog;
+                if let Some(id) = self.catalog_state.selected_id.clone()
+                    && self.startup.catalog.command(&id).is_none()
+                {
+                    self.catalog_state.selected_id = self
+                        .startup
+                        .catalog
+                        .commands
+                        .first()
+                        .map(|command| command.id.clone());
                 }
-                if let Some(notice) = self.startup.notices.first() {
-                    self.notice(notice.clone());
-                }
+            }
+            AppEvent::Startup(sf::StartupEvent::Notice(text)) => {
+                self.startup.notices.push(text.clone());
+                self.notice(text);
+            }
+            AppEvent::Startup(sf::StartupEvent::Finished) => {
+                self.startup_stage.done = true;
+                self.notice("Ready");
             }
             AppEvent::Notice { text, error } => {
                 if error {
@@ -486,18 +598,24 @@ impl App {
                 }
             }
             (JobPurpose::Transfer { options }, Some(value)) => {
-                if let Some(id) = sf::deploy::parse_started_job_id(&value) {
+                if options.retrieve {
+                    let mut report = sf::deploy::parse_report(&value);
+                    if report.status.is_empty() {
+                        report.status = if outcome.succeeded() {
+                            "Succeeded".to_owned()
+                        } else {
+                            "Failed".to_owned()
+                        };
+                    }
+                    self.deploy_state.report = Some(report);
+                    self.deploy_state.job_id = None;
+                    self.deploy_state.poll_after = None;
+                    self.notice("Retrieve finished");
+                } else if let Some(id) = sf::deploy::parse_started_job_id(&value) {
                     self.deploy_state.job_id = Some(id.clone());
                     self.deploy_state.poll_after = Some(Instant::now() + Duration::from_secs(3));
                     self.deploy_state.report = None;
-                    self.notice(format!(
-                        "Started {} job {id}",
-                        if options.retrieve {
-                            "retrieve"
-                        } else {
-                            "deploy"
-                        }
-                    ));
+                    self.notice(format!("Started deploy job {id}"));
                 }
             }
             (JobPurpose::Report { .. }, Some(value)) => {
@@ -556,7 +674,9 @@ impl App {
         {
             let options = self.deploy_state.options.clone();
             self.deploy_state.poll_after = Some(Instant::now() + Duration::from_secs(4));
-            self.spawn(options.report_argv(&job_id), JobPurpose::Report { options });
+            if let Some(argv) = options.report_argv(&job_id) {
+                self.spawn(argv, JobPurpose::Report { options });
+            }
         }
     }
 
@@ -689,7 +809,7 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Tab => self.switch_tab(1),
             KeyCode::BackTab => self.switch_tab(-1),
-            KeyCode::Char(number @ '1'..='6') => {
+            KeyCode::Char(number @ '1'..='7') => {
                 let index = number as usize - '1' as usize;
                 if let Some(tab) = self.tabs().get(index).copied() {
                     self.tab = tab;
@@ -702,8 +822,10 @@ impl App {
                     self.status.clear();
                 }
             }
+            KeyCode::Backspace if self.tab == Tab::Home => self.tab = Tab::Catalog,
             KeyCode::Char('y') => self.copy_context(),
             _ => match self.tab {
+                Tab::Home => self.home_key(key),
                 Tab::Catalog => self.catalog_key(key),
                 Tab::Favorites => self.favorites_key(key),
                 Tab::Orgs => self.org_key(key),
@@ -719,6 +841,19 @@ impl App {
         let current = tabs.iter().position(|tab| *tab == self.tab).unwrap_or(0) as isize;
         let index = (current + delta).rem_euclid(tabs.len() as isize) as usize;
         self.tab = tabs[index];
+        self.notice(format!("{} — {}", self.tab.label(), self.tab_action_hint()));
+    }
+
+    fn tab_action_hint(&self) -> &'static str {
+        match self.tab {
+            Tab::Home => "a login · r retrieve · d deploy · t test · g results",
+            Tab::Catalog => "/ search · Enter help · r run",
+            Tab::Favorites => "Enter run · e preset · x remove",
+            Tab::Orgs => "Enter details · o open · l login",
+            Tab::Deploy => "Space select · m payload · Enter run",
+            Tab::Output => "j/k scroll · z JSON · Y copy",
+            Tab::Setup => "Enter installer · r re-probe",
+        }
     }
 
     fn refresh_current_tab(&mut self) {
@@ -735,6 +870,7 @@ impl App {
 
     fn copy_context(&mut self) {
         let text = match self.tab {
+            Tab::Home => Some(QUICK_ACTIONS[self.home_state.selected].command.to_owned()),
             Tab::Catalog => self.selected_catalog_id().map(|id| format!("sf {id}")),
             Tab::Favorites => self.selected_favorite_id().map(|id| {
                 format!("sf {id} {}", self.preset_flags(&id).join(" "))
@@ -761,13 +897,123 @@ impl App {
         }
     }
 
+    // ----- Home ---------------------------------------------------------------------
+
+    fn home_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.home_state.selected = self.home_state.selected.saturating_sub(1),
+            KeyCode::Down => {
+                self.home_state.selected =
+                    (self.home_state.selected + 1).min(QUICK_ACTIONS.len() - 1)
+            }
+            KeyCode::Enter => self.run_quick_action(self.home_state.selected),
+            KeyCode::Char(character) => {
+                if let Some(index) = QUICK_ACTIONS
+                    .iter()
+                    .position(|action| action.key == character.to_ascii_lowercase())
+                {
+                    self.run_quick_action(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn run_quick_action(&mut self, index: usize) {
+        let Some(action) = QUICK_ACTIONS.get(index) else {
+            return;
+        };
+        let target = self.org_target_hint();
+        match action.command {
+            "sf org login web" => {
+                self.open_prompt(
+                    "Log in to an org (web)",
+                    PromptKind::LoginWeb,
+                    vec![PromptField::new("Alias (optional)", "")],
+                );
+            }
+            "sf project retrieve start" => {
+                let paths = self.project_source_paths();
+                self.open_prompt(
+                    "Retrieve metadata — paths from sfdx-project.json are pre-filled",
+                    PromptKind::QuickRetrieve,
+                    vec![
+                        PromptField::new("Source dirs (comma separated)", paths),
+                        PromptField::new("Target org", target),
+                    ],
+                );
+            }
+            "sf project deploy start" => {
+                let paths = self.project_source_paths();
+                self.open_prompt(
+                    "Deploy metadata — paths from sfdx-project.json are pre-filled",
+                    PromptKind::QuickDeploy,
+                    vec![
+                        PromptField::new("Source dirs (comma separated)", paths),
+                        PromptField::new("Target org", target),
+                    ],
+                );
+            }
+            "sf apex run test" => {
+                self.open_prompt(
+                    "Run Apex tests",
+                    PromptKind::RunApexTests,
+                    vec![
+                        PromptField::new("Target org", target),
+                        PromptField::new("Test classes (optional)", ""),
+                        PromptField::new("Result format (human/json)", "human"),
+                    ],
+                );
+            }
+            "sf logic get test" => {
+                self.open_prompt(
+                    "Get test results",
+                    PromptKind::GetTestResults,
+                    vec![
+                        PromptField::new("Test run id", ""),
+                        PromptField::new("Target org", target),
+                    ],
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub fn project_source_paths(&self) -> String {
+        self.deploy_state
+            .project
+            .as_ref()
+            .map(|project| project.package_directories.join(", "))
+            .unwrap_or_else(|| "force-app".to_owned())
+    }
+
+    pub fn org_target_hint(&self) -> String {
+        self.org_state
+            .orgs
+            .iter()
+            .find(|org| org.is_default)
+            .map(|org| org.label())
+            .unwrap_or_default()
+    }
+
     // ----- Catalog -----------------------------------------------------------------
 
     pub fn catalog_rows(&self) -> Vec<CatalogRow> {
         let catalog = &self.startup.catalog;
         let query = self.catalog_state.query.trim();
         if query.is_empty() {
-            let mut rows = Vec::new();
+            let mut rows = vec![CatalogRow::Header(
+                "Popular — your five most used commands".to_owned(),
+            )];
+            for id in POPULAR_COMMAND_IDS {
+                if let Some(command) = catalog.command(id) {
+                    rows.push(command_row(
+                        command,
+                        None,
+                        self.config.is_favorite(&command.id),
+                    ));
+                }
+            }
             let mut categories = catalog.categories();
             categories.sort();
             for category in categories {
@@ -776,6 +1022,7 @@ impl App {
                     .commands
                     .iter()
                     .filter(|command| command.category == category)
+                    .filter(|command| !POPULAR_COMMAND_IDS.contains(&command.id.as_str()))
                 {
                     rows.push(command_row(
                         command,
@@ -1105,8 +1352,8 @@ impl App {
             KeyCode::Char('m') => {
                 self.deploy_state.options.mode = match self.deploy_state.options.mode {
                     PayloadMode::Source => PayloadMode::Manifest,
-                    PayloadMode::Manifest => PayloadMode::TrackedChanges,
-                    PayloadMode::TrackedChanges => PayloadMode::Source,
+                    PayloadMode::Manifest => PayloadMode::Metadata,
+                    PayloadMode::Metadata => PayloadMode::Source,
                 };
             }
             KeyCode::Char('v') => {
@@ -1142,8 +1389,11 @@ impl App {
             KeyCode::Char('p') => {
                 if let Some(job_id) = self.deploy_state.job_id.clone() {
                     let options = self.deploy_state.options.clone();
-                    self.spawn(options.report_argv(&job_id), JobPurpose::Report { options });
-                    self.deploy_state.poll_after = Some(Instant::now() + Duration::from_secs(4));
+                    if let Some(argv) = options.report_argv(&job_id) {
+                        self.spawn(argv, JobPurpose::Report { options });
+                        self.deploy_state.poll_after =
+                            Some(Instant::now() + Duration::from_secs(4));
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -1195,7 +1445,7 @@ impl App {
             PayloadMode::Manifest => {
                 options.manifest = Some(item.path);
             }
-            PayloadMode::TrackedChanges => {}
+            PayloadMode::Metadata => {}
         }
     }
 
@@ -1207,6 +1457,17 @@ impl App {
         }
         if options.mode == PayloadMode::Manifest && options.manifest.is_none() {
             self.error("Select a package.xml manifest first");
+            return;
+        }
+        if options.mode == PayloadMode::Metadata && options.metadata_names.is_empty() {
+            self.open_prompt(
+                "Metadata names",
+                PromptKind::MetadataNames,
+                vec![PromptField::new(
+                    "Comma separated, e.g. ApexClass, Flow, CustomObject",
+                    "",
+                )],
+            );
             return;
         }
         let argv = options.argv();
@@ -1395,11 +1656,104 @@ impl App {
                 self.config.set_preset_flags(id, flags);
                 self.notice("Preset flags saved");
             }
+            PromptKind::QuickRetrieve | PromptKind::QuickDeploy => {
+                let retrieve = matches!(kind, PromptKind::QuickRetrieve);
+                let paths = split_names(values.first().map(String::as_str).unwrap_or(""));
+                let paths = if paths.is_empty() {
+                    split_names(&self.project_source_paths())
+                } else {
+                    paths
+                };
+                let options = &mut self.deploy_state.options;
+                options.retrieve = retrieve;
+                options.mode = PayloadMode::Source;
+                options.paths = paths;
+                options.target_org = values.get(1).filter(|org| !org.is_empty()).cloned();
+                self.tab = Tab::Deploy;
+                self.notice(if retrieve {
+                    "Retrieve ready — source paths are pre-filled; press Enter to run"
+                } else {
+                    "Deploy ready — source paths are pre-filled; press Enter to run"
+                });
+            }
+            PromptKind::RunApexTests => {
+                let classes = split_names(values.get(1).map(String::as_str).unwrap_or(""));
+                let format = match values.get(2).map(String::as_str).unwrap_or("human") {
+                    "json" => "json",
+                    _ => "human",
+                };
+                let mut argv = vec![
+                    "apex".to_owned(),
+                    "run".to_owned(),
+                    "test".to_owned(),
+                    "--result-format".to_owned(),
+                    format.to_owned(),
+                    "--wait".to_owned(),
+                    "10".to_owned(),
+                ];
+                for class_name in classes {
+                    argv.push("--class-names".to_owned());
+                    argv.push(class_name);
+                }
+                if let Some(org) = values.first().filter(|org| !org.is_empty()) {
+                    argv.push("--target-org".to_owned());
+                    argv.push(org.clone());
+                }
+                argv.push("--json".to_owned());
+                let display = format!("sf {}", argv.join(" "));
+                self.spawn(
+                    argv,
+                    JobPurpose::Command {
+                        id: "apex run test".to_owned(),
+                        command: display,
+                    },
+                );
+            }
+            PromptKind::GetTestResults => {
+                let Some(run_id) = values.first().filter(|id| !id.is_empty()) else {
+                    self.error("A test run id is required");
+                    return;
+                };
+                let mut argv = vec![
+                    "logic".to_owned(),
+                    "get".to_owned(),
+                    "test".to_owned(),
+                    "--test-run-id".to_owned(),
+                    run_id.clone(),
+                ];
+                if let Some(org) = values.get(1).filter(|org| !org.is_empty()) {
+                    argv.push("--target-org".to_owned());
+                    argv.push(org.clone());
+                }
+                argv.push("--json".to_owned());
+                let display = format!("sf {}", argv.join(" "));
+                self.spawn(
+                    argv,
+                    JobPurpose::Command {
+                        id: "logic get test".to_owned(),
+                        command: display,
+                    },
+                );
+            }
+            PromptKind::MetadataNames => {
+                let names = split_names(values.first().map(String::as_str).unwrap_or(""));
+                if names.is_empty() {
+                    self.error("Enter at least one metadata name, e.g. ApexClass, Flow");
+                    return;
+                }
+                self.deploy_state.options.metadata_names = names;
+                self.run_transfer();
+            }
             PromptKind::LoginWeb => {
                 let mut argv = vec!["org".to_owned(), "login".to_owned(), "web".to_owned()];
                 if let Some(alias) = values.first().filter(|alias| !alias.is_empty()) {
                     argv.push("--alias".to_owned());
                     argv.push(alias.clone());
+                }
+                if values.get(1).is_some_and(|answer| {
+                    matches!(answer.to_ascii_lowercase().as_str(), "y" | "yes" | "true")
+                }) {
+                    argv.push("--set-default".to_owned());
                 }
                 argv.push("--json".to_owned());
                 self.spawn(
@@ -1567,11 +1921,7 @@ Output appears in the Output tab."
             self.notice("A probe is already running");
             return;
         }
-        let tx = self.event_tx.clone();
-        self.probe_task = Some(tokio::spawn(async move {
-            let startup = sf::startup().await;
-            let _ = tx.send(AppEvent::Startup(startup));
-        }));
+        self.start_probe();
         self.notice("Re-probing the Salesforce CLI…");
     }
 }
@@ -1612,6 +1962,20 @@ fn build_pick_items(project: &SfProject) -> Vec<PickItem> {
     items
 }
 
+/// Split a user-entered list on commas or whitespace, keeping quoted paths intact.
+pub(crate) fn split_names(input: &str) -> Vec<String> {
+    split_args(input)
+        .into_iter()
+        .flat_map(|part| {
+            part.split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 pub(crate) fn split_args(input: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
@@ -1648,8 +2012,9 @@ pub async fn run(
     terminal: &mut DefaultTerminal,
     startup: Startup,
     config: Config,
+    config_dir: PathBuf,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(startup, config);
+    let mut app = App::new(startup, config, config_dir);
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     while !app.should_quit {
         tokio::select! {
@@ -1674,6 +2039,9 @@ mod tests {
     use crate::sf::catalog::CatalogSource;
 
     fn test_app() -> App {
+        let _guard = tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .enter();
         App::new(
             Startup {
                 installation: None,
@@ -1702,6 +2070,7 @@ mod tests {
                 notices: Vec::new(),
             },
             Config::default(),
+            std::path::PathBuf::from("/tmp/sftui-test"),
         )
     }
 
@@ -1710,14 +2079,15 @@ mod tests {
     }
 
     #[test]
-    fn switching_tabs_wraps_and_skips_missing_setup_tab() {
+    fn switching_tabs_covers_home_and_number_shortcuts() {
         let mut app = test_app();
-        app.tab = Tab::Catalog;
-        assert_eq!(app.tab, Tab::Catalog);
+        assert_eq!(app.tab, Tab::Home);
         app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Setup);
-        app.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(app.tab, Tab::Output);
+        app.handle_key(key(KeyCode::Char('4')));
         assert_eq!(app.tab, Tab::Orgs);
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.tab, Tab::Home);
     }
 
     #[test]
@@ -1756,6 +2126,37 @@ mod tests {
         assert_eq!(
             split_args("--target-org 'my org' --json"),
             vec!["--target-org", "my org", "--json"]
+        );
+    }
+
+    #[test]
+    fn home_screen_shortcuts_open_prefilled_prompts() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        app.handle_key(key(KeyCode::Char('r')));
+        match app.modal.as_ref() {
+            Some(Modal::Prompt { kind, fields, .. }) => {
+                assert!(matches!(kind, PromptKind::QuickRetrieve));
+                assert_eq!(fields[0].value, "force-app");
+            }
+            other => panic!("expected retrieve prompt, got {other:?}"),
+        }
+        app.modal = None;
+        app.handle_key(key(KeyCode::Char('g')));
+        assert!(matches!(
+            app.modal.as_ref(),
+            Some(Modal::Prompt {
+                kind: PromptKind::GetTestResults,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn split_names_handles_commas_and_spaces() {
+        assert_eq!(
+            split_names("force-app, \"my package/src\",other"),
+            vec!["force-app", "my package/src", "other"]
         );
     }
 

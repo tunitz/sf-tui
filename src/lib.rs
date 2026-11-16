@@ -13,10 +13,17 @@ pub mod ui;
 use anyhow::Context;
 use config::Config;
 
-/// Entry point used by the binary: probe the CLI before entering the alternate screen.
+/// Entry point used by the binary: open the UI immediately, then probe the CLI in the background.
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load().context("loading configuration")?;
-    let startup = sf::startup().await;
+    let config_dir = Config::path()
+        .and_then(|path| {
+            path.parent()
+                .map(std::path::Path::to_path_buf)
+                .ok_or(config::ConfigError::NoConfigDirectory)
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let startup = sf::Startup::pending();
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -25,7 +32,7 @@ pub async fn run() -> anyhow::Result<()> {
     }));
 
     let mut terminal = ratatui::try_init().context("initializing terminal")?;
-    let result = app::run(&mut terminal, startup, config).await;
+    let result = app::run(&mut terminal, startup, config, config_dir).await;
     let _ = ratatui::try_restore();
     result
 }

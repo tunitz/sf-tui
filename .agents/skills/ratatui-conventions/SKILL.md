@@ -9,7 +9,8 @@ description: How this repository structures its ratatui/crossterm event loop, ap
 
 - Use the pinned ratatui version (0.30.x). It ships `try_init()` / `try_restore()` and a panic
   hook must restore the terminal before delegating to the previous hook.
-- The binary probes the Salesforce CLI *before* entering the alternate screen.
+- The binary draws the first frame before probing the Salesforce CLI. Startup stages arrive as
+  `AppEvent::Startup` and are shown in the Home screen and header with elapsed seconds.
 - The loop waits on `tokio::select!` between a 100 ms ticker and the application event channel.
   Terminal events are drained with `crossterm::event::poll(Duration::ZERO)` and `read()`, so the
   event loop never blocks waiting for a key.
@@ -38,7 +39,8 @@ description: How this repository structures its ratatui/crossterm event loop, ap
 - Highlight with one accent color from config; use dim gray for secondary information and reserve
   red for errors and yellow for warnings. Keep stderr in a distinct color.
 - Do not display credentials or tokens even when the CLI returns them; filter them in the parser.
-- Keep a useful hint line on the footer so the interface is discoverable without external docs.
+- Every screen has an `Actions` bar with bracketed keys and verb labels; the footer carries only
+  navigation keys. Prefer progressive disclosure: one-line list rows, detail on demand.
 
 ## Headless tests
 

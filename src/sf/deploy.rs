@@ -9,7 +9,7 @@ use super::catalog::string_field;
 pub enum PayloadMode {
     Source,
     Manifest,
-    TrackedChanges,
+    Metadata,
 }
 
 impl PayloadMode {
@@ -17,7 +17,7 @@ impl PayloadMode {
         match self {
             Self::Source => "Source paths",
             Self::Manifest => "Manifest (package.xml)",
-            Self::TrackedChanges => "Tracked changes",
+            Self::Metadata => "Metadata names (no paths)",
         }
     }
 }
@@ -57,6 +57,7 @@ pub struct TransferOptions {
     pub mode: PayloadMode,
     pub paths: Vec<String>,
     pub manifest: Option<String>,
+    pub metadata_names: Vec<String>,
     pub check_only: bool,
     pub ignore_warnings: bool,
     pub test_level: TestLevel,
@@ -71,6 +72,7 @@ impl Default for TransferOptions {
             mode: PayloadMode::Source,
             paths: Vec::new(),
             manifest: None,
+            metadata_names: Vec::new(),
             check_only: false,
             ignore_warnings: false,
             test_level: TestLevel::NoTestRun,
@@ -93,9 +95,9 @@ impl TransferOptions {
         .collect();
         match self.mode {
             PayloadMode::Source => {
-                if !self.paths.is_empty() {
-                    argv.push("--source-path".to_owned());
-                    argv.push(self.paths.join(","));
+                for path in &self.paths {
+                    argv.push("--source-dir".to_owned());
+                    argv.push(path.clone());
                 }
             }
             PayloadMode::Manifest => {
@@ -104,17 +106,24 @@ impl TransferOptions {
                     argv.push(manifest.clone());
                 }
             }
-            PayloadMode::TrackedChanges => argv.push("--tracked-changes".to_owned()),
+            PayloadMode::Metadata => {
+                for name in &self.metadata_names {
+                    argv.push("--metadata".to_owned());
+                    argv.push(name.clone());
+                }
+            }
         }
         if !self.retrieve {
             if self.check_only {
-                argv.push("--check-only".to_owned());
+                argv.push("--dry-run".to_owned());
             }
             argv.push("--test-level".to_owned());
             argv.push(self.test_level.as_str().to_owned());
-            if self.test_level == TestLevel::RunSpecifiedTests && !self.tests.is_empty() {
-                argv.push("--tests".to_owned());
-                argv.push(self.tests.join(","));
+            if self.test_level == TestLevel::RunSpecifiedTests {
+                for test in &self.tests {
+                    argv.push("--tests".to_owned());
+                    argv.push(test.clone());
+                }
             }
             if self.ignore_warnings {
                 argv.push("--ignore-warnings".to_owned());
@@ -130,15 +139,20 @@ impl TransferOptions {
         argv
     }
 
-    pub fn report_argv(&self, job_id: &str) -> Vec<String> {
-        vec![
+    /// The current CLI has `project deploy report` but no `project retrieve report`.
+    /// Retrieve commands are run with `--wait` and produce their final result directly.
+    pub fn report_argv(&self, job_id: &str) -> Option<Vec<String>> {
+        if self.retrieve {
+            return None;
+        }
+        Some(vec![
             "project".to_owned(),
-            if self.retrieve { "retrieve" } else { "deploy" }.to_owned(),
+            "deploy".to_owned(),
             "report".to_owned(),
             "--job-id".to_owned(),
             job_id.to_owned(),
             "--json".to_owned(),
-        ]
+        ])
     }
 }
 
@@ -250,7 +264,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deploy_argv_contains_selected_paths_and_flags() {
+    fn deploy_argv_uses_current_cli_flags() {
         let options = TransferOptions {
             paths: vec!["force-app/main/default".to_owned()],
             check_only: true,
@@ -265,9 +279,9 @@ mod tests {
                 "project",
                 "deploy",
                 "start",
-                "--source-path",
+                "--source-dir",
                 "force-app/main/default",
-                "--check-only",
+                "--dry-run",
                 "--test-level",
                 "RunSpecifiedTests",
                 "--tests",
@@ -280,10 +294,11 @@ mod tests {
     }
 
     #[test]
-    fn retrieve_argv_uses_tracked_changes_and_report_id() {
+    fn retrieve_argv_uses_metadata_names_and_has_no_report_command() {
         let options = TransferOptions {
             retrieve: true,
-            mode: PayloadMode::TrackedChanges,
+            mode: PayloadMode::Metadata,
+            metadata_names: vec!["ApexClass".to_owned()],
             ..TransferOptions::default()
         };
         assert_eq!(
@@ -292,21 +307,12 @@ mod tests {
                 "project",
                 "retrieve",
                 "start",
-                "--tracked-changes",
+                "--metadata",
+                "ApexClass",
                 "--json"
             ]
         );
-        assert_eq!(
-            options.report_argv("0Af000000000001"),
-            vec![
-                "project",
-                "retrieve",
-                "report",
-                "--job-id",
-                "0Af000000000001",
-                "--json"
-            ]
-        );
+        assert!(options.report_argv("0Af000000000001").is_none());
     }
 
     #[test]

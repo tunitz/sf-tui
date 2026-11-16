@@ -15,10 +15,10 @@ src/lib.rs             crate root and layering guard test
 src/app.rs             application state, key dispatch, background job ownership, event loop
 src/ui.rs              all ratatui rendering
 src/config.rs          TOML config, favorites, recent runs, theme
+data/commands.json     bundled command catalog snapshot; cached refresh lives beside config.toml
 src/json_view.rs       JSON-to-table rendering
 src/clipboard.rs       OS clipboard helpers
 src/sf/                CLI detection, process runner, command catalog, org/project/deploy parsing
-data/commands.json     bundled command catalog snapshot (offline fallback)
 tests/                 integration tests and synthetic CLI stub fixtures
 .github/workflows/     CI and release automation
 install.sh/.ps1        user-level installers (no admin rights)
@@ -46,7 +46,8 @@ To debug the interface, run the release binary inside a terminal at least 100x30
   binary boundary and the terminal lifecycle. Never panic on user input, files or CLI output.
 - **Async boundaries:** every spawned task has an owner. Process tasks return through a tracked
   job map and an application event channel; cancellation is explicit. The UI thread never awaits
-  a long-running CLI command directly.
+  a long-running CLI command directly. CLI discovery and probing happen after the first frame so
+  a slow Windows `sf` process is visible as progress, never as a blank screen.
 - **JSON parsing:** treat all CLI output as untrusted. Parse defensively with `serde_json::Value`
   helpers, accept both `result`-wrapped and bare shapes, and never print tokens, auth URLs,
   passwords or secrets. Snapshot and fixture data must be synthetic only.

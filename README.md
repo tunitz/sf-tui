@@ -6,11 +6,17 @@ A single-binary terminal UI for the Salesforce CLI. `sftui` wraps the `sf` execu
 installed on your machine: it does not store credentials, and all authentication stays with `sf`
 in its own home directory.
 
-The interface has two layers:
+The interface opens on a **Home** screen with five labelled shortcuts for the commands people use
+most: org login, retrieve, deploy, Apex tests and test results. Behind it are:
 
+- **focused screens** for org operations and metadata deploy/retrieve, with project paths and the
+  default org pre-filled so you do not retype them;
 - a **generic command catalog** covering the full `sf` CLI surface (fuzzy search, favorites,
-  preset flags, exact invocation and streamed output);
-- **focused screens** for org operations and metadata deploy/retrieve.
+  preset flags, exact invocation and streamed output).
+
+Startup is non-blocking: the UI appears immediately with a visible progress line while `sf` is
+probed in the background. The bundled catalog is usable during the probe, and a successful command
+refresh is cached for seven days.
 
 ## Install
 
@@ -47,22 +53,18 @@ For a nonstandard location, set `SFTUI_SF_PATH` to the full path of the executab
 
 ## Keybindings
 
-| Key | Action |
-| --- | --- |
-| `Tab` / `Shift+Tab`, `1`–`6` | switch screens |
-| `?` | keyboard help |
-| `q` | quit |
-| `Ctrl+C` | cancel the newest running command, or quit when idle |
-| `F5` | refresh orgs, project or catalog |
+Every screen shows a compact **Actions** bar with keys and labels. `Tab` cycles screens, digits
+`1`–`7` jump directly, `?` opens the full key map and `q` quits.
 
 | Screen | Keys |
 | --- | --- |
-| Catalog | `/` search · `↑↓` move · `Enter` load live `--help` · `r` run with flags · `f` favorite · `e` preset flags · `y` copy |
-| Favorites | `Enter` run · `Ctrl+↑↓` reorder · `e` preset · `x` remove |
-| Orgs | `↑↓` move · `Enter` details · `o` open browser · `d` project default · `D` dev hub · `x` logout · `l` web login · `c` scratch org |
-| Deploy/Retrieve | `Space` select metadata · `m` payload mode · `v` check-only · `t` test level · `w` ignore warnings · `o` target org · `r` toggle retrieve · `Enter` run · `p` poll now |
-| Output | `↑↓` history · `j`/`k` scroll · `z` toggle JSON table · `y` copy command · `Y` copy output |
-| Setup | `↑↓` installer · `Enter` run installer · `r` re-probe |
+| Home | `a` log in · `r` retrieve · `d` deploy · `t` run Apex tests · `g` get test results |
+| Catalog | `/` search · `↑↓` move · `Enter` live `--help` · `r` run with flags · `f` favorite |
+| Favorites | `Enter` run · `Ctrl+↑↓` reorder · `e` preset flags · `x` remove |
+| Orgs | `↑↓` move · `Enter` details · `o` open browser · `d` project default · `D` dev hub · `x` logout · `l` login · `c` scratch org |
+| Deploy/Retrieve | `Space` select · `m` payload mode · `v` validate · `t` test level · `w` ignore warnings · `o` target org · `r` toggle retrieve · `Enter` run |
+| Output | `↑↓` history · `j`/`k` scroll · `z` JSON table · `y` copy command · `Y` copy output |
+| Setup | `↑↓` installer · `Enter` run · `r` re-probe |
 
 ## Walkthroughs
 
@@ -76,13 +78,17 @@ scratch org with an alias, definition file and duration.
 
 ### Deploy or retrieve metadata
 
-Open **Deploy/Retrieve**. `sftui` walks upward from the current directory to find
-`sfdx-project.json` and lists package directories, manifests and source files. Choose a payload
-mode with `m`, select paths with `Space`, set validation and test options, then press `Enter`. The
-exact command is shown and streamed in **Output**. An asynchronous job id triggers periodic
-`sf project deploy report --json --job-id …` polling with a spinner and component counts; failures
-and their problems are shown in the results panel. Retrieve uses the same flow with manifests,
-source paths or tracked changes.
+From Home press `r` or `d`. `sftui` walks upward from the current directory to find
+`sfdx-project.json`, pre-fills the package directories and leaves the target org blank so the CLI
+uses your default. Confirm the prefilled prompt, review the exact command on the Deploy/Retrieve
+screen and press `Enter` to run. You can still choose a manifest, individual source paths with
+`Space`, or type metadata names with mode `m` — but you never have to type the full project path.
+
+Deploy uses `sf project deploy start --source-dir …` with `--dry-run` for validation, and an async
+job id triggers `sf project deploy report --json --job-id …` polling with a spinner and component
+counts. Retrieve uses `sf project retrieve start` and shows its final result directly, matching the
+current CLI (there is no `project retrieve report` command). Failures and their problems are shown
+in the results panel and the raw stream stays in Output.
 
 ## Configuration
 
@@ -94,7 +100,8 @@ Configuration lives in a per-user directory chosen by the `directories` crate:
 
 Set `SFTUI_CONFIG_DIR` to use a different directory. The TOML file contains `favorites`
 (command id plus preset flags), `recent_runs` and `theme.accent` (`cyan`, `green`, `yellow`,
-`blue`, `magenta`, `red`). It is created on first exit.
+`blue`, `magenta`, `red`). It is created on first exit. A `catalog-cache.json` file beside it
+stores the last successful `sf commands --json` response for seven days.
 
 ## Development
 
