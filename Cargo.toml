@@ -1,0 +1,47 @@
+[package]
+name = "sf-tui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+authors = ["tunitz"]
+description = "A cross-platform terminal UI for the Salesforce CLI"
+repository = "https://github.com/tunitz/sf-tui"
+
+[lib]
+name = "sftui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sftui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+directories = "6"
+fuzzy-matcher = "0.3"
+open = "5"
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "sync", "time", "io-util"] }
+thiserror = "2"
+toml = "0.9"
+which = "8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

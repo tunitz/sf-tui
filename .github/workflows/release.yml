@@ -1,0 +1,147 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  verify-version:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare versions
+        shell: bash
+        run: |
+          manifest_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          tag_version="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml: $manifest_version / tag: $tag_version"
+          if [[ "$manifest_version" != "$tag_version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $manifest_version"
+            exit 1
+          fi
+
+  verify-quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets --locked
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [verify-version, verify-quality]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross linker
+        if: matrix.cross
+        uses: taiki-e/install-action@cross
+      - name: Add Rust target
+        if: ${{ !matrix.cross }}
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+      - name: Package binary only
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="sftui-${version}-${{ matrix.target }}"
+          mkdir -p dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "dist/${asset}.zip" "./target/${{ matrix.target }}/release/sftui.exe"
+          else
+            tar -czf "dist/${asset}.tar.gz" -C "target/${{ matrix.target }}/release" sftui
+          fi
+          ls -lh dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List assets
+        run: ls -lh dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  verify-assets:
+    name: Verify published assets
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all five binaries are attached
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          expected=(
+            "sftui-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "sftui-${version}-aarch64-unknown-linux-gnu.tar.gz"
+            "sftui-${version}-x86_64-apple-darwin.tar.gz"
+            "sftui-${version}-aarch64-apple-darwin.tar.gz"
+            "sftui-${version}-x86_64-pc-windows-msvc.zip"
+          )
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" \
+            --jq '.assets[].name' > assets.txt
+          for asset in "${expected[@]}"; do
+            grep -Fxq "$asset" assets.txt || { echo "::error::Missing asset $asset"; exit 1; }
+          done
+          echo "All ${#expected[@]} release assets are published"
