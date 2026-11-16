@@ -16,6 +16,7 @@ src/app.rs             application state, key dispatch, background job ownership
 src/ui.rs              all ratatui rendering
 src/config.rs          TOML config, favorites, recent runs, theme
 data/commands.json     bundled command catalog snapshot; cached refresh lives beside config.toml
+src/sf/metadata.rs     component/template suggestion candidates (fuzzy completion)
 src/json_view.rs       JSON-to-table rendering
 src/clipboard.rs       OS clipboard helpers
 src/sf/                CLI detection, process runner, command catalog, org/project/deploy parsing

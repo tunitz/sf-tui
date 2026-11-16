@@ -274,7 +274,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
 fn key_hints(app: &App) -> String {
     let common = "Tab next screen · ? help · q quit";
     let specific = match app.tab {
-        Tab::Home => "a login · r retrieve · d deploy · t test · g test results",
+        Tab::Home => "r retrieve · d deploy · t tests · g results · c create · a login",
         Tab::Catalog => "/ search · Enter help · r run · f favorite",
         Tab::Favorites => "Enter run · Ctrl+↑↓ reorder · e preset",
         Tab::Orgs => "Enter details · o open · d default · l login",
@@ -329,7 +329,11 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
             })
             .collect();
         let mut state = ListState::default();
-        state.select(Some(app.home_state.selected.min(QUICK_ACTIONS_LEN - 1)));
+        state.select(Some(
+            app.home_state
+                .selected
+                .min(crate::app::QUICK_ACTIONS.len() - 1),
+        ));
         frame.render_stateful_widget(
             List::new(items)
                 .block(block("Home — a/r/d/t/g run a task", app))
@@ -400,7 +404,11 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let mut state = ListState::default();
-    state.select(Some(app.home_state.selected.min(QUICK_ACTIONS_LEN - 1)));
+    state.select(Some(
+        app.home_state
+            .selected
+            .min(crate::app::QUICK_ACTIONS.len() - 1),
+    ));
     let list = List::new(items)
         .block(block(
             "What do you want to do? Five keys cover most work.",
@@ -434,11 +442,7 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
         ))),
         Line::from(" "),
         action_bar(
-            vec![
-                ("1-5", "go to screen"),
-                ("?", "all shortcuts"),
-                ("q", "quit"),
-            ],
+            vec![("r/d", "retrieve/deploy"), ("c", "create"), ("?", "keys")],
             app,
         ),
         Line::from(" "),
@@ -464,8 +468,6 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
         columns[1],
     );
 }
-
-const QUICK_ACTIONS_LEN: usize = 5;
 
 fn draw_catalog(frame: &mut Frame, area: Rect, app: &App) {
     let density = density(area);
@@ -1564,10 +1566,24 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                     ));
                 }
                 lines.push(Line::from(spans));
+                let suggestions = crate::app::suggestions_for(field);
+                for (index, suggestion) in suggestions.iter().take(3).enumerate() {
+                    let chosen = active && field.suggestion_index.unwrap_or(0) == index;
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("    {} ", if chosen { ">" } else { " " }),
+                            Style::default().fg(if chosen { accent(app) } else { Color::DarkGray }),
+                        ),
+                        faint(truncated(
+                            suggestion,
+                            usize::from(area.width).saturating_sub(10),
+                        )),
+                    ]));
+                }
                 lines.push(Line::from(" "));
             }
             lines.push(Line::from(faint(
-                "Enter submit · Tab next field · ←→ cursor · Esc cancel",
+                "Enter accept/submit · ↑↓ suggestions · Tab next field · Esc cancel",
             )));
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block(title.clone(), app)),

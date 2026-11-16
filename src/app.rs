@@ -114,34 +114,40 @@ pub struct QuickAction {
 
 pub const QUICK_ACTIONS: &[QuickAction] = &[
     QuickAction {
-        key: 'a',
-        label: "Log in to an org",
-        command: "sf org login web",
-        hint: "Open the browser login flow",
-    },
-    QuickAction {
         key: 'r',
         label: "Retrieve metadata",
         command: "sf project retrieve start",
-        hint: "Pre-filled from this project's source paths",
+        hint: "Most used — type a component name and pick from fuzzy matches",
     },
     QuickAction {
         key: 'd',
         label: "Deploy metadata",
         command: "sf project deploy start",
-        hint: "Pre-filled from this project's source paths",
+        hint: "Most used — type a component name and pick from fuzzy matches",
     },
     QuickAction {
         key: 't',
         label: "Run Apex tests",
         command: "sf apex run test",
-        hint: "Uses your default org unless you enter another",
+        hint: "Second most used — default org is used when left blank",
     },
     QuickAction {
         key: 'g',
         label: "Get test results",
         command: "sf logic get test",
-        hint: "Enter a test run id when prompted",
+        hint: "Second most used — enter a test run id",
+    },
+    QuickAction {
+        key: 'c',
+        label: "Create metadata",
+        command: "sf template generate",
+        hint: "Third — fuzzy-pick a template, then name the component",
+    },
+    QuickAction {
+        key: 'a',
+        label: "Log in to an org",
+        command: "sf org login web",
+        hint: "Infrequent — browser login, usually once every couple of months",
     },
 ];
 
@@ -263,6 +269,8 @@ pub struct PromptField {
     pub label: String,
     pub value: String,
     pub cursor: usize,
+    pub suggestion_set: Option<crate::sf::metadata::SuggestionSet>,
+    pub suggestion_index: Option<usize>,
 }
 
 impl PromptField {
@@ -273,7 +281,14 @@ impl PromptField {
             label: label.into(),
             value,
             cursor,
+            suggestion_set: None,
+            suggestion_index: None,
         }
+    }
+
+    pub fn with_suggestions(mut self, suggestion_set: crate::sf::metadata::SuggestionSet) -> Self {
+        self.suggestion_set = Some(suggestion_set);
+        self
     }
 }
 
@@ -284,6 +299,7 @@ pub enum PromptKind {
     QuickDeploy,
     RunApexTests,
     GetTestResults,
+    CreateMetadata,
     MetadataNames,
     EditPreset { id: String },
     LoginWeb,
@@ -846,7 +862,7 @@ impl App {
 
     fn tab_action_hint(&self) -> &'static str {
         match self.tab {
-            Tab::Home => "a login · r retrieve · d deploy · t test · g results",
+            Tab::Home => "r retrieve · d deploy · t tests · g results · c create · a login",
             Tab::Catalog => "/ search · Enter help · r run",
             Tab::Favorites => "Enter run · e preset · x remove",
             Tab::Orgs => "Enter details · o open · l login",
@@ -932,25 +948,25 @@ impl App {
                     vec![PromptField::new("Alias (optional)", "")],
                 );
             }
-            "sf project retrieve start" => {
-                let paths = self.project_source_paths();
+            "sf project retrieve start" | "sf project deploy start" => {
+                let retrieve = action.command == "sf project retrieve start";
+                let suggestions =
+                    crate::sf::metadata::transfer_suggestions(self.deploy_state.project.as_ref());
                 self.open_prompt(
-                    "Retrieve metadata — paths from sfdx-project.json are pre-filled",
-                    PromptKind::QuickRetrieve,
+                    if retrieve {
+                        "Retrieve — type a component name, fuzzy search suggests the rest"
+                    } else {
+                        "Deploy — type a component name, fuzzy search suggests the rest"
+                    },
+                    if retrieve {
+                        PromptKind::QuickRetrieve
+                    } else {
+                        PromptKind::QuickDeploy
+                    },
                     vec![
-                        PromptField::new("Source dirs (comma separated)", paths),
-                        PromptField::new("Target org", target),
-                    ],
-                );
-            }
-            "sf project deploy start" => {
-                let paths = self.project_source_paths();
-                self.open_prompt(
-                    "Deploy metadata — paths from sfdx-project.json are pre-filled",
-                    PromptKind::QuickDeploy,
-                    vec![
-                        PromptField::new("Source dirs (comma separated)", paths),
-                        PromptField::new("Target org", target),
+                        PromptField::new("Component (fuzzy, e.g. apex demo)", "")
+                            .with_suggestions(suggestions),
+                        PromptField::new("Target org (blank = sf default)", target),
                     ],
                 );
             }
@@ -962,6 +978,18 @@ impl App {
                         PromptField::new("Target org", target),
                         PromptField::new("Test classes (optional)", ""),
                         PromptField::new("Result format (human/json)", "human"),
+                    ],
+                );
+            }
+            "sf template generate" => {
+                self.open_prompt(
+                    "Create metadata — fuzzy-pick a template, then name it",
+                    PromptKind::CreateMetadata,
+                    vec![
+                        PromptField::new("Template (fuzzy)", "")
+                            .with_suggestions(crate::sf::metadata::create_suggestions()),
+                        PromptField::new("Component name", ""),
+                        PromptField::new("Target org (blank = sf default)", target),
                     ],
                 );
             }
@@ -1558,12 +1586,32 @@ impl App {
             } => match key.code {
                 KeyCode::Esc => self.notice("Cancelled"),
                 KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
-                    let delta = if matches!(key.code, KeyCode::Tab | KeyCode::Down) {
-                        1
+                    let suggestions = fields.get(focus).map(suggestions_for).unwrap_or_default();
+                    let use_suggestions = !suggestions.is_empty()
+                        && (key.code == KeyCode::Tab || focus_has_suggestions(&fields, focus));
+                    if use_suggestions && key.code != KeyCode::Tab {
+                        if let Some(field) = fields.get_mut(focus) {
+                            let current = field.suggestion_index.unwrap_or(0) as isize;
+                            let delta = if key.code == KeyCode::Down {
+                                1
+                            } else {
+                                suggestions.len() as isize - 1
+                            };
+                            field.suggestion_index =
+                                Some((current + delta).rem_euclid(suggestions.len() as isize)
+                                    as usize);
+                        }
                     } else {
-                        fields.len() as isize - 1
-                    };
-                    focus = (focus as isize + delta).rem_euclid(fields.len() as isize) as usize;
+                        if key.code == KeyCode::Tab && use_suggestions {
+                            accept_suggestion(fields.get_mut(focus), &suggestions);
+                        }
+                        let delta = if matches!(key.code, KeyCode::Tab | KeyCode::Down) {
+                            1
+                        } else {
+                            fields.len() as isize - 1
+                        };
+                        focus = (focus as isize + delta).rem_euclid(fields.len() as isize) as usize;
+                    }
                     self.modal = Some(Modal::Prompt {
                         title,
                         kind,
@@ -1572,6 +1620,12 @@ impl App {
                     });
                 }
                 KeyCode::Enter => {
+                    if let Some(field) = fields.get_mut(focus) {
+                        let suggestions = suggestions_for(field);
+                        if field.suggestion_index.is_some() || suggestions.len() == 1 {
+                            accept_suggestion(Some(field), &suggestions);
+                        }
+                    }
                     self.submit_prompt(&kind, &fields);
                 }
                 KeyCode::Backspace => {
@@ -1585,6 +1639,7 @@ impl App {
                             .unwrap_or(0);
                         field.value.replace_range(previous..field.cursor, "");
                         field.cursor = previous;
+                        field.suggestion_index = None;
                     }
                     self.modal = Some(Modal::Prompt {
                         title,
@@ -1619,6 +1674,7 @@ impl App {
                     if let Some(field) = fields.get_mut(focus) {
                         field.value.insert(field.cursor, character);
                         field.cursor += character.len_utf8();
+                        field.suggestion_index = None;
                     }
                     self.modal = Some(Modal::Prompt {
                         title,
@@ -1658,23 +1714,70 @@ impl App {
             }
             PromptKind::QuickRetrieve | PromptKind::QuickDeploy => {
                 let retrieve = matches!(kind, PromptKind::QuickRetrieve);
-                let paths = split_names(values.first().map(String::as_str).unwrap_or(""));
-                let paths = if paths.is_empty() {
-                    split_names(&self.project_source_paths())
+                let component = values.first().map(String::as_str).unwrap_or("").trim();
+                let target = values.get(1).filter(|org| !org.is_empty()).cloned();
+                let (mode, paths, metadata) = if component.is_empty() {
+                    (
+                        PayloadMode::Source,
+                        split_names(&self.project_source_paths()),
+                        Vec::new(),
+                    )
+                } else if component.contains(':') || !component.contains('/') {
+                    (PayloadMode::Metadata, Vec::new(), split_names(component))
                 } else {
-                    paths
+                    (PayloadMode::Source, split_names(component), Vec::new())
                 };
-                let options = &mut self.deploy_state.options;
-                options.retrieve = retrieve;
-                options.mode = PayloadMode::Source;
-                options.paths = paths;
-                options.target_org = values.get(1).filter(|org| !org.is_empty()).cloned();
+                {
+                    let options = &mut self.deploy_state.options;
+                    options.retrieve = retrieve;
+                    options.target_org = target;
+                    options.mode = mode;
+                    options.paths = paths;
+                    options.metadata_names = metadata;
+                }
                 self.tab = Tab::Deploy;
-                self.notice(if retrieve {
-                    "Retrieve ready — source paths are pre-filled; press Enter to run"
-                } else {
-                    "Deploy ready — source paths are pre-filled; press Enter to run"
-                });
+                self.notice(format!(
+                    "{} ready — {} preset; press Enter on Deploy to run",
+                    if retrieve { "Retrieve" } else { "Deploy" },
+                    mode.label()
+                ));
+            }
+            PromptKind::CreateMetadata => {
+                let template_input = values.first().map(String::as_str).unwrap_or("");
+                let template =
+                    crate::sf::metadata::create_template_for(template_input).or_else(|| {
+                        let hit = crate::sf::metadata::create_suggestions()
+                            .filter(template_input, 1)
+                            .into_iter()
+                            .next()?;
+                        crate::sf::metadata::create_template_for(&hit)
+                    });
+                let Some(template) = template else {
+                    self.error(
+                        "No matching template; try ApexClass, Flow or Lightning Web Component",
+                    );
+                    return;
+                };
+                let name = values.get(1).map(String::as_str).unwrap_or("").trim();
+                if name.is_empty() {
+                    self.error("Enter the new component name");
+                    return;
+                }
+                let mut argv: Vec<String> = template
+                    .command
+                    .iter()
+                    .map(|part| (*part).to_owned())
+                    .collect();
+                argv.push(template.name_flag.to_owned());
+                argv.push(name.to_owned());
+                let display = format!("sf {}", argv.join(" "));
+                self.spawn(
+                    argv,
+                    JobPurpose::Command {
+                        id: template.command.join(" "),
+                        command: display,
+                    },
+                );
             }
             PromptKind::RunApexTests => {
                 let classes = split_names(values.get(1).map(String::as_str).unwrap_or(""));
@@ -1962,6 +2065,35 @@ fn build_pick_items(project: &SfProject) -> Vec<PickItem> {
     items
 }
 
+pub fn suggestions_for(field: &PromptField) -> Vec<String> {
+    field
+        .suggestion_set
+        .as_ref()
+        .map(|set| set.filter(&field.value, 4))
+        .unwrap_or_default()
+}
+
+fn focus_has_suggestions(fields: &[PromptField], focus: usize) -> bool {
+    fields
+        .get(focus)
+        .is_some_and(|field| field.suggestion_set.is_some())
+}
+
+fn accept_suggestion(field: Option<&mut PromptField>, suggestions: &[String]) {
+    let Some(field) = field else {
+        return;
+    };
+    let index = field
+        .suggestion_index
+        .unwrap_or(0)
+        .min(suggestions.len().saturating_sub(1));
+    if let Some(suggestion) = suggestions.get(index) {
+        field.value = suggestion.clone();
+        field.cursor = field.value.len();
+        field.suggestion_index = None;
+    }
+}
+
 /// Split a user-entered list on commas or whitespace, keeping quoted paths intact.
 pub(crate) fn split_names(input: &str) -> Vec<String> {
     split_args(input)
@@ -2130,14 +2262,18 @@ mod tests {
     }
 
     #[test]
-    fn home_screen_shortcuts_open_prefilled_prompts() {
+    fn home_shortcuts_put_retrieve_deploy_first_and_offer_suggestions() {
+        assert_eq!(QUICK_ACTIONS[0].key, 'r');
+        assert_eq!(QUICK_ACTIONS[1].key, 'd');
+        assert_eq!(QUICK_ACTIONS[5].key, 'a');
         let mut app = test_app();
         app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('r')));
         match app.modal.as_ref() {
             Some(Modal::Prompt { kind, fields, .. }) => {
                 assert!(matches!(kind, PromptKind::QuickRetrieve));
-                assert_eq!(fields[0].value, "force-app");
+                assert!(fields[0].suggestion_set.is_some());
+                assert!(fields[0].value.is_empty());
             }
             other => panic!("expected retrieve prompt, got {other:?}"),
         }
@@ -2150,6 +2286,65 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn suggestion_keys_select_and_submit_a_component() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        app.handle_key(key(KeyCode::Char('d')));
+        for character in "Apex".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.deploy_state.options.mode, PayloadMode::Metadata);
+        assert!(!app.deploy_state.options.metadata_names.is_empty());
+        assert!(app.deploy_state.options.metadata_names[0].contains("Apex"));
+    }
+
+    #[test]
+    fn component_text_without_slash_becomes_metadata_name() {
+        let mut app = test_app();
+        app.submit_prompt(
+            &PromptKind::QuickDeploy,
+            &[
+                PromptField::new("Component", "ApexClass:Demo"),
+                PromptField::new("Target org", String::new()),
+            ],
+        );
+        assert_eq!(app.deploy_state.options.mode, PayloadMode::Metadata);
+        assert_eq!(
+            app.deploy_state.options.metadata_names,
+            vec!["ApexClass:Demo"]
+        );
+    }
+
+    #[test]
+    fn create_metadata_builds_the_generate_command() {
+        let _guard = tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .enter();
+        let mut app = test_app();
+        app.startup.installation = Some(crate::sf::detect::SfInstallation {
+            executable: std::path::PathBuf::from("sf"),
+            flavor: crate::sf::detect::SfFlavor::Sf,
+            source: "test".to_owned(),
+        });
+        app.submit_prompt(
+            &PromptKind::CreateMetadata,
+            &[
+                PromptField::new("Template", "ApexClass"),
+                PromptField::new("Name", "DemoController"),
+                PromptField::new("Org", String::new()),
+            ],
+        );
+        let record = app.output_state.records.last().expect("record");
+        assert!(
+            record
+                .command
+                .contains("template generate apex class --name DemoController")
+        );
     }
 
     #[test]

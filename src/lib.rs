@@ -51,6 +51,7 @@ mod layering_tests {
             include_str!("sf/catalog.rs"),
             include_str!("sf/deploy.rs"),
             include_str!("sf/detect.rs"),
+            include_str!("sf/metadata.rs"),
             include_str!("sf/org.rs"),
             include_str!("sf/project.rs"),
             include_str!("sf/runner.rs"),

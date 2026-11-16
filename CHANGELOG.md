@@ -3,23 +3,28 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
-## Unreleased
+## [0.1.1] - 2026-11-16
 
 ### Added
 
-- Home screen with five labelled shortcuts (org login, retrieve, deploy, Apex tests, test results)
-  and pre-filled project paths/default org.
-- Visible startup progress: the UI opens immediately, probes `sf` in the background with short
-  timeouts, and caches the command catalog for seven days.
-- Key labels and an Actions bar on every screen, plus a simplified one-line catalog.
-- Responsive layout: compact panes below 105x30 and a single-column mode below 72x20 for
-  VS Code/Zed terminal panels; rendering verified down to 48x12.
+- Home screen reordered around real usage: retrieve and deploy first, Apex test run/results second,
+  metadata creation third, org login last.
+- Fuzzy component autocomplete for retrieve/deploy: type part of a component name and pick from
+  matches built from local source files, `package.xml` manifests and common metadata types.
+- Create metadata shortcut with fuzzy template selection (Apex class/trigger, LWC, FlexiPage,
+  CustomObject, custom metadata type and more), followed by a name prompt.
+- Responsive layout for VS Code/Zed terminal panels (compact below 105x30, single-column below
+  72x20; verified down to 48x12).
 
-### Fixed
+### Changed
 
+- Startup now draws the UI immediately and shows staged progress while `sf` is probed with short
+  timeouts; successful catalog refreshes are cached for seven days.
 - Deploy/retrieve flags now match the current CLI (`--source-dir`, `--dry-run`, repeated
   `--metadata`; retrieve no longer calls a non-existent `project retrieve report`).
-- Disabled CLI telemetry and update checks in child processes to reduce startup latency.
+- Telemetry and update checks are disabled in child `sf` processes to reduce startup latency.
+
+[0.1.1]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.1
 
 ## [0.1.0] - 2026-11-16
 

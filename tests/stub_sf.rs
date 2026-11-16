@@ -192,7 +192,7 @@ fn every_screen_renders_without_panicking() {
                 "empty frame at {width}x{height} on {tab:?}"
             );
             if (width, height) == (60, 16) && tab == sftui::app::Tab::Home {
-                assert!(rendered.contains("[a] Log in"), "quick actions missing");
+                assert!(rendered.contains("[r] Retrieve"), "quick actions missing");
                 assert!(rendered.contains("Home"), "current tab missing");
             }
         }

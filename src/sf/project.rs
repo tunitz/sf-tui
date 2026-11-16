@@ -161,6 +161,56 @@ fn relative(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+/// Extract `Type:Member` pairs from package.xml `<types>` blocks.
+pub fn parse_manifest_components(xml: &str) -> Vec<String> {
+    let mut components = Vec::new();
+    let mut remaining = xml;
+    while let Some(start) = remaining.find("<types>") {
+        let after_open = &remaining[start + "<types>".len()..];
+        let Some(end) = after_open.find("</types>") else {
+            break;
+        };
+        let block = &after_open[..end];
+        let kind = tag_content(block, "name").unwrap_or_default();
+        for member in all_tag_contents(block, "members") {
+            if !kind.is_empty() && !member.is_empty() {
+                components.push(format!("{kind}:{member}"));
+            }
+        }
+        remaining = &after_open[end + "</types>".len()..];
+    }
+    components.sort();
+    components.dedup();
+    components
+}
+
+fn tag_content(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = start + xml[start..].find(&close)?;
+    Some(xml[start..end].trim().to_owned())
+}
+
+fn all_tag_contents(xml: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut values = Vec::new();
+    let mut remaining = xml;
+    while let Some(start) = remaining.find(&open) {
+        let after_open = &remaining[start + open.len()..];
+        let Some(end) = after_open.find(&close) else {
+            break;
+        };
+        let value = after_open[..end].trim().to_owned();
+        if !value.is_empty() {
+            values.push(value);
+        }
+        remaining = &after_open[end + close.len()..];
+    }
+    values
+}
+
 /// Extract `<members>` values from a package.xml manifest.
 pub fn parse_manifest_members(xml: &str) -> Vec<String> {
     let mut members = Vec::new();
@@ -224,6 +274,15 @@ mod tests {
                 .source_files
                 .iter()
                 .any(|path| path.ends_with("Demo.cls"))
+        );
+    }
+
+    #[test]
+    fn manifest_components_include_type_and_member() {
+        let xml = "<Package><types><members>Demo</members><name>ApexClass</name></types><types><members>Account</members><name>CustomObject</name></types></Package>";
+        assert_eq!(
+            parse_manifest_components(xml),
+            vec!["ApexClass:Demo", "CustomObject:Account"]
         );
     }
 

@@ -6,8 +6,9 @@ A single-binary terminal UI for the Salesforce CLI. `sftui` wraps the `sf` execu
 installed on your machine: it does not store credentials, and all authentication stays with `sf`
 in its own home directory.
 
-The interface opens on a **Home** screen with five labelled shortcuts for the commands people use
-most: org login, retrieve, deploy, Apex tests and test results. Behind it are:
+The interface opens on a **Home** screen ordered by frequency: retrieve and deploy first, Apex
+test run/results second, metadata creation third, and org login last (you only need it occasionally).
+Behind it are:
 
 - **focused screens** for org operations and metadata deploy/retrieve, with project paths and the
   default org pre-filled so you do not retype them;
@@ -63,7 +64,7 @@ header and status bar, aimed at VS Code and Zed terminal panels. Rendering is te
 
 | Screen | Keys |
 | --- | --- |
-| Home | `a` log in · `r` retrieve · `d` deploy · `t` run Apex tests · `g` get test results |
+| Home | `r` retrieve · `d` deploy · `t` run tests · `g` results · `c` create metadata · `a` login |
 | Catalog | `/` search · `↑↓` move · `Enter` live `--help` · `r` run with flags · `f` favorite |
 | Favorites | `Enter` run · `Ctrl+↑↓` reorder · `e` preset flags · `x` remove |
 | Orgs | `↑↓` move · `Enter` details · `o` open browser · `d` project default · `D` dev hub · `x` logout · `l` login · `c` scratch org |
@@ -72,6 +73,12 @@ header and status bar, aimed at VS Code and Zed terminal panels. Rendering is te
 | Setup | `↑↓` installer · `Enter` run · `r` re-probe |
 
 ## Walkthroughs
+
+### Create metadata
+
+Press `c` on Home. Type part of a template name — `apex class`, `lwc`, `flexi`, `custom object` —
+and pick from the fuzzy list, then enter the component name. `sftui` builds the matching
+`sf template generate`, `sf schema generate` or `sf cmdt generate` command and streams it in Output.
 
 ### Work with orgs
 
@@ -83,11 +90,12 @@ scratch org with an alias, definition file and duration.
 
 ### Deploy or retrieve metadata
 
-From Home press `r` or `d`. `sftui` walks upward from the current directory to find
-`sfdx-project.json`, pre-fills the package directories and leaves the target org blank so the CLI
-uses your default. Confirm the prefilled prompt, review the exact command on the Deploy/Retrieve
-screen and press `Enter` to run. You can still choose a manifest, individual source paths with
-`Space`, or type metadata names with mode `m` — but you never have to type the full project path.
+From Home press `r` or `d`, then type part of a component name — for example `apex demo` or
+`flow`. `sftui` fuzzy-searches local source files, `package.xml` manifests and common metadata
+types, showing suggestions such as `ApexClass:Demo`. Use `↑↓` to pick a suggestion and `Enter` to
+accept; leave the field blank to use all package directories from `sfdx-project.json`. The target
+org defaults to your CLI default. The command is prepared on the Deploy/Retrieve screen; press
+`Enter` there to run. You can still pick a manifest or individual paths with `Space`.
 
 Deploy uses `sf project deploy start --source-dir …` with `--dry-run` for validation, and an async
 job id triggers `sf project deploy report --json --job-id …` polling with a spinner and component

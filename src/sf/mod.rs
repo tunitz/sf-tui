@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod deploy;
 pub mod detect;
+pub mod metadata;
 pub mod org;
 pub mod project;
 pub mod runner;
