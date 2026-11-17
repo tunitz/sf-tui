@@ -63,6 +63,9 @@ Home is just the menu:
 
 Global: `Tab` next screen · `h` Home · `Backspace` back · `?` help · `q` quit.
 
+The Tests screen follows the same pattern: type to find Apex test classes, `Space` check/uncheck,
+`Enter` confirm, then run the generated `sf apex run test` command from the confirmation dialog.
+
 On the Retrieve/Deploy screens, type to search, `↑↓` move, `Space` check/uncheck, `Enter`
 confirm, `Esc` back. The search is async and debounced; selected components keep their source
 paths and become `--metadata` entries in the command.

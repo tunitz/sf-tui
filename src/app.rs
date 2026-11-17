@@ -26,6 +26,7 @@ use crate::sf::{self, Startup};
 pub enum Tab {
     Home,
     Retrieve,
+    Tests,
     Deploy,
     Catalog,
     Favorites,
@@ -39,6 +40,7 @@ impl Tab {
         match self {
             Self::Home => "Home",
             Self::Retrieve => "Retrieve",
+            Self::Tests => "Tests",
             Self::Deploy => "Deploy",
             Self::Catalog => "Catalog",
             Self::Favorites => "Favorites",
@@ -80,10 +82,16 @@ impl JobPurpose {
 }
 
 /// Messages sent from background processes into the UI thread.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchKind {
+    Transfer,
+    Tests,
+}
+
 pub enum AppEvent {
     Sf(SfEvent),
     TransferResults {
+        kind: SearchKind,
         retrieve: bool,
         query: String,
         results: Vec<SuggestionItem>,
@@ -476,6 +484,12 @@ pub enum Modal {
         message: String,
         action: PendingAction,
     },
+    TestConfirm {
+        entries: Vec<TransferSelection>,
+        focus: usize,
+        show_command: bool,
+        org: Option<String>,
+    },
     TransferConfirm {
         retrieve: bool,
         entries: Vec<TransferSelection>,
@@ -513,11 +527,13 @@ pub struct App {
     pub org_state: OrgState,
     pub deploy_state: DeployState,
     pub transfer_search: TransferSearchState,
+    pub test_search: TransferSearchState,
     pub output_state: OutputState,
     pub modal: Option<Modal>,
     pub setup_selected: usize,
     tab_history: Vec<Tab>,
     suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
+    test_suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
     ticks: usize,
     probe_task: Option<JoinHandle<()>>,
     search_task: Option<JoinHandle<()>>,
@@ -557,11 +573,13 @@ impl App {
             org_state: OrgState::default(),
             deploy_state: DeployState::default(),
             transfer_search: TransferSearchState::new(false),
+            test_search: TransferSearchState::new(false),
             output_state: OutputState::default(),
             modal: None,
             setup_selected: 0,
             tab_history: Vec::new(),
             suggestion_cache: None,
+            test_suggestion_cache: None,
             ticks: 0,
             probe_task: None,
             search_task: None,
@@ -596,6 +614,7 @@ impl App {
             Tab::Home,
             Tab::Retrieve,
             Tab::Deploy,
+            Tab::Tests,
             Tab::Catalog,
             Tab::Favorites,
             Tab::Orgs,
@@ -700,16 +719,21 @@ impl App {
                 self.notice("Ready");
             }
             AppEvent::TransferResults {
+                kind,
                 retrieve,
                 query,
                 results,
             } => {
-                if self.transfer_search.retrieve == retrieve && self.transfer_search.query == query
-                {
-                    self.transfer_search.results = results;
-                    self.transfer_search.cursor = 0;
-                    self.transfer_search.searching = false;
-                    self.transfer_search.dirty = false;
+                let state = if kind == SearchKind::Tests {
+                    &mut self.test_search
+                } else {
+                    &mut self.transfer_search
+                };
+                if state.retrieve == retrieve && state.query == query {
+                    state.results = results;
+                    state.cursor = 0;
+                    state.searching = false;
+                    state.dirty = false;
                 }
             }
             AppEvent::Notice { text, error } => {
@@ -852,23 +876,54 @@ impl App {
             && let Some(task) = self.search_task.take()
         {
             let _ = task.await;
-            if self.transfer_search.dirty {
-                self.transfer_search.searching = false;
-            }
         }
-        if self.transfer_search.debounce_ready()
-            && !self.transfer_search.searching
-            && let Some((_, set)) = &self.suggestion_cache
+        let test_mode = self.tab == Tab::Tests;
+        let debounce_ready = if test_mode {
+            self.test_search.debounce_ready()
+        } else {
+            self.transfer_search.debounce_ready()
+        };
+        let searching = if test_mode {
+            self.test_search.searching
+        } else {
+            self.transfer_search.searching
+        };
+        let query = if test_mode {
+            self.test_search.query.clone()
+        } else {
+            self.transfer_search.query.clone()
+        };
+        let set = if test_mode {
+            self.test_suggestion_cache
+                .as_ref()
+                .map(|(_, set)| Arc::clone(set))
+        } else {
+            self.suggestion_cache
+                .as_ref()
+                .map(|(_, set)| Arc::clone(set))
+        };
+        if debounce_ready
+            && !searching
+            && let Some(set) = set
         {
-            let set = Arc::clone(set);
-            let query = self.transfer_search.query.clone();
-            let retrieve = self.transfer_search.retrieve;
+            let kind = if test_mode {
+                SearchKind::Tests
+            } else {
+                SearchKind::Transfer
+            };
+            let retrieve = !test_mode && self.transfer_search.retrieve;
+            if test_mode {
+                self.test_search.searching = true;
+                self.test_search.dirty = false;
+            } else {
+                self.transfer_search.searching = true;
+                self.transfer_search.dirty = false;
+            }
             let tx = self.event_tx.clone();
-            self.transfer_search.searching = true;
-            self.transfer_search.dirty = false;
             self.search_task = Some(tokio::spawn(async move {
                 let results = set.filter(&query, 8);
                 let _ = tx.send(AppEvent::TransferResults {
+                    kind,
                     retrieve,
                     query,
                     results,
@@ -1061,6 +1116,10 @@ impl App {
             self.transfer_key(key);
             return;
         }
+        if self.tab == Tab::Tests {
+            self.test_key(key);
+            return;
+        }
         if self.catalog_state.search_focused {
             self.catalog_key(key);
             return;
@@ -1088,6 +1147,7 @@ impl App {
             _ => match self.tab {
                 Tab::Home => self.home_key(key),
                 Tab::Retrieve | Tab::Deploy => self.transfer_key(key),
+                Tab::Tests => self.test_key(key),
                 Tab::Catalog => self.catalog_key(key),
                 Tab::Favorites => self.favorites_key(key),
                 Tab::Orgs => self.org_key(key),
@@ -1105,6 +1165,9 @@ impl App {
     }
 
     fn set_tab(&mut self, tab: Tab) {
+        if tab == Tab::Tests {
+            self.ensure_suggestion_sets();
+        }
         if matches!(tab, Tab::Retrieve | Tab::Deploy) {
             let retrieve = tab == Tab::Retrieve;
             if self.transfer_search.retrieve != retrieve {
@@ -1140,6 +1203,7 @@ impl App {
             Tab::Home => "r retrieve · d deploy · t tests · g results · c create · a login",
             Tab::Retrieve => "type component · Space select · Enter confirm · Esc home",
             Tab::Deploy => "type component · Space select · Enter confirm · Esc home",
+            Tab::Tests => "type test class · Space select · Enter confirm · Esc home",
             Tab::Catalog => "/ search · Enter help · r run",
             Tab::Favorites => "Enter run · e preset · x remove",
             Tab::Orgs => "Enter details · o open · l login",
@@ -1168,6 +1232,14 @@ impl App {
             Tab::Home => Some(QUICK_ACTIONS[self.home_state.selected].command.to_owned()),
             Tab::Retrieve | Tab::Deploy => Some(
                 self.transfer_search
+                    .checked()
+                    .iter()
+                    .map(|item| item.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+            Tab::Tests => Some(
+                self.test_search
                     .checked()
                     .iter()
                     .map(|item| item.value.clone())
@@ -1280,6 +1352,78 @@ impl App {
         });
     }
 
+    fn ensure_suggestion_sets(&mut self) {
+        let root = self
+            .deploy_state
+            .project
+            .as_ref()
+            .map(|project| project.root.clone())
+            .unwrap_or_default();
+        if self
+            .suggestion_cache
+            .as_ref()
+            .is_none_or(|(cached_root, _)| cached_root != &root)
+        {
+            let all = Arc::new(crate::sf::metadata::transfer_suggestions(
+                self.deploy_state.project.as_ref(),
+            ));
+            let tests = Arc::new(crate::sf::metadata::test_suggestions(&all));
+            self.suggestion_cache = Some((root.clone(), all));
+            self.test_suggestion_cache = Some((root, tests));
+        }
+    }
+
+    fn test_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.test_search.cursor = self.test_search.cursor.saturating_sub(1),
+            KeyCode::Down => {
+                if !self.test_search.results.is_empty() {
+                    self.test_search.cursor =
+                        (self.test_search.cursor + 1).min(self.test_search.results.len() - 1);
+                }
+            }
+            KeyCode::Char(' ') => self.test_search.toggle_result(),
+            KeyCode::Enter => self.open_test_confirm(),
+            KeyCode::Backspace => {
+                self.test_search.query.pop();
+                self.test_search.mark_edited();
+            }
+            KeyCode::Esc => self.go_home(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.test_search.query.clear();
+                self.test_search.mark_edited();
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.test_search.query.push(character);
+                self.test_search.mark_edited();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_test_confirm(&mut self) {
+        let checked = self.test_search.checked();
+        if checked.is_empty() {
+            self.error("Select at least one test class with Space");
+            return;
+        }
+        let entries = self
+            .test_search
+            .selected
+            .iter()
+            .map(|entry| TransferSelection {
+                item: entry.item.clone(),
+                checked: entry.checked,
+            })
+            .collect();
+        self.modal = Some(Modal::TestConfirm {
+            entries,
+            focus: 0,
+            show_command: false,
+            org: self.org_target_hint().into(),
+        });
+    }
+
     fn run_quick_action(&mut self, index: usize) {
         let Some(action) = QUICK_ACTIONS.get(index) else {
             return;
@@ -1295,36 +1439,16 @@ impl App {
             }
             "sf project retrieve start" | "sf project deploy start" => {
                 let retrieve = action.command == "sf project retrieve start";
-                let root = self
-                    .deploy_state
-                    .project
-                    .as_ref()
-                    .map(|project| project.root.clone())
-                    .unwrap_or_default();
-                if self
-                    .suggestion_cache
-                    .as_ref()
-                    .is_none_or(|(cached_root, _)| cached_root != &root)
-                {
-                    let set = Arc::new(crate::sf::metadata::transfer_suggestions(
-                        self.deploy_state.project.as_ref(),
-                    ));
-                    self.suggestion_cache = Some((root, set));
-                }
+                self.ensure_suggestion_sets();
                 self.transfer_search = TransferSearchState::new(retrieve);
                 self.set_tab(if retrieve { Tab::Retrieve } else { Tab::Deploy });
                 self.notice("Type a component name to search");
             }
             "sf apex run test" => {
-                self.open_prompt(
-                    "Run tests",
-                    PromptKind::RunApexTests,
-                    vec![
-                        PromptField::new("Org", target),
-                        PromptField::new("Classes", ""),
-                        PromptField::new("Format", "human"),
-                    ],
-                );
+                self.ensure_suggestion_sets();
+                self.test_search = TransferSearchState::new(false);
+                self.set_tab(Tab::Tests);
+                self.notice("Type a test class name to search");
             }
             "sf template generate" => {
                 self.open_prompt(
@@ -1771,6 +1895,137 @@ impl App {
             Modal::Confirm { action, .. } => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => self.execute(action),
                 _ => self.notice("Cancelled"),
+            },
+            Modal::TestConfirm {
+                mut entries,
+                mut focus,
+                mut show_command,
+                mut org,
+            } => match key.code {
+                KeyCode::Up => {
+                    focus = focus.saturating_sub(1);
+                    self.modal = Some(Modal::TestConfirm {
+                        entries,
+                        focus,
+                        show_command,
+                        org,
+                    });
+                }
+                KeyCode::Down => {
+                    if !entries.is_empty() {
+                        focus = (focus + 1).min(entries.len() - 1);
+                    }
+                    self.modal = Some(Modal::TestConfirm {
+                        entries,
+                        focus,
+                        show_command,
+                        org,
+                    });
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(entry) = entries.get_mut(focus) {
+                        entry.checked = !entry.checked;
+                    }
+                    self.modal = Some(Modal::TestConfirm {
+                        entries,
+                        focus,
+                        show_command,
+                        org,
+                    });
+                }
+                KeyCode::Enter => {
+                    let classes: Vec<String> = entries
+                        .iter()
+                        .filter(|entry| entry.checked)
+                        .map(|entry| {
+                            entry
+                                .item
+                                .value
+                                .split_once(':')
+                                .map_or(entry.item.value.clone(), |(_, name)| name.to_owned())
+                        })
+                        .collect();
+                    if classes.is_empty() {
+                        self.error("Select at least one test class");
+                        self.modal = Some(Modal::TestConfirm {
+                            entries,
+                            focus,
+                            show_command,
+                            org,
+                        });
+                        return;
+                    }
+                    let mut argv = vec![
+                        "apex".to_owned(),
+                        "run".to_owned(),
+                        "test".to_owned(),
+                        "--result-format".to_owned(),
+                        "human".to_owned(),
+                        "--wait".to_owned(),
+                        "10".to_owned(),
+                    ];
+                    for class_name in &classes {
+                        argv.push("--class-names".to_owned());
+                        argv.push(class_name.clone());
+                    }
+                    if let Some(org) = org.as_ref().filter(|org| !org.is_empty()) {
+                        argv.push("--target-org".to_owned());
+                        argv.push(org.clone());
+                    }
+                    argv.push("--json".to_owned());
+                    let display = format!("sf {}", argv.join(" "));
+                    self.spawn(
+                        argv,
+                        JobPurpose::Command {
+                            id: "apex run test".to_owned(),
+                            command: display,
+                        },
+                    );
+                    self.tab = Tab::Output;
+                }
+                KeyCode::Esc => {
+                    self.tab = Tab::Tests;
+                    self.notice("Back to test selection");
+                }
+                KeyCode::Char('c') => {
+                    show_command = !show_command;
+                    self.modal = Some(Modal::TestConfirm {
+                        entries,
+                        focus,
+                        show_command,
+                        org,
+                    });
+                }
+                KeyCode::Char('g') => {
+                    let mut choices = vec![String::new()];
+                    choices.extend(
+                        self.org_state
+                            .orgs
+                            .iter()
+                            .map(|org| org.label())
+                            .collect::<Vec<_>>(),
+                    );
+                    if let Some(current) = &org {
+                        choices.push(current.clone());
+                    }
+                    choices.sort();
+                    choices.dedup();
+                    org = choices.first().cloned();
+                    self.modal = Some(Modal::TestConfirm {
+                        entries,
+                        focus,
+                        show_command,
+                        org,
+                    });
+                }
+                _ => {
+                    self.modal = Some(Modal::TestConfirm {
+                        entries,
+                        focus,
+                        show_command,
+                        org,
+                    });
+                }
             },
             Modal::TransferConfirm {
                 retrieve,
@@ -2609,7 +2864,7 @@ mod tests {
         assert_eq!(app.tab, Tab::Home);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::Output);
-        app.handle_key(key(KeyCode::Char('6')));
+        app.handle_key(key(KeyCode::Char('7')));
         assert_eq!(app.tab, Tab::Orgs);
         app.handle_key(key(KeyCode::Char('1')));
         assert_eq!(app.tab, Tab::Home);
@@ -2710,6 +2965,27 @@ mod tests {
         app.handle_key(key(KeyCode::Char('3')));
         assert_eq!(app.tab, Tab::Retrieve);
         assert_eq!(app.transfer_search.query, "3");
+    }
+
+    #[test]
+    fn test_run_uses_search_checkboxes_and_confirmation() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.tab, Tab::Tests);
+        app.test_search.results = vec![
+            SuggestionItem::new("ApexClass:DemoTest", "force-app/classes/DemoTest.cls"),
+            SuggestionItem::new("ApexClass:Helper", "force-app/classes/Helper.cls"),
+        ];
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+        match app.modal.as_ref() {
+            Some(Modal::TestConfirm { entries, .. }) => {
+                assert_eq!(entries.len(), 1);
+                assert!(entries[0].checked);
+            }
+            other => panic!("expected test confirmation, got {other:?}"),
+        }
     }
 
     #[test]

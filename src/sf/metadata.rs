@@ -136,6 +136,19 @@ impl SuggestionSet {
     }
 }
 
+/// Apex classes from the project index, used by the test-run search screen.
+pub fn test_suggestions(all: &SuggestionSet) -> SuggestionSet {
+    SuggestionSet {
+        kind: SuggestionKind::Transfer,
+        items: all
+            .items
+            .iter()
+            .filter(|item| item.value.starts_with("ApexClass:"))
+            .cloned()
+            .collect(),
+    }
+}
+
 /// A scaffold command supported by the Create metadata shortcut.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateTemplate {
@@ -405,6 +418,26 @@ mod tests {
         let hits = set.filter(name, 5);
         eprintln!("hits: {:?}", hits);
         assert!(hits.iter().any(|item| item.value.contains(name)));
+    }
+
+    #[test]
+    fn test_suggestions_keep_only_apex_classes() {
+        let all = SuggestionSet::new(
+            SuggestionKind::Transfer,
+            vec![
+                "ApexClass:DemoTest".to_owned(),
+                "Flow:Other".to_owned(),
+                "ApexClass:Helper".to_owned(),
+            ],
+        );
+        let tests = test_suggestions(&all);
+        assert_eq!(tests.items.len(), 2);
+        assert!(
+            tests
+                .items
+                .iter()
+                .all(|item| item.value.starts_with("ApexClass:"))
+        );
     }
 
     #[test]

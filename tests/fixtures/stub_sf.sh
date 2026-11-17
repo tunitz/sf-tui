@@ -26,7 +26,7 @@ case "$*" in
   "apex run test --result-format json --wait 10 --json")
     printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}'
     ;;
-  "logic get test --test-run-id 08N000000000001 --json")
+  "apex run test --result-format human --wait 10 --class-names DemoTest --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}'
     ;;
   "project deploy report --job-id 0Af000000000001 --json")

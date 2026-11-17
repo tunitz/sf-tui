@@ -3,6 +3,19 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.1.8] - 2026-11-17
+
+### Added
+
+- Test runs now use the same async search screen and checkbox multi-select as retrieve/deploy,
+  with a confirmation dialog showing the exact `sf apex run test --class-names …` command.
+
+### Fixed
+
+- Removed the stray `[` character from the component search input.
+
+[0.1.8]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.8
+
 ## [0.1.7] - 2026-11-17
 
 ### Changed

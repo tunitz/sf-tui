@@ -38,6 +38,7 @@ fn short_tab(tab: Tab) -> &'static str {
         Tab::Home => "Home",
         Tab::Retrieve => "Retrieve",
         Tab::Deploy => "Deploy",
+        Tab::Tests => "Tests",
         Tab::Catalog => "Cat",
         Tab::Favorites => "Fav",
         Tab::Orgs => "Orgs",
@@ -94,6 +95,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.tab {
         Tab::Home => draw_home(frame, layout[1], app),
         Tab::Retrieve | Tab::Deploy => draw_transfer(frame, layout[1], app),
+        Tab::Tests => draw_tests(frame, layout[1], app),
         Tab::Catalog => draw_catalog(frame, layout[1], app),
         Tab::Favorites => draw_favorites(frame, layout[1], app),
         Tab::Orgs => draw_orgs(frame, layout[1], app),
@@ -276,7 +278,9 @@ fn key_hints(app: &App) -> String {
     let common = "Tab next screen · ? help · q quit";
     let specific = match app.tab {
         Tab::Home => "r retrieve · d deploy · t tests · g results · c create · a login",
-        Tab::Retrieve | Tab::Deploy => "type · Space select · Enter confirm · Esc back",
+        Tab::Retrieve | Tab::Deploy | Tab::Tests => {
+            "type · Space select · Enter confirm · Esc back"
+        }
         Tab::Catalog => "/ search · Enter help · r run · f favorite",
         Tab::Favorites => "Enter run · Ctrl+↑↓ reorder · e preset",
         Tab::Orgs => "Enter details · o open · d default · l login",
@@ -338,6 +342,83 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
     .chain(std::iter::once(Line::from(faint("[?] Help    [q] Quit"))))
     .collect();
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
+    let state = &app.test_search;
+    let sections = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    frame.render_widget(
+        Line::from(vec![
+            strong("Run tests", accent(app)),
+            faint(format!(
+                "                             Org: {}",
+                app.org_target_hint()
+            )),
+            faint("       [Esc] back"),
+        ]),
+        sections[0],
+    );
+    let query = if state.query.is_empty() {
+        "type a test class name".to_owned()
+    } else {
+        state.query.clone()
+    };
+    frame.render_widget(
+        Line::from(vec![
+            strong("Search: ", accent(app)),
+            Span::styled(
+                format!("{}{}", query, if state.searching { " …" } else { "" }),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        sections[1],
+    );
+    let items: Vec<ListItem> = state
+        .results
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let checked = state
+                .selected
+                .iter()
+                .find(|entry| entry.item.value == item.value)
+                .is_some_and(|entry| entry.checked);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{} [{}] ",
+                            if index == state.cursor { ">" } else { " " },
+                            if checked { "x" } else { " " }
+                        ),
+                        Style::default().fg(if checked { accent(app) } else { Color::White }),
+                    ),
+                    Span::styled(item.value.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        "    {}",
+                        truncated(&item.path, usize::from(area.width).saturating_sub(6))
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ])
+        })
+        .collect();
+    frame.render_widget(List::new(items), sections[2]);
+    frame.render_widget(
+        Line::from(vec![
+            faint(format!("{} selected", state.checked().len())),
+            faint("                             [Space] select   [Enter] confirm"),
+        ]),
+        sections[3],
+    );
 }
 
 fn draw_catalog(frame: &mut Frame, area: Rect, app: &App) {
@@ -919,7 +1000,7 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             strong("Search: ", accent(app)),
             Span::styled(
-                format!("[{query}{}", if state.searching { " …" } else { "" }),
+                format!("{query}{}", if state.searching { " …" } else { "" }),
                 Style::default().fg(Color::White),
             ),
         ]),
@@ -1174,6 +1255,77 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             ];
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block(title.clone(), app)),
+                area,
+            );
+        }
+        Modal::TestConfirm {
+            entries,
+            focus,
+            show_command,
+            org,
+        } => {
+            let mut lines = vec![
+                Line::from(strong(
+                    format!(
+                        "Run {} test classes in {}",
+                        entries.iter().filter(|entry| entry.checked).count(),
+                        org.as_deref().unwrap_or("default org")
+                    ),
+                    accent(app),
+                )),
+                Line::from(" "),
+            ];
+            for (index, entry) in entries.iter().enumerate() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} [{}] {}",
+                        if index == *focus { ">" } else { " " },
+                        if entry.checked { "x" } else { " " },
+                        entry.item.value
+                    ),
+                    Style::default().fg(if entry.checked {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", truncated(&entry.item.path, 60)),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            if *show_command {
+                let classes: Vec<String> = entries
+                    .iter()
+                    .filter(|entry| entry.checked)
+                    .map(|entry| {
+                        entry
+                            .item
+                            .value
+                            .split_once(':')
+                            .map_or(entry.item.value.clone(), |(_, name)| name.to_owned())
+                    })
+                    .collect();
+                let mut command = "sf apex run test --result-format human --wait 10".to_owned();
+                for class_name in classes {
+                    command.push_str(&format!(" --class-names {class_name}"));
+                }
+                if let Some(org) = org.as_ref().filter(|org| !org.is_empty()) {
+                    command.push_str(&format!(" --target-org {org}"));
+                }
+                command.push_str(" --json");
+                lines.push(Line::from(" "));
+                lines.push(Line::from(faint(command)));
+            }
+            lines.push(Line::from(" "));
+            lines.push(Line::from(faint(
+                "[Enter] run   [Esc] back   [Space] toggle   [c] command   [g] org",
+            )));
+            let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+            let area = centered(frame.area(), 90, height);
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(block("Confirm tests", app)),
                 area,
             );
         }
