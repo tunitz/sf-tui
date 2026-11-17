@@ -10,8 +10,8 @@ description: The version bump, changelog, tag and published-asset verification p
 `Cargo.toml` contains the version. A tag `vX.Y.Z` must equal that version exactly. The release
 workflow reads both and fails before building on drift; never edit a tag to work around it.
 
-Semantics during initial development: `0.x.y` fixes, `0.x.0` features, `1.0.0` only when stability
-is promised.
+Versioning for this project: stay in `0.1.x`, from `0.1.0` through `0.1.99`. Increment only the
+patch number. Do not bump the minor version during initial development.
 
 ## Steps
 

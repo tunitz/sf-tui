@@ -54,7 +54,8 @@ To debug the interface, run the release binary inside a terminal at least 100x30
   passwords or secrets. Snapshot and fixture data must be synthetic only.
 - **Layering:** modules under `src/sf`, `src/config`, `src/json_view` and `src/clipboard` must not
   import ratatui or crossterm. The layering test in `src/lib.rs` enforces this.
-- **Version:** one source of truth, `Cargo.toml`. A `v*` tag must match it exactly.
+- **Version:** one source of truth, `Cargo.toml`. Stay on `0.1.x` until `0.1.99`; increment only
+  the patch number. A `v*` tag must match it exactly.
 - **Repository hygiene:** the public repository contains production-ready files only: source,
   tests, CI/release workflows, installers, docs, scripts listed above, skills and license. No
   scratch files, personal data, real org names, editor/OS junk or development-only snippets.

@@ -1,7 +1,17 @@
 # Changelog
 
-All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
-`0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
+All notable changes to this project are documented here. Versions stay in `0.1.x` during
+initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
+and are superseded by `v0.1.10`.
+
+## [0.1.10] - 2026-11-17
+
+### Changed
+
+- Restored the `0.1.x` version line. This release contains the same application as `v0.2.2`.
+- All future releases increment only the patch number until `0.1.99`.
+
+[0.1.10]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.10
 
 ## [0.2.2] - 2026-11-17
 
