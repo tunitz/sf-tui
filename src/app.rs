@@ -98,6 +98,7 @@ pub enum AppEvent {
         retrieve: bool,
         query: String,
         results: Vec<SuggestionItem>,
+        generation: u64,
     },
     Startup(crate::sf::StartupEvent),
     Notice {
@@ -244,6 +245,7 @@ pub struct TransferSearchState {
     pub dirty: bool,
     pub last_edit: Instant,
     pub searching: bool,
+    pub searched_query: Option<String>,
 }
 
 impl TransferSearchState {
@@ -257,6 +259,7 @@ impl TransferSearchState {
             dirty: true,
             last_edit: Instant::now(),
             searching: false,
+            searched_query: None,
         }
     }
 
@@ -264,10 +267,13 @@ impl TransferSearchState {
         self.dirty = true;
         self.last_edit = Instant::now();
         self.cursor = 0;
+        self.searched_query = None;
+        self.results.clear();
+        self.selected.clear();
     }
 
-    pub fn debounce_ready(&self) -> bool {
-        self.dirty && self.last_edit.elapsed() >= Duration::from_millis(90)
+    pub fn needs_search(&self) -> bool {
+        self.searched_query.as_deref() != Some(self.query.trim())
     }
 
     pub fn toggle_result(&mut self) {
@@ -299,6 +305,7 @@ impl TransferSearchState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultKind {
+    Generic,
     Retrieve,
     Deploy,
     ApexTests,
@@ -312,6 +319,12 @@ pub struct ResultItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResultSection {
+    pub title: String,
+    pub rows: Vec<ResultItem>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ResultView {
     pub kind: ResultKind,
     pub title: String,
@@ -320,6 +333,7 @@ pub struct ResultView {
     pub summary: String,
     pub items: Vec<ResultItem>,
     pub coverage: Vec<ResultItem>,
+    pub sections: Vec<ResultSection>,
 }
 
 /// A single recorded command invocation and its streamed output.
@@ -572,6 +586,7 @@ pub struct App {
     ticks: usize,
     probe_task: Option<JoinHandle<()>>,
     search_task: Option<JoinHandle<()>>,
+    search_generation: u64,
     event_tx: UnboundedSender<AppEvent>,
     event_rx: UnboundedReceiver<AppEvent>,
     jobs: HashMap<u64, JobEntry>,
@@ -620,6 +635,7 @@ impl App {
             ticks: 0,
             probe_task: None,
             search_task: None,
+            search_generation: 0,
             event_tx,
             event_rx,
             jobs: HashMap::new(),
@@ -761,7 +777,11 @@ impl App {
                 retrieve,
                 query,
                 results,
+                generation,
             } => {
+                if generation != self.search_generation {
+                    return;
+                }
                 let state = if kind == SearchKind::Tests {
                     &mut self.test_search
                 } else {
@@ -772,6 +792,7 @@ impl App {
                     state.cursor = 0;
                     state.searching = false;
                     state.dirty = false;
+                    state.searched_query = Some(query);
                 }
             }
             AppEvent::Notice { text, error } => {
@@ -832,7 +853,8 @@ impl App {
                 | JobPurpose::ApexTests { .. }
         );
         let succeeded = outcome.succeeded();
-        let mut result_view: Option<ResultView> = None;
+        let purpose_title = purpose.label().to_owned();
+        let mut result_view = Some(generic_result(&purpose_title, &outcome, parsed.as_ref()));
         match (purpose, parsed) {
             (JobPurpose::OrgList, Some(value)) => {
                 self.org_state.orgs = sf::org::parse_org_list(&value);
@@ -893,6 +915,7 @@ impl App {
                             detail: id.clone(),
                         }],
                         coverage: Vec::new(),
+                        sections: Vec::new(),
                     });
                     self.deploy_state.report = None;
                     self.notice(format!("Started deploy job {id}"));
@@ -946,73 +969,12 @@ impl App {
         {
             let _ = task.await;
         }
-        let test_mode = self.tab == Tab::Tests;
-        let debounce_ready = if test_mode {
-            self.test_search.debounce_ready()
-        } else {
-            self.transfer_search.debounce_ready()
-        };
-        let searching = if test_mode {
-            self.test_search.searching
-        } else {
-            self.transfer_search.searching
-        };
-        let query = if test_mode {
-            self.test_search.query.clone()
-        } else {
-            self.transfer_search.query.clone()
-        };
-        let set = if test_mode {
-            self.test_suggestion_cache
-                .as_ref()
-                .map(|(_, set)| Arc::clone(set))
-        } else {
-            self.suggestion_cache
-                .as_ref()
-                .map(|(_, set)| Arc::clone(set))
-        };
-        if debounce_ready
-            && !searching
-            && let Some(set) = set
-        {
-            let kind = if test_mode {
-                SearchKind::Tests
-            } else {
-                SearchKind::Transfer
-            };
-            let retrieve = !test_mode && self.transfer_search.retrieve;
-            if test_mode {
-                self.test_search.searching = true;
-                self.test_search.dirty = false;
-            } else {
-                self.transfer_search.searching = true;
-                self.transfer_search.dirty = false;
-            }
-            let tx = self.event_tx.clone();
-            self.search_task = Some(tokio::spawn(async move {
-                let results = set.filter(&query, 8);
-                let _ = tx.send(AppEvent::TransferResults {
-                    kind,
-                    retrieve,
-                    query,
-                    results,
-                });
-            }));
-        }
         if let Some(Modal::Prompt { fields, .. }) = self.modal.as_mut()
             && fields.iter().any(PromptField::debounce_ready)
         {
             for field in fields.iter_mut() {
                 field.ensure_suggestions();
             }
-        }
-        if self.catalog_state.query != self.catalog_state.active_query
-            && self
-                .catalog_state
-                .query_changed_at
-                .is_some_and(|when| when.elapsed() >= SUGGESTION_DEBOUNCE)
-        {
-            self.catalog_state.active_query = self.catalog_state.query.clone();
         }
         if self
             .probe_task
@@ -1270,9 +1232,9 @@ impl App {
     fn tab_action_hint(&self) -> &'static str {
         match self.tab {
             Tab::Home => "r retrieve · d deploy · t tests · g results · c create · a login",
-            Tab::Retrieve => "type component · Space select · Enter confirm · Esc home",
-            Tab::Deploy => "type component · Space select · Enter confirm · Esc home",
-            Tab::Tests => "type test class · Space select · Enter confirm · Esc home",
+            Tab::Retrieve => "type component · Enter search · Space select · Enter confirm",
+            Tab::Deploy => "type component · Enter search · Space select · Enter confirm",
+            Tab::Tests => "type test class · Enter search · Space select · Enter confirm",
             Tab::Catalog => "/ search · Enter help · r run",
             Tab::Favorites => "Enter run · e preset · x remove",
             Tab::Orgs => "Enter details · o open · l login",
@@ -1362,6 +1324,55 @@ impl App {
         }
     }
 
+    fn start_search(&mut self, kind: SearchKind) {
+        let state = if kind == SearchKind::Tests {
+            &self.test_search
+        } else {
+            &self.transfer_search
+        };
+        if state.searching {
+            self.notice("Search still running");
+            return;
+        }
+        let query = state.query.clone();
+        let retrieve = kind == SearchKind::Transfer && self.transfer_search.retrieve;
+        let set = if kind == SearchKind::Tests {
+            self.test_suggestion_cache
+                .as_ref()
+                .map(|(_, set)| Arc::clone(set))
+        } else {
+            self.suggestion_cache
+                .as_ref()
+                .map(|(_, set)| Arc::clone(set))
+        };
+        let Some(set) = set else {
+            self.error("Component index is not ready");
+            return;
+        };
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        if kind == SearchKind::Tests {
+            self.test_search.searching = true;
+        } else {
+            self.transfer_search.searching = true;
+        }
+        let tx = self.event_tx.clone();
+        let filter_query = query.clone();
+        self.search_task = Some(tokio::spawn(async move {
+            let results = tokio::task::spawn_blocking(move || set.filter(&filter_query, 8))
+                .await
+                .unwrap_or_default();
+            let _ = tx.send(AppEvent::TransferResults {
+                kind,
+                retrieve,
+                query,
+                results,
+                generation,
+            });
+        }));
+        self.notice("Searching…");
+    }
+
     fn transfer_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => {
@@ -1374,7 +1385,16 @@ impl App {
                 }
             }
             KeyCode::Char(' ') => self.transfer_search.toggle_result(),
-            KeyCode::Enter => self.open_transfer_confirm(),
+            KeyCode::Enter => {
+                let needs_search = self.transfer_search.needs_search();
+                if self.transfer_search.searching {
+                    self.notice("Search still running");
+                } else if needs_search {
+                    self.start_search(SearchKind::Transfer);
+                } else {
+                    self.open_transfer_confirm();
+                }
+            }
             KeyCode::Backspace => {
                 self.transfer_search.query.pop();
                 self.transfer_search.mark_edited();
@@ -1455,7 +1475,16 @@ impl App {
                 }
             }
             KeyCode::Char(' ') => self.test_search.toggle_result(),
-            KeyCode::Enter => self.open_test_confirm(),
+            KeyCode::Enter => {
+                let needs_search = self.test_search.needs_search();
+                if self.test_search.searching {
+                    self.notice("Search still running");
+                } else if needs_search {
+                    self.start_search(SearchKind::Tests);
+                } else {
+                    self.open_test_confirm();
+                }
+            }
             KeyCode::Backspace => {
                 self.test_search.query.pop();
                 self.test_search.mark_edited();
@@ -2869,11 +2898,77 @@ fn build_pick_items(project: &SfProject) -> Vec<PickItem> {
     items
 }
 
-pub fn transfer_result(
-    retrieve: bool,
-    report: &TransferReport,
-    job_id: Option<&str>,
-) -> ResultView {
+pub fn generic_result(title: &str, outcome: &ProcessOutcome, parsed: Option<&Value>) -> ResultView {
+    let ok = outcome.succeeded();
+    let mut items = Vec::new();
+    let mut sections = Vec::new();
+    if let Some(value) = parsed {
+        let view = crate::json_view::table(value);
+        for row in view.rows.iter().take(12) {
+            let label = row.first().cloned().unwrap_or_default();
+            let detail = row.iter().skip(1).cloned().collect::<Vec<_>>().join(" | ");
+            if !label.is_empty() || !detail.is_empty() {
+                items.push(ResultItem { ok, label, detail });
+            }
+        }
+    }
+    if items.is_empty() {
+        for line in outcome
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(12)
+        {
+            let bad = line.to_ascii_lowercase().contains("error")
+                || line.to_ascii_lowercase().contains("failed");
+            items.push(ResultItem {
+                ok: !bad,
+                label: line.trim().to_owned(),
+                detail: String::new(),
+            });
+        }
+    }
+    if !outcome.stderr.trim().is_empty() {
+        let rows = outcome
+            .stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .take(8)
+            .map(|line| ResultItem {
+                ok: false,
+                label: line.trim().to_owned(),
+                detail: String::new(),
+            })
+            .collect();
+        sections.push(ResultSection {
+            title: "ERRORS".to_owned(),
+            rows,
+        });
+    }
+    ResultView {
+        kind: ResultKind::Generic,
+        title: title.to_uppercase(),
+        status: if ok {
+            "SUCCESS".to_owned()
+        } else {
+            "FAILED".to_owned()
+        },
+        ok,
+        summary: format!(
+            "exit {} · {} output lines",
+            outcome
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+            outcome.stdout.lines().count()
+        ),
+        items,
+        coverage: Vec::new(),
+        sections,
+    }
+}
+
+fn transfer_result(retrieve: bool, report: &TransferReport, job_id: Option<&str>) -> ResultView {
     let ok = !report.status.eq_ignore_ascii_case("failed");
     let items = if report.components.is_empty() {
         vec![ResultItem {
@@ -2929,6 +3024,7 @@ pub fn transfer_result(
         ),
         items,
         coverage: Vec::new(),
+        sections: Vec::new(),
     }
 }
 
@@ -2974,6 +3070,7 @@ fn apex_result(run: &TestRun) -> ResultView {
         ),
         items,
         coverage,
+        sections: Vec::new(),
     }
 }
 
@@ -3199,6 +3296,7 @@ mod tests {
             SuggestionItem::new("ApexClass:Demo", "force-app/classes/Demo.cls"),
             SuggestionItem::new("Flow:Other", "force-app/flows/Other.flow-meta.xml"),
         ];
+        app.transfer_search.searched_query = Some(app.transfer_search.query.clone());
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
@@ -3234,6 +3332,7 @@ mod tests {
             SuggestionItem::new("ApexClass:DemoTest", "force-app/classes/DemoTest.cls"),
             SuggestionItem::new("ApexClass:Helper", "force-app/classes/Helper.cls"),
         ];
+        app.test_search.searched_query = Some(app.test_search.query.clone());
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Enter));
         match app.modal.as_ref() {
@@ -3243,6 +3342,20 @@ mod tests {
             }
             other => panic!("expected test confirmation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn component_search_waits_for_enter() {
+        let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let _guard = _runtime.enter();
+        let mut app = test_app();
+        app.tab = Tab::Retrieve;
+        app.ensure_suggestion_sets();
+        app.handle_key(key(KeyCode::Char('A')));
+        assert!(app.transfer_search.needs_search());
+        assert!(app.transfer_search.results.is_empty());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.transfer_search.searching || !app.transfer_search.needs_search());
     }
 
     #[test]
@@ -3286,6 +3399,7 @@ mod tests {
             SuggestionItem::new("ApexClass:Demo", "force-app/classes/Demo.cls"),
             SuggestionItem::new("Flow:Other", "force-app/flows/Other.flow-meta.xml"),
         ];
+        app.transfer_search.searched_query = Some(app.transfer_search.query.clone());
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Char(' ')));

@@ -33,6 +33,9 @@ case "$*" in
   "project deploy report --job-id 0Af000000000001 --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}'
     ;;
+  project*retrieve*start*metadata*)
+    printf '%s\n' '{"status":0,"result":{"status":"Succeeded","components":{"total":1,"successes":1,"failed":0}}}'
+    ;;
   "echo-error")
     printf '%s\n' 'synthetic failure from stub' >&2
     exit 3

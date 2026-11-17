@@ -415,7 +415,11 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Line::from(vec![
             faint(format!("{} selected", state.checked().len())),
-            faint("                             [Space] select   [Enter] confirm"),
+            faint(if state.needs_search() {
+                "                        [Enter] search"
+            } else {
+                "              [Space] select   [Enter] confirm"
+            }),
         ]),
         sections[3],
     );
@@ -1043,7 +1047,11 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Line::from(vec![
             faint(format!("{count} selected")),
-            faint("                                  [Space] select   [Enter] confirm"),
+            faint(if state.needs_search() {
+                "                            [Enter] search"
+            } else {
+                "                  [Space] select   [Enter] confirm"
+            }),
         ]),
         sections[3],
     );
@@ -1147,6 +1155,13 @@ fn draw_result_view(
         lines.push(Line::from(" "));
         lines.push(strong_line("COVERAGE", accent(app)));
         for item in result.coverage.iter().take(20) {
+            lines.push(result_item_line(item));
+        }
+    }
+    for section in &result.sections {
+        lines.push(Line::from(" "));
+        lines.push(strong_line(&section.title, Color::Red));
+        for item in section.rows.iter().take(12) {
             lines.push(result_item_line(item));
         }
     }

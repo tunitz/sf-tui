@@ -69,17 +69,17 @@ highlights first — outcome, failures, coverage — then per-class coverage. Pr
 screen to view previous runs. The Org menu replaces the old login shortcut: check current org,
 switch, login, delete/logout or reauth.
 
-On the Retrieve/Deploy screens, type to search, `↑↓` move, `Space` check/uncheck, `Enter`
-confirm, `Esc` back. The search is async and debounced; selected components keep their source
+On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
+`Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`. The search is async and debounced; selected components keep their source
 paths and become `--metadata` entries in the command.
 
 The confirmation dialog shows every selected component as a checkbox: `Space` toggles, `↑↓` moves,
 `c` shows the exact command, `v/t/w` toggle deploy options, `g` cycles orgs, `Enter` runs and `Esc`
 goes back.
 
-The result screen shows a human-readable result immediately: status, counts, per-item pass/fail
-rows with `[✓]`/`[x]` icons, and per-class Apex coverage. Raw stdout/JSON is behind `o`. Press
-`v` on Apex test results to view saved runs.
+Every command result is rendered human-readable immediately: status, counts, per-item pass/fail
+rows with `[✓]`/`[x]` icons, and sections for errors/values. Raw stdout/JSON is behind `o`. Apex
+test results also include per-class coverage; press `v` to view saved runs.
 
 ## Configuration
 

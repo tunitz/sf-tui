@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.11] - 2026-11-17
+
+### Changed
+
+- Component/test search no longer runs while typing. Type the query, press `Enter` to search,
+  `Space` to select, then `Enter` again to confirm. Filtering runs in `spawn_blocking` with a
+  generation guard so stale results are ignored.
+- Every command now gets a human-readable result view with status, counts, `[✓]`/`[x]` rows and
+  sections. Raw stdout/JSON remains behind `o`.
+
+[0.1.11]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.11
+
 ## [0.1.10] - 2026-11-17
 
 ### Changed
