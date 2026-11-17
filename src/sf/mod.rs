@@ -145,18 +145,22 @@ pub async fn probe_with(
         )
         .await
         {
-            Ok(outcome) => match catalog::parse_commands_json(&outcome.stdout) {
-                Ok(commands) => {
-                    let _ = catalog::write_cache(&cache_path, outcome.stdout.trim());
+            Ok(outcome) => match parse_json_document(&outcome.stdout).and_then(|value| {
+                catalog::parse_commands_json(&value.to_string())
+                    .ok()
+                    .map(|commands| (value, commands))
+            }) {
+                Some((value, commands)) => {
+                    let _ = catalog::write_cache(&cache_path, &value.to_string());
                     Some(Catalog {
                         commands,
                         source: catalog::CatalogSource::Live,
                     })
                 }
-                Err(error) => {
-                    send(StartupEvent::Notice(format!(
-                        "Using bundled catalog: {error}"
-                    )));
+                None => {
+                    send(StartupEvent::Notice(
+                        "Using bundled catalog: unreadable command response".to_owned(),
+                    ));
                     None
                 }
             },

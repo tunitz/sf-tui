@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.1.9] - 2026-11-17
+
+### Fixed
+
+- Catalog cache is now written from the extracted JSON document, so warning text before
+  `sf commands --json` no longer prevents caching.
+- Added a regression test proving the second launch reuses the cache instead of showing
+  "Loading command catalog".
+
+[0.1.9]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.9
+
 ## [0.1.8] - 2026-11-17
 
 ### Added

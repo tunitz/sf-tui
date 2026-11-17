@@ -6,6 +6,7 @@ case "$*" in
     printf '%s\n' '{"status":0,"result":{"version":"99.0.0"}}'
     ;;
   "commands --json")
+    printf '%s\n' 'warning: synthetic plugin notice'
     printf '%s\n' '{"status":0,"result":[{"id":"org list","summary":"List orgs","category":"Orgs","flags":[{"name":"json","description":"JSON output","type":"boolean","required":false}],"examples":[["sf org list","List orgs"]]}]}'
     ;;
   "config get target-org --json" | "org display --json")

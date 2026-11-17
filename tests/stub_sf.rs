@@ -146,6 +146,39 @@ async fn staged_startup_reports_progress_and_caches_the_catalog() {
 }
 
 #[tokio::test]
+async fn second_launch_reuses_the_catalog_cache() {
+    assert_synthetic_environment();
+    let dir = tempfile::tempdir().expect("temp dir");
+    for launch in 1..=2 {
+        let (tx, mut rx) = mpsc::unbounded_channel::<StartupEvent>();
+        let task = tokio::spawn(sftui::sf::probe_with(
+            dir.path().to_path_buf(),
+            tx,
+            Some(stub_installation()),
+        ));
+        let mut saw_loading = false;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = rx.recv().await {
+                if matches!(event, StartupEvent::Stage("Loading command catalog")) {
+                    saw_loading = true;
+                }
+                if matches!(event, StartupEvent::Finished) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("probe finished");
+        let _ = task.await.expect("probe task");
+        if launch == 1 {
+            assert!(saw_loading, "first launch should build the cache");
+        } else {
+            assert!(!saw_loading, "second launch should reuse the cache");
+        }
+    }
+}
+
+#[tokio::test]
 async fn failed_stub_command_captures_stderr_and_exit_code() {
     assert_synthetic_environment();
     let outcome = runner::capture(
