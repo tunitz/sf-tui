@@ -1112,6 +1112,65 @@ fn test_run_lines(
     lines
 }
 
+fn result_item_line(item: &crate::app::ResultItem) -> Line<'static> {
+    let icon = if item.ok { "✓" } else { "x" };
+    let color = if item.ok { Color::Green } else { Color::Red };
+    Line::from(vec![
+        Span::styled(format!("[{icon}] "), Style::default().fg(color)),
+        Span::styled(item.label.clone(), Style::default().fg(Color::White)),
+        Span::styled(
+            format!("  {}", item.detail),
+            Style::default().fg(if item.ok { Color::DarkGray } else { Color::Red }),
+        ),
+    ])
+}
+
+fn draw_result_view(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    record: &crate::app::OutputRecord,
+    result: &crate::app::ResultView,
+) {
+    let color = if result.ok { Color::Green } else { Color::Red };
+    let mut lines = vec![
+        strong(&result.title, accent(app))
+            + Span::styled(" — ", Style::default().fg(Color::DarkGray))
+            + strong(&result.status, color),
+        Line::from(faint(&result.summary)),
+        Line::from(" "),
+    ];
+    for item in result.items.iter().take(20) {
+        lines.push(result_item_line(item));
+    }
+    if !result.coverage.is_empty() {
+        lines.push(Line::from(" "));
+        lines.push(strong_line("COVERAGE", accent(app)));
+        for item in result.coverage.iter().take(20) {
+            lines.push(result_item_line(item));
+        }
+    }
+    lines.push(Line::from(" "));
+    lines.push(Line::from(faint(
+        "[o] raw output   [h] Home   [Esc] Back   [r] Rerun",
+    )));
+    if result.kind == crate::app::ResultKind::ApexTests {
+        lines.push(Line::from(faint("[v] saved results")));
+    }
+    if app.output_state.show_details {
+        lines.push(Line::from(" "));
+        lines.push(strong_line("RAW OUTPUT", accent(app)));
+        for line in record.lines.iter().rev().take(20).rev() {
+            lines.push(Line::from(Span::styled(
+                line.text.clone(),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::from(faint("[z] JSON")));
+    }
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
 fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
     let Some(record) = app.output_state.records.get(app.output_state.selected) else {
         frame.render_widget(
@@ -1120,6 +1179,10 @@ fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
+    if let Some(result) = &record.result {
+        draw_result_view(frame, area, app, record, result);
+        return;
+    }
     if record.purpose == "apex tests" {
         let run = app.latest_test_run.clone().or_else(|| {
             record

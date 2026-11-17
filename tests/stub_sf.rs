@@ -214,6 +214,7 @@ fn every_screen_renders_without_panicking() {
         lines: Vec::new(),
         status: None,
         json: Some(serde_json::json!({"result":{"status":"ok"}})),
+        result: None,
     });
     for (width, height) in [(120, 40), (80, 24), (60, 16), (48, 12)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");

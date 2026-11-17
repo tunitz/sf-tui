@@ -297,6 +297,31 @@ impl TransferSearchState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResultKind {
+    Retrieve,
+    Deploy,
+    ApexTests,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResultItem {
+    pub ok: bool,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResultView {
+    pub kind: ResultKind,
+    pub title: String,
+    pub status: String,
+    pub ok: bool,
+    pub summary: String,
+    pub items: Vec<ResultItem>,
+    pub coverage: Vec<ResultItem>,
+}
+
 /// A single recorded command invocation and its streamed output.
 #[derive(Debug, Clone)]
 pub struct OutputRecord {
@@ -306,6 +331,7 @@ pub struct OutputRecord {
     pub lines: Vec<JobLine>,
     pub status: Option<ProcessOutcome>,
     pub json: Option<Value>,
+    pub result: Option<ResultView>,
 }
 
 impl OutputRecord {
@@ -343,6 +369,7 @@ impl OutputState {
             lines: Vec::new(),
             status: None,
             json: None,
+            result: None,
         });
         if self.records.len() > MAX_RECORDS {
             self.records.remove(0);
@@ -805,6 +832,7 @@ impl App {
                 | JobPurpose::ApexTests { .. }
         );
         let succeeded = outcome.succeeded();
+        let mut result_view: Option<ResultView> = None;
         match (purpose, parsed) {
             (JobPurpose::OrgList, Some(value)) => {
                 self.org_state.orgs = sf::org::parse_org_list(&value);
@@ -845,6 +873,7 @@ impl App {
                             "Failed".to_owned()
                         };
                     }
+                    result_view = Some(transfer_result(true, &report, None));
                     self.deploy_state.report = Some(report);
                     self.deploy_state.job_id = None;
                     self.deploy_state.poll_after = None;
@@ -852,6 +881,19 @@ impl App {
                 } else if let Some(id) = sf::deploy::parse_started_job_id(&value) {
                     self.deploy_state.job_id = Some(id.clone());
                     self.deploy_state.poll_after = Some(Instant::now() + Duration::from_secs(3));
+                    result_view = Some(ResultView {
+                        kind: ResultKind::Deploy,
+                        title: "Deploy".to_owned(),
+                        status: "Queued".to_owned(),
+                        ok: true,
+                        summary: format!("Job {id} started"),
+                        items: vec![ResultItem {
+                            ok: true,
+                            label: "Deploy request accepted".to_owned(),
+                            detail: id.clone(),
+                        }],
+                        coverage: Vec::new(),
+                    });
                     self.deploy_state.report = None;
                     self.notice(format!("Started deploy job {id}"));
                 }
@@ -859,6 +901,7 @@ impl App {
             (JobPurpose::Report { .. }, Some(value)) => {
                 let report = sf::deploy::parse_report(&value);
                 let complete = report.is_complete();
+                result_view = Some(transfer_result(false, &report, Some(&report.id)));
                 self.deploy_state.report = Some(report);
                 if complete {
                     self.deploy_state.job_id = None;
@@ -875,12 +918,18 @@ impl App {
             }
             (JobPurpose::ApexTests { command }, Some(value)) => {
                 let run = test_results::parse(&value, &command);
+                result_view = Some(apex_result(&run));
                 self.test_runs = test_results::record(&self.config_dir, run.clone());
                 self.latest_test_run = Some(run);
-                self.output_state.show_details = true;
+                self.output_state.show_details = false;
                 self.notice("Apex test results saved");
             }
             _ => {}
+        }
+        if let Some(view) = result_view
+            && let Some(record) = self.output_state.find_mut(job_id)
+        {
+            record.result = Some(view);
         }
         if succeeded && user_command {
             self.notice("Done — h home · Backspace back");
@@ -2820,7 +2869,115 @@ fn build_pick_items(project: &SfProject) -> Vec<PickItem> {
     items
 }
 
-pub fn suggestions_for(field: &PromptField) -> Vec<SuggestionItem> {
+pub fn transfer_result(
+    retrieve: bool,
+    report: &TransferReport,
+    job_id: Option<&str>,
+) -> ResultView {
+    let ok = !report.status.eq_ignore_ascii_case("failed");
+    let items = if report.components.is_empty() {
+        vec![ResultItem {
+            ok,
+            label: if retrieve {
+                "Retrieve request".to_owned()
+            } else {
+                "Deploy request".to_owned()
+            },
+            detail: job_id.unwrap_or("").to_owned(),
+        }]
+    } else {
+        report
+            .components
+            .iter()
+            .map(|component| {
+                let failed = matches!(
+                    component.status.to_ascii_lowercase().as_str(),
+                    "failed" | "error" | "failure"
+                );
+                ResultItem {
+                    ok: !failed && component.problem.is_empty(),
+                    label: if component.component_type.is_empty() {
+                        component.name.clone()
+                    } else {
+                        format!("{}:{}", component.component_type, component.name)
+                    },
+                    detail: if component.problem.is_empty() {
+                        component.status.clone()
+                    } else {
+                        format!("{} — {}", component.status, component.problem)
+                    },
+                }
+            })
+            .collect()
+    };
+    ResultView {
+        kind: if retrieve {
+            ResultKind::Retrieve
+        } else {
+            ResultKind::Deploy
+        },
+        title: if retrieve {
+            "Retrieve".to_owned()
+        } else {
+            "Deploy".to_owned()
+        },
+        status: report.status.clone(),
+        ok,
+        summary: format!(
+            "{} total · {} succeeded · {} failed",
+            report.total, report.succeeded, report.failed
+        ),
+        items,
+        coverage: Vec::new(),
+    }
+}
+
+fn apex_result(run: &TestRun) -> ResultView {
+    let ok = run.outcome.eq_ignore_ascii_case("Passed") || run.outcome.eq_ignore_ascii_case("Pass");
+    let items = run
+        .tests
+        .iter()
+        .map(|test| ResultItem {
+            ok: !matches!(
+                test.outcome.to_ascii_lowercase().as_str(),
+                "fail" | "failed" | "compilefail"
+            ),
+            label: test.name.clone(),
+            detail: if test.message.is_empty() {
+                test.outcome.clone()
+            } else {
+                format!("{} — {}", test.outcome, test.message)
+            },
+        })
+        .collect();
+    let coverage = run
+        .coverages
+        .iter()
+        .map(|item| ResultItem {
+            ok: true,
+            label: item.name.clone(),
+            detail: if item.total == 0 {
+                item.percent.clone()
+            } else {
+                format!("{} ({}/{})", item.percent, item.covered, item.total)
+            },
+        })
+        .collect();
+    ResultView {
+        kind: ResultKind::ApexTests,
+        title: "Apex tests".to_owned(),
+        status: run.outcome.clone(),
+        ok,
+        summary: format!(
+            "{} run · {} passed · {} failed · {} skipped · coverage {}",
+            run.tests_run, run.passing, run.failing, run.skipped, run.coverage
+        ),
+        items,
+        coverage,
+    }
+}
+
+fn suggestions_for(field: &PromptField) -> Vec<SuggestionItem> {
     field.cached_suggestions().to_vec()
 }
 

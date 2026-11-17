@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.2.2] - 2026-11-17
+
+### Changed
+
+- Output now shows a human-readable result immediately for retrieve, deploy and Apex tests.
+  Raw stdout/JSON is behind `o`.
+- Results are rendered as separate rows with `[✓]` / `[x]` icons instead of one compressed line.
+- Apex test output lists every test method with pass/fail state, then per-class coverage, including
+  nested `perClassCoverage` and `codecoverage` shapes from Salesforce.
+
+[0.2.2]: https://github.com/tunitz/sf-tui/releases/tag/v0.2.2
+
 ## [0.2.1] - 2026-11-17
 
 ### Fixed

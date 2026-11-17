@@ -77,8 +77,9 @@ The confirmation dialog shows every selected component as a checkbox: `Space` to
 `c` shows the exact command, `v/t/w` toggle deploy options, `g` cycles orgs, `Enter` runs and `Esc`
 goes back.
 
-The result screen shows `SUCCESS` or `FAILED`; press `o` to expand raw details, `h` for Home,
-`Esc` to go back, or `r` to rerun.
+The result screen shows a human-readable result immediately: status, counts, per-item pass/fail
+rows with `[✓]`/`[x]` icons, and per-class Apex coverage. Raw stdout/JSON is behind `o`. Press
+`v` on Apex test results to view saved runs.
 
 ## Configuration
 
