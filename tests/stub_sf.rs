@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use sftui::app::{App, OutputRecord};
@@ -257,7 +258,7 @@ fn every_screen_renders_without_panicking() {
                 "empty frame at {width}x{height} on {tab:?}"
             );
             if (width, height) == (60, 16) && tab == sftui::app::Tab::Home {
-                assert!(rendered.contains("[r] Retrieve"), "menu missing");
+                assert!(rendered.contains("[1] Retrieve"), "numeric menu missing");
                 assert!(rendered.contains("MENU"), "menu heading missing");
             }
             if (width, height) == (60, 16) && tab == sftui::app::Tab::Tests {
@@ -267,12 +268,25 @@ fn every_screen_renders_without_panicking() {
                 );
             }
             if (width, height) == (120, 40) && tab == sftui::app::Tab::Home {
-                assert!(!rendered.contains("[1]"), "tab bar must be gone");
+                assert!(rendered.contains("[1] Retrieve"), "numeric menu missing");
+                assert!(
+                    !rendered.contains("Organization"),
+                    "org menu entry must be gone"
+                );
+                assert!(
+                    !rendered.contains("Run command"),
+                    "run-command menu entry must be gone"
+                );
                 assert!(rendered.contains("[F2] jobs"), "key hints missing");
             }
         }
         for modal in [
             sftui::app::Modal::Help { scroll: 0 },
+            sftui::app::Modal::Catalog {
+                query: String::new(),
+                selected: 0,
+                scroll: 0,
+            },
             sftui::app::Modal::Message {
                 title: "Notice".to_owned(),
                 message: "Synthetic modal".to_owned(),
@@ -366,6 +380,53 @@ fn tiny_footer_keeps_key_hints_and_moves_status_to_the_header() {
 }
 
 #[test]
+fn header_is_left_aligned_at_all_sizes() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup {
+            installation: None,
+            version: Some("99.0.0".to_owned()),
+            current_org: None,
+            notices: Vec::new(),
+        },
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.startup_stage.done = true;
+    app.status.clear();
+    app.tab = sftui::app::Tab::Home;
+
+    for (width, height) in [(80, 24), (60, 12)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+        let buffer = terminal.backend().buffer();
+        let header: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            header.contains("SFTUI"),
+            "brand missing at {width}x{height}: {header}"
+        );
+        assert!(
+            header.contains("no default org"),
+            "org context missing at {width}x{height}: {header}"
+        );
+        assert!(
+            header.contains("ready"),
+            "activity missing at {width}x{height}: {header}"
+        );
+        let context_at = header.find("no default org").expect("org context position");
+        let activity_at = header.find("ready").expect("activity position");
+        assert!(
+            activity_at > context_at,
+            "activity must follow the org context in one left-aligned row: {header}"
+        );
+    }
+}
+
+#[test]
 fn prompt_overlay_renders_with_a_cursor() {
     assert_synthetic_environment();
     let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
@@ -396,6 +457,167 @@ fn prompt_overlay_renders_with_a_cursor() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(rendered.contains("test-scratch"));
+}
+
+#[test]
+fn help_modal_renders_as_a_table_at_multiple_sizes() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup {
+            installation: None,
+            version: None,
+            current_org: None,
+            notices: Vec::new(),
+        },
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.modal = Some(sftui::app::Modal::Help { scroll: 0 });
+
+    for (width, height) in [(80, 24), (60, 16)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| ui::draw(frame, &app))
+            .expect("draw help");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("Key") && rendered.contains("Action"),
+            "help table header missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("F2"),
+            "known key row missing at {width}x{height}"
+        );
+        if width == 80 {
+            assert!(
+                rendered.contains("open the command catalog"),
+                "F3 help row missing at {width}x{height}"
+            );
+        }
+        assert!(
+            !rendered.contains("Menu r/d/c/t/o/e"),
+            "stale menu row at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn f3_catalog_renders_at_small_and_roomy_sizes() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup {
+            installation: None,
+            version: None,
+            current_org: None,
+            notices: Vec::new(),
+        },
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+    assert!(
+        matches!(app.modal, Some(sftui::app::Modal::Catalog { .. })),
+        "F3 must open the catalog"
+    );
+    for character in "org list".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+
+    for (width, height) in [(80, 24), (60, 16)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| ui::draw(frame, &app))
+            .expect("draw catalog");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("command catalog"),
+            "catalog title missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("org list"),
+            "filtered command row missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("key flags"),
+            "detail pane missing at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn create_metadata_modal_shows_local_output_and_scannable_templates() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup {
+            installation: None,
+            version: None,
+            current_org: None,
+            notices: Vec::new(),
+        },
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.modal = Some(sftui::app::Modal::Prompt {
+        title: "Create metadata".to_owned(),
+        kind: sftui::app::PromptKind::CreateMetadata,
+        fields: vec![
+            sftui::app::PromptField::new("Template", "").with_suggestions(std::sync::Arc::new(
+                sftui::sf::metadata::create_suggestions(),
+            )),
+            sftui::app::PromptField::new("Component name (PascalCase)", ""),
+            sftui::app::PromptField::new("Output dir (optional)", ""),
+        ],
+        focus: 0,
+    });
+
+    for (width, height) in [(80, 24), (60, 16)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("ApexClass"),
+            "template suggestions missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("classes/"),
+            "destination folder missing at {width}x{height}"
+        );
+        assert!(
+            !rendered.contains("Org"),
+            "the irrelevant Org field must be gone at {width}x{height}"
+        );
+        if width == 80 {
+            assert!(
+                rendered.contains("Component name (PascalCase)")
+                    && rendered.contains("Output dir (optional)"),
+                "improved field labels missing: {rendered}"
+            );
+        }
+    }
 }
 
 #[test]

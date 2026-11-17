@@ -136,8 +136,6 @@ pub enum MenuAction {
     Deploy,
     Create,
     Tests,
-    Organizations,
-    RunCommand,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,34 +147,24 @@ pub struct MenuItem {
 
 pub const MENU_ITEMS: &[MenuItem] = &[
     MenuItem {
-        key: 'r',
+        key: '1',
         label: "Retrieve Metadata",
         action: MenuAction::Retrieve,
     },
     MenuItem {
-        key: 'd',
+        key: '2',
         label: "Deploy Metadata",
         action: MenuAction::Deploy,
     },
     MenuItem {
-        key: 'c',
+        key: '3',
         label: "Create Metadata",
         action: MenuAction::Create,
     },
     MenuItem {
-        key: 't',
+        key: '4',
         label: "Apex Tests",
         action: MenuAction::Tests,
-    },
-    MenuItem {
-        key: 'o',
-        label: "Organization",
-        action: MenuAction::Organizations,
-    },
-    MenuItem {
-        key: 'e',
-        label: "Run command",
-        action: MenuAction::RunCommand,
     },
 ];
 
@@ -669,6 +657,12 @@ pub enum PendingAction {
 #[derive(Debug, Clone)]
 pub enum Modal {
     Help {
+        scroll: usize,
+    },
+    /// Global F3 command catalog: type to filter, arrows to move, Enter to confirm and run.
+    Catalog {
+        query: String,
+        selected: usize,
         scroll: usize,
     },
     Message {
@@ -1255,18 +1249,25 @@ impl App {
                     .org_state
                     .selected
                     .min(self.org_state.orgs.len().saturating_sub(1));
+                result_view = Some(generic_result(&purpose_title, &outcome, parsed.as_ref()));
                 if succeeded {
-                    self.notice(format!("Loaded {} orgs", self.org_state.orgs.len()));
+                    self.notice(format!(
+                        "Loaded {} orgs — F2 jobs shows the result",
+                        self.org_state.orgs.len()
+                    ));
                 }
             }
             (JobPurpose::OrgList, None) => {
                 self.org_state.loading = false;
+                result_view = Some(generic_result(&purpose_title, &outcome, None));
             }
             (JobPurpose::OrgDetail { username }, Some(value)) => {
-                self.org_state.detail = Some(sf::org::parse_org_display(&value));
+                let detail = sf::org::parse_org_display(&value);
+                result_view = Some(org_display_result(&username, &detail, succeeded));
+                self.org_state.detail = Some(detail);
                 self.org_state.detail_for = Some(username);
                 if succeeded {
-                    self.notice("Org details loaded");
+                    self.notice("Org details loaded — F2 jobs shows the result");
                 }
             }
             (JobPurpose::Transfer { options }, Some(value)) => {
@@ -1333,8 +1334,9 @@ impl App {
             }
             (JobPurpose::Report { .. }, None) => {}
             (JobPurpose::OrgAction { description }, _) => {
+                result_view = Some(redacted_result(&purpose_title, succeeded, &description));
                 if succeeded {
-                    self.notice(format!("{description} finished"));
+                    self.notice(format!("{description} finished — F2 jobs shows the result"));
                 }
                 self.refresh_orgs();
             }
@@ -1651,6 +1653,7 @@ impl App {
                     | TaskKind::Tests
                     | TaskKind::Command
                     | TaskKind::Setup
+                    | TaskKind::Organization
             )
         {
             self.output_state.begin(
@@ -1916,6 +1919,10 @@ impl App {
             self.open_jobs();
             return;
         }
+        if key.code == KeyCode::F(3) {
+            self.open_catalog();
+            return;
+        }
         if key.code == KeyCode::F(4) {
             self.open_switch_org();
             return;
@@ -2093,15 +2100,14 @@ impl App {
                 self.notice("Type a component name to search");
             }
             MenuAction::Create => {
-                let target = self.org_target_hint();
                 self.open_prompt(
                     "Create metadata",
                     PromptKind::CreateMetadata,
                     vec![
                         PromptField::new("Template", "")
                             .with_suggestions(Arc::new(crate::sf::metadata::create_suggestions())),
-                        PromptField::new("Name", ""),
-                        PromptField::new("Org", target),
+                        PromptField::new("Component name (PascalCase)", ""),
+                        PromptField::new("Output dir (optional)", ""),
                     ],
                 );
             }
@@ -2110,12 +2116,6 @@ impl App {
                 self.set_tab(Tab::Tests);
                 self.notice("Type a test class name to search");
             }
-            MenuAction::Organizations => self.set_tab(Tab::Orgs),
-            MenuAction::RunCommand => self.open_prompt(
-                "Run command",
-                PromptKind::RunCommand,
-                vec![PromptField::new("Command", "")],
-            ),
         }
     }
 
@@ -2521,6 +2521,16 @@ impl App {
         self.modal = Some(Modal::SwitchOrg { selected });
     }
 
+    /// Open the bundled command catalog. F3: discover an sf command from any screen without
+    /// adding a menu entry or probing the CLI.
+    fn open_catalog(&mut self) {
+        self.modal = Some(Modal::Catalog {
+            query: String::new(),
+            selected: 0,
+            scroll: 0,
+        });
+    }
+
     fn open_jobs(&mut self) {
         let rows = self.job_rows();
         let selected = rows
@@ -2704,6 +2714,74 @@ impl App {
                 }
                 _ => {}
             },
+            Modal::Catalog {
+                mut query,
+                mut selected,
+                mut scroll,
+            } => {
+                let hits = catalog_hits(&query);
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal = None;
+                        return;
+                    }
+                    KeyCode::Enter => {
+                        if let Some(command) = hits.get(selected) {
+                            let argv = catalog_command_argv(command);
+                            let display = redact_command(&format!("sf {}", argv.join(" ")));
+                            let warning = if is_secret_command(&display) {
+                                "\n\nSecrets are shown as [redacted]; this command may expose credentials, so its output is not retained."
+                            } else {
+                                ""
+                            };
+                            self.modal = Some(Modal::Confirm {
+                                title: "Run catalog command?".to_owned(),
+                                message: format!("{display}{warning}\n\nEnter runs · Esc cancels"),
+                                action: PendingAction::RunCommand {
+                                    argv,
+                                    command: display,
+                                },
+                            });
+                        } else {
+                            self.modal = Some(Modal::Catalog {
+                                query,
+                                selected,
+                                scroll,
+                            });
+                        }
+                        return;
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        selected = 0;
+                        scroll = 0;
+                    }
+                    KeyCode::Up => selected = selected.saturating_sub(1),
+                    KeyCode::Down => selected = (selected + 1).min(hits.len().saturating_sub(1)),
+                    KeyCode::PageUp => selected = selected.saturating_sub(CATALOG_VISIBLE_ROWS),
+                    KeyCode::PageDown => {
+                        selected =
+                            (selected + CATALOG_VISIBLE_ROWS).min(hits.len().saturating_sub(1))
+                    }
+                    KeyCode::Home => {
+                        selected = 0;
+                        scroll = 0;
+                    }
+                    KeyCode::End => selected = hits.len().saturating_sub(1),
+                    KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(character);
+                        selected = 0;
+                        scroll = 0;
+                    }
+                    _ => {}
+                }
+                scroll = catalog_scroll_for(selected, scroll, hits.len());
+                self.modal = Some(Modal::Catalog {
+                    query,
+                    selected,
+                    scroll,
+                });
+            }
             Modal::Message { .. } => {}
             Modal::Confirm {
                 title,
@@ -3437,6 +3515,27 @@ impl App {
                     self.error("Enter the new component name");
                     return false;
                 }
+                // An explicit output dir wins; otherwise target the first package directory so
+                // generated files land beside the other components instead of the project root.
+                let override_dir = values
+                    .get(2)
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let output_dir = match override_dir {
+                    Some(value) => std::path::PathBuf::from(value),
+                    None => {
+                        self.deploy_state
+                            .project
+                            .as_ref()
+                            .and_then(|project| {
+                                project.package_directories.first().map(|package| {
+                                    project.root.join(package).join(template.output_dir)
+                                })
+                            })
+                            .unwrap_or_else(|| std::path::PathBuf::from(template.output_dir))
+                    }
+                };
                 let mut argv: Vec<String> = template
                     .command
                     .iter()
@@ -3444,14 +3543,18 @@ impl App {
                     .collect();
                 argv.push(template.name_flag.to_owned());
                 argv.push(name.to_owned());
+                if !argv.iter().any(|part| part == "--output-dir") {
+                    argv.push("--output-dir".to_owned());
+                    argv.push(output_dir.to_string_lossy().into_owned());
+                }
                 let display = format!("sf {}", argv.join(" "));
-                self.spawn(
-                    argv,
-                    JobPurpose::Command {
-                        id: template.command.join(" "),
-                        command: display,
-                    },
-                );
+                self.modal = Some(Modal::Confirm {
+                    title: "Create metadata".to_owned(),
+                    message: format!(
+                        "{display}\n\nFiles are created locally · Enter runs · Esc back"
+                    ),
+                    action: PendingAction::RunPrepared { argv },
+                });
             }
             PromptKind::SwitchOrg => {
                 let org = values.first().map(String::as_str).unwrap_or("").trim();
@@ -3662,6 +3765,52 @@ pub(crate) fn split_names(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Rows shown in the catalog list at once. Shared with the renderer so keyboard scrolling and
+/// the visible table stay in step.
+pub(crate) const CATALOG_VISIBLE_ROWS: usize = 8;
+
+/// Filtered catalog commands for the current query, best match first.
+pub(crate) fn catalog_hits(query: &str) -> Vec<&'static sf::catalog::CommandSpec> {
+    sf::catalog::search(&sf::catalog::catalog().commands, query, usize::MAX)
+        .into_iter()
+        .map(|hit| hit.command)
+        .collect()
+}
+
+/// Keep the selected row inside the visible window.
+pub(crate) fn catalog_scroll_for(selected: usize, scroll: usize, len: usize) -> usize {
+    let max_start = len.saturating_sub(CATALOG_VISIBLE_ROWS);
+    let mut next = scroll.min(max_start);
+    if selected < next {
+        next = selected;
+    } else if selected >= next.saturating_add(CATALOG_VISIBLE_ROWS) {
+        next = selected
+            .saturating_add(1)
+            .saturating_sub(CATALOG_VISIBLE_ROWS);
+    }
+    next.min(max_start)
+}
+
+/// Build argv for a catalog command from its first example, falling back to the command id.
+/// Only modern `sf` examples without unfilled `<placeholder>` tokens are usable: a legacy
+/// `sfdx force:` example or a placeholder such as `<test run id>` would otherwise produce a
+/// command that is guaranteed to fail. No flags are invented.
+pub(crate) fn catalog_command_argv(command: &sf::catalog::CommandSpec) -> Vec<String> {
+    let example = command
+        .examples
+        .first()
+        .map(|item| item.command.trim())
+        .unwrap_or("");
+    let usable = example.starts_with("sf ")
+        && !example.contains('<')
+        && !example.contains('>')
+        && !example.to_ascii_lowercase().contains("sfdx");
+    if usable && let Some(argv) = parse_run_command(example) {
+        return argv;
+    }
+    split_args(&command.id.replace(':', " "))
+}
+
 /// Parse the Run command prompt: strip a leading `sf`/`sfdx`, keep quoted arguments together.
 pub(crate) fn parse_run_command(input: &str) -> Option<Vec<String>> {
     let trimmed = input.trim();
@@ -3817,6 +3966,50 @@ fn apex_report_action(run: &test_results::TestRun) -> ApexReportAction {
     }
 }
 
+/// A compact result for `org display`: the parser has already dropped secret fields.
+fn org_display_result(username: &str, detail: &OrgDetail, ok: bool) -> ResultView {
+    let items = detail
+        .fields
+        .iter()
+        .take(24)
+        .map(|(label, value)| ResultItem {
+            ok: true,
+            label: label.clone(),
+            detail: value.clone(),
+            progress: None,
+        })
+        .collect();
+    ResultView {
+        kind: ResultKind::Generic,
+        title: "ORG DETAIL".to_owned(),
+        status: if ok { "SUCCESS" } else { "FAILED" }.to_owned(),
+        ok,
+        summary: format!("{username} · {} fields", detail.fields.len()),
+        items,
+        coverage: Vec::new(),
+        sections: Vec::new(),
+    }
+}
+
+/// A result for org actions whose raw output must never be retained or shown.
+fn redacted_result(title: &str, ok: bool, detail: &str) -> ResultView {
+    ResultView {
+        kind: ResultKind::Generic,
+        title: title.to_uppercase(),
+        status: if ok { "SUCCESS" } else { "FAILED" }.to_owned(),
+        ok,
+        summary: format!("{detail} · output redacted"),
+        items: vec![ResultItem {
+            ok,
+            label: "[output redacted]".to_owned(),
+            detail: String::new(),
+            progress: None,
+        }],
+        coverage: Vec::new(),
+        sections: Vec::new(),
+    }
+}
+
 /// A lightweight result shown while the org still works on the test run.
 fn started_test_view(run_id: &str) -> ResultView {
     ResultView {
@@ -3893,7 +4086,6 @@ fn is_user_purpose(purpose: &JobPurpose) -> bool {
             | JobPurpose::Transfer { .. }
             | JobPurpose::ApexTests { .. }
             | JobPurpose::Installer { .. }
-            | JobPurpose::OrgAction { .. }
     )
 }
 
@@ -4141,8 +4333,8 @@ mod tests {
     fn menu_keys_open_screens_and_escape_returns_to_previous() {
         let mut app = test_app();
         assert_eq!(app.tab, Tab::Home);
-        app.handle_key(key(KeyCode::Char('o')));
-        assert_eq!(app.tab, Tab::Orgs);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.tab, Tab::Tests);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.tab, Tab::Home);
         app.handle_key(key(KeyCode::Down));
@@ -4151,9 +4343,15 @@ mod tests {
     }
 
     #[test]
-    fn number_and_tab_keys_no_longer_switch_screens() {
+    fn number_keys_open_menu_items_and_tab_does_not_switch_screens() {
         let mut app = test_app();
+        app.handle_key(key(KeyCode::Char('1')));
+        assert_eq!(app.tab, Tab::Retrieve);
+        assert!(app.transfer_search.retrieve);
+        app.go_home();
         app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.tab, Tab::Tests);
+        app.go_home();
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Home);
     }
@@ -4289,6 +4487,113 @@ mod tests {
         assert_eq!(result.summary, "2 total · 2 succeeded · 0 failed");
         assert!(app.latest_result(TaskKind::Deploy).is_none());
         assert!(app.latest_result(TaskKind::Tests).is_none());
+    }
+
+    /// Spawn a harmless local process so the job is tracked and `finish_job` can be driven with a
+    /// synthetic outcome instead of waiting for a real CLI.
+    fn spawn_tracked(app: &mut App, purpose: JobPurpose) -> u64 {
+        let executable = if cfg!(windows) {
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd".to_owned())
+        } else {
+            "/bin/true".to_owned()
+        };
+        app.spawn_external(std::path::PathBuf::from(executable), Vec::new(), purpose);
+        app.output_state
+            .records
+            .last()
+            .map(|record| record.id)
+            .expect("spawned record")
+    }
+
+    #[test]
+    fn org_jobs_get_a_record_and_store_results_in_jobs() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let _guard = runtime.enter();
+        let mut app = test_app();
+
+        let list_id = spawn_tracked(&mut app, JobPurpose::OrgList);
+        let list_record = app
+            .output_state
+            .records
+            .iter()
+            .find(|record| record.id == list_id)
+            .expect("org list record");
+        assert_eq!(list_record.task, TaskKind::Organization);
+        assert!(app.job_rows().iter().any(|row| row.record.id == list_id));
+        assert!(!is_user_purpose(&JobPurpose::OrgList));
+        assert!(!is_user_purpose(&JobPurpose::OrgAction {
+            description: "switch".to_owned(),
+        }));
+
+        app.finish_job(
+            list_id,
+            sf::runner::ProcessOutcome {
+                exit_code: Some(0),
+                stdout: r#"{"result":{"scratchOrgs":[{"username":"demo@example.com","aliases":["demo"]}]}}"#
+                    .to_owned(),
+                stderr: String::new(),
+            },
+        );
+        let list_record = app
+            .output_state
+            .records
+            .iter()
+            .find(|record| record.id == list_id)
+            .expect("org list record");
+        assert_eq!(
+            list_record.result.as_ref().map(|view| view.title.as_str()),
+            Some("ORGS")
+        );
+        assert_eq!(app.org_state.orgs.len(), 1);
+
+        let detail_id = spawn_tracked(
+            &mut app,
+            JobPurpose::OrgDetail {
+                username: "demo@example.com".to_owned(),
+            },
+        );
+        app.finish_job(
+            detail_id,
+            sf::runner::ProcessOutcome {
+                exit_code: Some(0),
+                stdout: r#"{"result":{"username":"demo@example.com","instanceUrl":"https://example.my.salesforce.com","accessToken":"SUPER_SECRET"}}"#
+                    .to_owned(),
+                stderr: String::new(),
+            },
+        );
+        let detail_record = app
+            .output_state
+            .records
+            .iter()
+            .find(|record| record.id == detail_id)
+            .expect("org detail record");
+        let detail_view = detail_record.result.as_ref().expect("org detail result");
+        assert_eq!(detail_view.title, "ORG DETAIL");
+        assert!(!format!("{detail_view:?}").contains("SUPER_SECRET"));
+
+        let action_id = spawn_tracked(
+            &mut app,
+            JobPurpose::OrgAction {
+                description: "Switch org".to_owned(),
+            },
+        );
+        app.finish_job(
+            action_id,
+            sf::runner::ProcessOutcome {
+                exit_code: Some(0),
+                stdout: "token SECRET".to_owned(),
+                stderr: String::new(),
+            },
+        );
+        let action_record = app
+            .output_state
+            .records
+            .iter()
+            .find(|record| record.id == action_id)
+            .expect("org action record");
+        let action_view = action_record.result.as_ref().expect("org action result");
+        assert!(action_view.summary.contains("output redacted"));
+        assert!(!format!("{action_view:?}").contains("SECRET"));
     }
 
     #[test]
@@ -4685,6 +4990,112 @@ mod tests {
     }
 
     #[test]
+    fn f3_opens_the_catalog_from_every_screen() {
+        let mut app = test_app();
+        for tab in app.screens() {
+            app.tab = tab;
+            app.handle_key(key(KeyCode::F(3)));
+            assert!(
+                matches!(app.modal, Some(Modal::Catalog { .. })),
+                "F3 did not open the catalog on {tab:?}"
+            );
+            app.modal = None;
+        }
+    }
+
+    #[test]
+    fn catalog_selection_confirms_the_exact_command() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::F(3)));
+        for character in "org list".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        match app.modal.take() {
+            Some(Modal::Confirm {
+                message,
+                action: PendingAction::RunCommand { argv, command },
+                ..
+            }) => {
+                assert!(message.contains("sf org list"), "message: {message}");
+                assert_eq!(argv, vec!["org".to_owned(), "list".to_owned()]);
+                assert_eq!(command, "sf org list");
+            }
+            other => panic!("expected catalog confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_command_uses_the_first_example_or_falls_back_to_the_id() {
+        let hits = catalog_hits("project retrieve start");
+        assert_eq!(
+            hits.first().map(|command| command.id.as_str()),
+            Some("project retrieve start")
+        );
+        assert_eq!(
+            catalog_command_argv(hits[0]),
+            vec![
+                "project".to_owned(),
+                "retrieve".to_owned(),
+                "start".to_owned()
+            ]
+        );
+        let no_examples = sf::catalog::catalog()
+            .commands
+            .iter()
+            .find(|command| command.examples.is_empty())
+            .expect("a command without examples");
+        assert_eq!(
+            catalog_command_argv(no_examples),
+            split_args(&no_examples.id.replace(':', " "))
+        );
+    }
+
+    #[test]
+    fn catalog_argv_ignores_placeholders_and_legacy_examples() {
+        let command = |id: &str, example: &str| sf::catalog::CommandSpec {
+            id: id.to_owned(),
+            summary: String::new(),
+            description: String::new(),
+            category: String::new(),
+            flags: Vec::new(),
+            examples: vec![sf::catalog::Example {
+                command: example.to_owned(),
+                description: String::new(),
+            }],
+        };
+        let placeholder = command(
+            "apex get test",
+            "sf apex get test --test-run-id <test run id> --json",
+        );
+        assert_eq!(
+            catalog_command_argv(&placeholder),
+            vec!["apex", "get", "test"]
+        );
+        let legacy = command(
+            "force:lightning:lwc:test:run",
+            "sfdx force:lightning:lwc:test:run",
+        );
+        assert_eq!(
+            catalog_command_argv(&legacy),
+            vec!["force", "lightning", "lwc", "test", "run"]
+        );
+    }
+
+    #[test]
+    fn catalog_empty_search_keeps_the_modal_open_on_enter() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::F(3)));
+        for character in "zzzznotacommand".chars() {
+            app.handle_key(key(KeyCode::Char(character)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(Modal::Catalog { .. })));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
     fn apex_report_decision_polls_only_non_terminal_runs_with_an_id() {
         let processing = test_results::parse(
             &serde_json::json!({
@@ -4793,35 +5204,36 @@ mod tests {
 
     #[test]
     fn menu_lists_task_screens_in_order() {
-        let labels: Vec<&str> = MENU_ITEMS.iter().map(|item| item.label).collect();
+        let items: Vec<(char, &str)> = MENU_ITEMS
+            .iter()
+            .map(|item| (item.key, item.label))
+            .collect();
         assert_eq!(
-            labels,
+            items,
             vec![
-                "Retrieve Metadata",
-                "Deploy Metadata",
-                "Create Metadata",
-                "Apex Tests",
-                "Organization",
-                "Run command",
+                ('1', "Retrieve Metadata"),
+                ('2', "Deploy Metadata"),
+                ('3', "Create Metadata"),
+                ('4', "Apex Tests"),
             ]
         );
         let mut app = test_app();
-        app.handle_key(key(KeyCode::Char('r')));
+        app.handle_key(key(KeyCode::Char('1')));
         assert_eq!(app.tab, Tab::Retrieve);
         assert!(app.transfer_search.retrieve);
         app.go_home();
-        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('2')));
         assert_eq!(app.tab, Tab::Deploy);
         app.go_home();
-        app.handle_key(key(KeyCode::Char('o')));
-        assert_eq!(app.tab, Tab::Orgs);
+        app.handle_key(key(KeyCode::Char('4')));
+        assert_eq!(app.tab, Tab::Tests);
     }
 
     #[test]
     fn suggestion_keys_open_confirmation_and_consume_arrows() {
         let mut app = test_app();
         app.tab = Tab::Home;
-        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('2')));
         app.transfer_search.results = vec![
             SuggestionItem::new("ApexClass:Demo", "force-app/classes/Demo.cls"),
             SuggestionItem::new("Flow:Other", "force-app/flows/Other.flow-meta.xml"),
@@ -4856,7 +5268,7 @@ mod tests {
     fn test_run_uses_search_checkboxes_and_confirmation() {
         let mut app = test_app();
         app.tab = Tab::Home;
-        app.handle_key(key(KeyCode::Char('t')));
+        app.handle_key(key(KeyCode::Char('4')));
         assert_eq!(app.tab, Tab::Tests);
         app.test_search.results = vec![
             SuggestionItem::new("ApexClass:DemoTest", "force-app/classes/DemoTest.cls"),
@@ -4925,7 +5337,7 @@ mod tests {
     fn space_toggles_multiple_components_before_confirming() {
         let mut app = test_app();
         app.tab = Tab::Home;
-        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char('2')));
         app.transfer_search.results = vec![
             SuggestionItem::new("ApexClass:Demo", "force-app/classes/Demo.cls"),
             SuggestionItem::new("Flow:Other", "force-app/flows/Other.flow-meta.xml"),
@@ -5015,30 +5427,102 @@ mod tests {
         assert!(view.summary.contains(&id));
     }
 
+    fn create_project() -> SfProject {
+        SfProject {
+            root: std::path::PathBuf::from("/repo"),
+            package_directories: vec!["force-app/main/default".to_owned()],
+            source_api_version: None,
+            manifests: Vec::new(),
+            source_files: Vec::new(),
+        }
+    }
+
+    fn confirm_create_metadata(app: &mut App, output_dir: &str) -> PendingAction {
+        assert!(app.submit_prompt(
+            &PromptKind::CreateMetadata,
+            &[
+                PromptField::new("Template", "ApexClass"),
+                PromptField::new("Component name (PascalCase)", "DemoController"),
+                PromptField::new("Output dir (optional)", output_dir.to_owned()),
+            ],
+        ));
+        match app.modal.as_ref() {
+            Some(Modal::Confirm {
+                title,
+                message,
+                action,
+            }) => {
+                assert_eq!(title, "Create metadata");
+                assert!(message.contains("Files are created locally"), "{message}");
+                action.clone()
+            }
+            other => panic!("expected create confirmation, got {other:?}"),
+        }
+    }
+
     #[test]
     fn create_metadata_builds_the_generate_command() {
-        let _guard = tokio::runtime::Runtime::new()
-            .expect("test runtime")
-            .enter();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let _guard = runtime.enter();
         let mut app = test_app();
         app.startup.installation = Some(crate::sf::detect::SfInstallation {
             executable: std::path::PathBuf::from("sf"),
             source: "test".to_owned(),
         });
-        app.submit_prompt(
-            &PromptKind::CreateMetadata,
-            &[
-                PromptField::new("Template", "ApexClass"),
-                PromptField::new("Name", "DemoController"),
-                PromptField::new("Org", String::new()),
-            ],
+        app.deploy_state.project = Some(create_project());
+
+        let action = confirm_create_metadata(&mut app, "");
+        let expected = std::path::PathBuf::from("/repo")
+            .join("force-app/main/default")
+            .join("classes")
+            .to_string_lossy()
+            .into_owned();
+        let argv = match &action {
+            PendingAction::RunPrepared { argv } => argv.clone(),
+            other => panic!("expected prepared command, got {other:?}"),
+        };
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--output-dir" && pair[1] == expected),
+            "derived output dir missing from {argv:?}"
         );
+        if let Some(Modal::Confirm { message, .. }) = app.modal.as_ref() {
+            assert!(
+                message.contains(&format!(
+                    "sf template generate apex class --name DemoController --output-dir {expected}"
+                )),
+                "confirmation does not show the exact command: {message}"
+            );
+        }
+
+        app.execute(action);
         let record = app.output_state.records.last().expect("record");
         assert!(
             record
                 .command
                 .contains("template generate apex class --name DemoController")
         );
+        assert!(record.command.contains("--output-dir"));
+    }
+
+    #[test]
+    fn create_metadata_honours_an_explicit_output_dir() {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let _guard = runtime.enter();
+        let mut app = test_app();
+        app.deploy_state.project = Some(create_project());
+        let action = confirm_create_metadata(&mut app, "/custom/schemas");
+        match action {
+            PendingAction::RunPrepared { argv } => {
+                assert!(
+                    argv.windows(2)
+                        .any(|pair| { pair[0] == "--output-dir" && pair[1] == "/custom/schemas" }),
+                    "explicit output dir missing from {argv:?}"
+                );
+                assert!(!argv.iter().any(|part| part.contains("force-app")));
+            }
+            other => panic!("expected prepared command, got {other:?}"),
+        }
     }
 
     #[test]

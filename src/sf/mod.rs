@@ -1,5 +1,6 @@
 //! The SF CLI integration layer: detection, process execution and response parsing.
 
+pub mod catalog;
 pub mod commands;
 pub mod deploy;
 pub mod detect;

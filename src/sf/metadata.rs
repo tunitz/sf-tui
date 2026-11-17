@@ -293,12 +293,14 @@ pub fn test_suggestions(all: &SuggestionSet, project: Option<&SfProject>) -> Sug
     )
 }
 
-/// A scaffold command supported by the Create metadata shortcut.
+/// A scaffold command supported by the Create metadata shortcut. `output_dir` is the metadata
+/// folder inside a package directory, so generated files land next to the other components.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateTemplate {
     pub label: &'static str,
     pub command: &'static [&'static str],
     pub name_flag: &'static str,
+    pub output_dir: &'static str,
 }
 
 pub const CREATE_TEMPLATES: &[CreateTemplate] = &[
@@ -306,11 +308,13 @@ pub const CREATE_TEMPLATES: &[CreateTemplate] = &[
         label: "ApexClass",
         command: &["template", "generate", "apex", "class"],
         name_flag: "--name",
+        output_dir: "classes",
     },
     CreateTemplate {
         label: "ApexTrigger",
         command: &["template", "generate", "apex", "trigger"],
         name_flag: "--name",
+        output_dir: "triggers",
     },
     CreateTemplate {
         label: "Lightning Web Component",
@@ -323,6 +327,7 @@ pub const CREATE_TEMPLATES: &[CreateTemplate] = &[
             "lwc",
         ],
         name_flag: "--name",
+        output_dir: "lwc",
     },
     CreateTemplate {
         label: "Aura Component",
@@ -335,46 +340,55 @@ pub const CREATE_TEMPLATES: &[CreateTemplate] = &[
             "aura",
         ],
         name_flag: "--name",
+        output_dir: "aura",
     },
     CreateTemplate {
         label: "FlexiPage",
         command: &["template", "generate", "flexipage"],
         name_flag: "--name",
+        output_dir: "flexipages",
     },
     CreateTemplate {
         label: "StaticResource",
         command: &["template", "generate", "static-resource"],
         name_flag: "--name",
+        output_dir: "staticresources",
     },
     CreateTemplate {
         label: "CustomObject",
         command: &["schema", "generate", "sobject"],
         name_flag: "--label",
+        output_dir: "objects",
     },
     CreateTemplate {
         label: "Custom Metadata Type",
         command: &["cmdt", "generate", "object"],
         name_flag: "--type-name",
+        output_dir: "customMetadata",
     },
     CreateTemplate {
         label: "Visualforce Page",
         command: &["template", "generate", "visualforce", "page"],
         name_flag: "--name",
+        output_dir: "pages",
     },
     CreateTemplate {
         label: "Visualforce Component",
         command: &["template", "generate", "visualforce", "component"],
         name_flag: "--name",
+        output_dir: "components",
     },
     CreateTemplate {
         label: "Lightning App",
         command: &["template", "generate", "lightning", "app"],
         name_flag: "--name",
+        output_dir: "aura",
     },
     CreateTemplate {
         label: "Analytics Template",
         command: &["template", "generate", "analytics", "template"],
         name_flag: "--name",
+        output_dir: "waveTemplates",
     },
 ];
 
@@ -391,7 +405,14 @@ pub fn create_suggestions() -> SuggestionSet {
         CREATE_TEMPLATES
             .iter()
             .map(|template| {
-                SuggestionItem::new(template.label, format!("sf {}", template.command.join(" ")))
+                SuggestionItem::new(
+                    template.label,
+                    format!(
+                        "→ {}/   sf {}",
+                        template.output_dir,
+                        template.command.join(" ")
+                    ),
+                )
             })
             .collect(),
     )
@@ -680,5 +701,32 @@ mod tests {
             Some("ApexClass")
         );
         assert!(create_template_for("unknown").is_none());
+    }
+
+    #[test]
+    fn create_templates_map_to_their_metadata_folders() {
+        assert!(
+            CREATE_TEMPLATES
+                .iter()
+                .all(|template| !template.output_dir.is_empty())
+        );
+        let folder = |label: &str| create_template_for(label).map(|template| template.output_dir);
+        assert_eq!(folder("ApexClass"), Some("classes"));
+        assert_eq!(folder("ApexTrigger"), Some("triggers"));
+        assert_eq!(folder("Lightning Web Component"), Some("lwc"));
+        assert_eq!(folder("Aura Component"), Some("aura"));
+        assert_eq!(folder("Lightning App"), Some("aura"));
+        assert_eq!(folder("StaticResource"), Some("staticresources"));
+        assert_eq!(folder("Visualforce Page"), Some("pages"));
+        assert_eq!(folder("Visualforce Component"), Some("components"));
+        assert_eq!(folder("CustomObject"), Some("objects"));
+        assert_eq!(folder("Custom Metadata Type"), Some("customMetadata"));
+        assert_eq!(folder("Analytics Template"), Some("waveTemplates"));
+        assert!(
+            create_suggestions()
+                .items
+                .iter()
+                .all(|item| item.path.starts_with("→ "))
+        );
     }
 }

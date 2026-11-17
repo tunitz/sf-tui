@@ -4,6 +4,25 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.21] - 2026-11-17
+
+### Added
+
+- A searchable **command catalog** on `F3`, from any screen. It lists commands with a detail pane (summary, flags and examples); Enter shows the exact command before running it. The catalog is a bundled snapshot, so no `sf commands --json` call happens at startup.
+- Create metadata now generates files into the correct package directory and shows the exact command for confirmation before running.
+
+### Changed
+
+- Menu shortcuts are numbers: `1` Retrieve, `2` Deploy, `3` Create, `4` Tests. The Organization and Run command menu items were removed; org switching stays on `F4`.
+- Headers are left-aligned; on short terminals the status appears at the left of the header so the footer can keep its key hints.
+- The `?` help is now a two-column table that stays in sync with the footer from one keymap.
+
+### Fixed
+
+- Org list, detail and action jobs now appear in the F2 Jobs window with their results, and no longer consume a user job slot.
+- Catalog selection no longer builds a command from legacy `sfdx force:` examples or unfilled `<placeholder>` tokens.
+- Removed the "LATEST RESULT" panel; results are shown only in the F2 Jobs window.
+
 ## [0.1.20] - 2026-11-17
 
 ### Changed

@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 
 use crate::app::{App, JobSection, JobsFocus, Modal, ResultItem, Tab, TestsFocus};
@@ -246,14 +246,13 @@ fn strip_colors(cells: &mut [ratatui::buffer::Cell]) {
 fn draw_header(frame: &mut Frame, area: Rect, app: &App, density: Density) {
     // Tiny has a single footer row, so keep it for key hints and show the transient status here
     // instead. Wider densities keep the status on their dedicated footer row.
-    let (right_text, right_style) = if density == Density::Tiny && !app.status.is_empty() {
+    let (suffix, suffix_style) = if density == Density::Tiny && !app.status.is_empty() {
         let style = if app.status_error {
             Style::default().fg(Color::Red)
         } else {
             Style::default().fg(Color::Green)
         };
-        let max = area.width.saturating_div(2).saturating_sub(2) as usize;
-        (truncated(&app.status, max), style)
+        (app.status.clone(), style)
     } else {
         let frames = ["-", "\\", "|", "/"];
         let spinner = frames[app.spinner_tick() % frames.len()];
@@ -272,7 +271,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, density: Density) {
         (activity, style)
     };
 
-    let mut left: Vec<Span> = vec![
+    let mut spans: Vec<Span> = vec![
         strong("SFTUI", accent(app)),
         faint(format!(" {}", env!("CARGO_PKG_VERSION"))),
         Span::styled("  ›  ", Style::default().fg(Color::DarkGray)),
@@ -282,21 +281,20 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, density: Density) {
                 .fg(Color::Reset)
                 .add_modifier(Modifier::BOLD),
         ),
+        faint("   "),
+        faint(project_context(app)),
+        faint("   "),
+        faint(org_context(app)),
     ];
-    left.push(faint("   "));
-    left.push(faint(project_context(app)));
-    left.push(faint("   "));
-    left.push(faint(org_context(app)));
-
-    let right_width = (right_text.chars().count() as u16 + 1).min(area.width / 2);
-    let columns =
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).split(area);
-    frame.render_widget(Paragraph::new(Line::from(left)), columns[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(right_text, right_style)))
-            .alignment(ratatui::layout::Alignment::Right),
-        columns[1],
-    );
+    // Everything lives in one left-aligned line: the activity/status is appended after the org
+    // context and truncated against the frame width so a narrow terminal never overflows.
+    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let budget = usize::from(area.width).saturating_sub(used + 2);
+    if budget > 0 {
+        spans.push(faint("  "));
+        spans.push(Span::styled(truncated(&suffix, budget), suffix_style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// `project name`, `project …` while scanning, or `no project`.
@@ -388,15 +386,8 @@ const KEYMAP: &[KeyBinding] = &[
         cap: "",
         hints: &[],
         order: 0,
-        help_key: "Menu r/d/c/t/o/e",
-        help: "retrieve · deploy · create · tests · organization · run command",
-    },
-    KeyBinding {
-        cap: "d",
-        hints: &[(HintContext::Orgs, "default")],
-        order: 6,
-        help_key: "d (Orgs)",
-        help: "make the selected org the default",
+        help_key: "Menu 1/2/3/4",
+        help: "retrieve · deploy · create · tests",
     },
     KeyBinding {
         cap: "Enter",
@@ -455,13 +446,6 @@ const KEYMAP: &[KeyBinding] = &[
         help: "cancel the newest job; Ctrl+C also quits when no job runs",
     },
     KeyBinding {
-        cap: "x",
-        hints: &[(HintContext::Orgs, "logout")],
-        order: 13,
-        help_key: "x (Orgs)",
-        help: "log out of an org",
-    },
-    KeyBinding {
         cap: "",
         hints: &[],
         order: 0,
@@ -477,10 +461,10 @@ const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         cap: "F5",
-        hints: &[(HintContext::Orgs, "refresh")],
+        hints: &[(HintContext::Transfer, "refresh")],
         order: 15,
         help_key: "F5",
-        help: "refresh orgs or component search",
+        help: "refresh component search",
     },
     KeyBinding {
         cap: "r",
@@ -504,21 +488,32 @@ const KEYMAP: &[KeyBinding] = &[
         help: "open the jobs window from any screen",
     },
     KeyBinding {
-        cap: "F4",
+        cap: "F3",
         hints: &[
-            (HintContext::Home, "org"),
-            (HintContext::Orgs, "switch org"),
+            (HintContext::Home, "commands"),
+            (HintContext::Transfer, "commands"),
+            (HintContext::TestsSearch, "commands"),
+            (HintContext::TestsCoverage, "commands"),
+            (HintContext::TestsPlain, "commands"),
+            (HintContext::Setup, "commands"),
         ],
+        order: 10,
+        help_key: "F3",
+        help: "open the command catalog",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "F3 (catalog)",
+        help: "type to filter · ↑↓ move · Enter run · Esc close",
+    },
+    KeyBinding {
+        cap: "F4",
+        hints: &[(HintContext::Home, "org")],
         order: 9,
         help_key: "F4",
         help: "switch the default org from any screen",
-    },
-    KeyBinding {
-        cap: "l",
-        hints: &[(HintContext::Orgs, "login")],
-        order: 10,
-        help_key: "l (Orgs)",
-        help: "log in to an org",
     },
     KeyBinding {
         cap: "",
@@ -812,16 +807,7 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
             render_test_list(frame, body, app, state);
         }
     } else {
-        let latest_lines = latest_result_lines(app, crate::app::TaskKind::Tests);
-        let rows = Layout::vertical([
-            Constraint::Min(2),
-            Constraint::Length(latest_lines.len() as u16),
-        ])
-        .split(sections[2]);
-        render_test_list(frame, rows[0], app, state);
-        if !latest_lines.is_empty() {
-            frame.render_widget(Paragraph::new(Text::from(latest_lines)), rows[1]);
-        }
+        render_test_list(frame, sections[2], app, state);
     }
 
     let footer = if has_coverage && app.tests_focus == TestsFocus::Coverage {
@@ -904,7 +890,7 @@ fn draw_test_coverage(frame: &mut Frame, area: Rect, app: &App, result: &crate::
                 format!("[{}] ", if result.ok { "✓" } else { "✗" }),
                 Style::default().fg(color),
             ),
-            strong("LATEST RESULT ", accent(app)),
+            strong("RESULT ", accent(app)),
             Span::styled(
                 format!("{} · {}", result.status, result.summary),
                 Style::default().fg(Color::DarkGray),
@@ -1178,48 +1164,12 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn latest_result_lines(app: &App, kind: crate::app::TaskKind) -> Vec<Line<'static>> {
-    let Some(result) = app.latest_result(kind) else {
-        return Vec::new();
-    };
-    let color = if result.ok { Color::Green } else { Color::Red };
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            format!("[{}] ", if result.ok { "✓" } else { "✗" }),
-            Style::default().fg(color),
-        ),
-        strong("LATEST RESULT ", accent(app)),
-        Span::styled(
-            format!("{} · {}", result.status, result.summary),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled("   F2 jobs", Style::default().fg(Color::DarkGray)),
-    ])];
-    for item in result.items.iter().take(4) {
-        lines.push(result_item_line(item));
-    }
-    if result.items.len() > 4 {
-        lines.push(Line::from(faint(format!(
-            "   … {} more · F2 opens the jobs window",
-            result.items.len() - 4
-        ))));
-    }
-    lines
-}
-
 fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
     let state = &app.transfer_search;
-    let kind = if state.retrieve {
-        crate::app::TaskKind::Retrieve
-    } else {
-        crate::app::TaskKind::Deploy
-    };
-    let latest = latest_result_lines(app, kind);
     let sections = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(2),
-        Constraint::Length(latest.len() as u16),
         Constraint::Length(1),
     ])
     .split(area);
@@ -1288,9 +1238,6 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         sections[2],
         &mut list_state,
     );
-    if !latest.is_empty() {
-        frame.render_widget(Paragraph::new(Text::from(latest)), sections[3]);
-    }
     let count = state.checked().len();
     let status = if state.searching {
         "searching…"
@@ -1304,7 +1251,7 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
             faint(format!("{count} selected")),
             faint(format!("   {status}")),
         ]),
-        sections[4],
+        sections[3],
     );
 }
 
@@ -1966,24 +1913,132 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
         Modal::Help { scroll } => {
             let area = centered(frame.area(), 86, frame.area().height.min(24));
             frame.render_widget(Clear, area);
-            let help = help_rows();
-            let lines: Vec<Line> = help
-                .iter()
-                .map(|(keys, description)| {
-                    Line::from(vec![
-                        strong(format!("  {keys:<20}"), accent(app)),
-                        Span::styled((*description).to_owned(), Style::default().fg(Color::Gray)),
-                    ])
-                })
-                .collect();
             let title = block("keyboard shortcuts — ↑↓ scroll · any other key closes", app);
             frame.render_widget(title.clone(), area);
             let inner = title.inner(area);
-            let max_scroll = lines.len().saturating_sub(usize::from(inner.height));
+            let help = help_rows();
+            let rows: Vec<Row> = help
+                .iter()
+                .map(|(keys, description)| {
+                    Row::new(vec![
+                        Line::from(Span::styled(
+                            (*keys).to_owned(),
+                            Style::default()
+                                .fg(accent(app))
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(Span::styled(
+                            (*description).to_owned(),
+                            Style::default().fg(Color::Gray),
+                        )),
+                    ])
+                })
+                .collect();
+            let key_width = usize::from(inner.width).saturating_div(3).clamp(16, 24) as u16;
+            let table = Table::new(rows, [Constraint::Length(key_width), Constraint::Min(16)])
+                .header(
+                    Row::new(["Key", "Action"]).style(
+                        Style::default()
+                            .fg(accent(app))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                )
+                .column_spacing(2);
+            let visible_rows = usize::from(inner.height).saturating_sub(1); // header
+            let max_scroll = help.len().saturating_sub(visible_rows);
+            let mut state = TableState::new().with_offset((*scroll).min(max_scroll));
+            frame.render_stateful_widget(table, inner, &mut state);
+        }
+        Modal::Catalog {
+            query,
+            selected,
+            scroll,
+        } => {
+            use crate::app::{CATALOG_VISIBLE_ROWS, catalog_hits};
+
+            let hits = catalog_hits(query);
+            let width = 88u16.min(frame.area().width);
+            let height = (CATALOG_VISIBLE_ROWS as u16 + 5)
+                .min(frame.area().height.saturating_sub(2))
+                .max(7);
+            let area = centered(frame.area(), width, height);
+            frame.render_widget(Clear, area);
+            let title = format!("command catalog — search: {query}_ · Enter run · Esc close");
+            let outer = block(title, app);
+            frame.render_widget(outer.clone(), area);
+            let inner = outer.inner(area);
+            let columns =
+                Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+                    .split(inner);
+
+            let list_block = pane_block("commands", app, true);
+            frame.render_widget(list_block.clone(), columns[0]);
+            let rows: Vec<Row> = hits
+                .iter()
+                .skip(*scroll)
+                .take(CATALOG_VISIBLE_ROWS)
+                .map(|command| {
+                    Row::new(vec![
+                        Line::from(Span::styled(
+                            command.id.clone(),
+                            Style::default().fg(Color::Reset),
+                        )),
+                        Line::from(Span::styled(
+                            command.category.clone(),
+                            Style::default().fg(Color::DarkGray),
+                        )),
+                    ])
+                })
+                .collect();
+            let table = Table::new(rows, [Constraint::Min(16), Constraint::Length(14)])
+                .column_spacing(1)
+                .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("›");
+            let mut state = TableState::new().with_selected(selected.saturating_sub(*scroll));
+            frame.render_stateful_widget(table, list_block.inner(columns[0]), &mut state);
+
+            let detail_block = pane_block("detail", app, false);
+            frame.render_widget(detail_block.clone(), columns[1]);
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            if let Some(command) = hits.get(*selected) {
+                lines.push(Line::from(Span::styled(
+                    command.invocation(),
+                    Style::default()
+                        .fg(accent(app))
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(command.summary.clone()));
+                lines.push(Line::from(format!("category: {}", command.category)));
+                if !command.flags.is_empty() {
+                    lines.push(Line::from(" "));
+                    lines.push(Line::from(faint("key flags")));
+                    for flag in command.flags.iter().take(4) {
+                        let label = match &flag.value_name {
+                            Some(value) => format!("  --{} <{}>", flag.name, value),
+                            None => format!("  --{}", flag.name),
+                        };
+                        lines.push(Line::from(Span::styled(
+                            label,
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                }
+                if !command.examples.is_empty() {
+                    lines.push(Line::from(" "));
+                    lines.push(Line::from(faint("examples")));
+                    for example in command.examples.iter().take(2) {
+                        lines.push(Line::from(Span::styled(
+                            example.command.clone(),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                }
+            } else {
+                lines.push(Line::from(faint("No matching commands")));
+            }
             frame.render_widget(
-                Paragraph::new(Text::from(lines))
-                    .scroll(((*scroll).min(max_scroll).min(u16::MAX as usize) as u16, 0)),
-                inner,
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
+                detail_block.inner(columns[1]),
             );
         }
         Modal::Message { title, message } => {
