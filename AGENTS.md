@@ -14,9 +14,13 @@ src/main.rs            tokio binary entry point, named `sftui`
 src/lib.rs             crate root and layering guard test
 src/app.rs             application state, key dispatch, background job ownership, event loop
 src/ui.rs              all ratatui rendering
+src/view.rs            pure result-view construction
+src/update.rs           self-update from GitHub releases with checksum verification
 src/config.rs          TOML config, favorites, recent runs, theme
+src/fsutil.rs          atomic, owner-only state-file writes
 data/commands.json     bundled command catalog snapshot; cached refresh lives beside config.toml
 src/sf/metadata.rs     component/template suggestion candidates (fuzzy completion)
+src/sf/commands.rs     argv builders for invocations the TUI constructs itself
 src/json_view.rs       JSON-to-table rendering
 src/clipboard.rs       OS clipboard helpers
 src/sf/                CLI detection, process runner, catalog, org/project/deploy/test-result parsing
@@ -47,13 +51,15 @@ To debug the interface, run the release binary inside a terminal at least 100x30
   binary boundary and the terminal lifecycle. Never panic on user input, files or CLI output.
 - **Async boundaries:** every spawned task has an owner. Process tasks return through a tracked
   job map and an application event channel; cancellation is explicit. The UI thread never awaits
-  a long-running CLI command directly. CLI discovery and probing happen after the first frame so
-  a slow Windows `sf` process is visible as progress, never as a blank screen.
+  a long-running CLI command directly. CLI discovery, probing and project scanning happen after
+  the first frame so a slow Windows `sf` process is visible as progress, never as a blank screen.
+  Process output is drained in batches before each frame.
 - **JSON parsing:** treat all CLI output as untrusted. Parse defensively with `serde_json::Value`
   helpers, accept both `result`-wrapped and bare shapes, and never print tokens, auth URLs,
   passwords or secrets. Snapshot and fixture data must be synthetic only.
-- **Layering:** modules under `src/sf`, `src/config`, `src/json_view` and `src/clipboard` must not
-  import ratatui or crossterm. The layering test in `src/lib.rs` enforces this.
+- **Layering:** modules under `src/sf`, `src/config`, `src/fsutil`, `src/json_view` and
+  `src/clipboard` must not import ratatui or crossterm. The layering test in `src/lib.rs`
+  enforces this.
 - **Version:** one source of truth, `Cargo.toml`. Stay on `0.1.x` until `0.1.99`; increment only
   the patch number. A `v*` tag must match it exactly.
 - **Repository hygiene:** the public repository contains production-ready files only: source,

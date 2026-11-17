@@ -114,6 +114,11 @@ jobs:
           merge-multiple: true
       - name: List assets
         run: ls -lh dist
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

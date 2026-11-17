@@ -4,6 +4,61 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.14] - 2026-11-17
+
+### Added
+
+- `sftui update` checks GitHub for the newest release and installs it in place, with
+  `--check` to report only and `--force` to reinstall the latest version.
+- The updater downloads the platform archive, verifies the published `SHA256SUMS`, extracts the
+  binary and replaces it atomically on Unix. On Windows it stages a small helper that waits for
+  the running process to exit before replacing the executable.
+- The `--help` text now lists the update command.
+
+## [0.1.13] - 2026-11-17
+
+### Added
+
+- The Output screen keeps a selectable record rail (or a record counter in narrow layouts) and
+  scrolls long results with `↑↓`, `PgUp`/`PgDn`, `Home`/`End`; raw output and JSON are modes.
+- A dedicated saved-test-run view, reachable with `v`, with scrolling instead of a six-row cap.
+- Home now surfaces `recent_runs`, project/org context and the actions it advertises
+  (`c` create, `a` login, `g` results).
+- Configuration, cache and test-history writes are atomic and owner-only on Unix.
+- Release archives now ship `SHA256SUMS`, verified by both installers when present.
+
+### Changed
+
+- The header and footer use the full frame density: a two-row header with a real tab bar and a
+  two-row footer that always shows key hints. Large terminals no longer waste rows on borders.
+- `Esc` always navigates back; `Ctrl+X` cancels the newest running job. `q` asks before quitting
+  while a job is running, and shutdown cancels and joins tracked jobs.
+- Search results are scoped per screen kind, typing no longer clears the selected components,
+  and queries are compared after trimming.
+- Project discovery runs in the background; duplicate startup indexing was removed, test-class
+  discovery is byte-bounded, and process events are drained before each frame.
+- Result views unwrap the `result` envelope, recursively redact sensitive fields, and no longer
+  keep a second full stdout copy per record.
+- Orgs loads on entry, clears its loading state on failure, and refreshes the target after a
+  switch; the org detail pane follows the selected row.
+- Colors use terminal defaults instead of bright white, selection uses reverse video, failure
+  icons are `✗` while checked rows use `✓`, and `NO_COLOR` strips color while keeping emphasis.
+- Documentation and the keymap modal reflect the actual controls.
+
+### Fixed
+
+- UTF-8 prompt editing no longer panics on non-ASCII characters.
+- A search reply for an edited query can no longer lock a screen on "Search still running".
+- Deploy reports include `--target-org`, stop after repeated failures, and are not respawned by
+  navigation or cancellation.
+- JSON extraction tolerates bracketed warning lines before the document.
+- Non-ASCII command categories no longer panic.
+- Test-confirm `g` cycles orgs instead of always resetting to the default.
+- Validation errors keep the prompt open instead of discarding typed input.
+- Catalog rows are cached until the query, catalog or favorites change.
+- Auth/secret flags (`--sfdx-url`, `--access-token`, `--password`, `--client-secret`) are masked
+  before display, copy and history; auth-command output is not retained.
+
 ## [0.1.12] - 2026-11-17
 
 ### Changed

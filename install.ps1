@@ -25,6 +25,23 @@ try {
   $zip = Join-Path $temp $asset
   Write-Host "Downloading $asset…"
   Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+  $sumsUrl = "https://github.com/$Repository/releases/download/v$Version/SHA256SUMS"
+  $sums = Join-Path $temp 'SHA256SUMS'
+  try {
+    Invoke-WebRequest -Uri $sumsUrl -OutFile $sums -UseBasicParsing
+  } catch {
+    $sums = $null
+  }
+  if ($sums -and (Test-Path $sums)) {
+    $line = Get-Content $sums | Where-Object { $_ -match "  $([regex]::Escape($asset))$" } | Select-Object -First 1
+    if ($line) {
+      $expected = ($line -split '\s+')[0].ToLowerInvariant()
+      $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($expected -ne $actual) {
+        throw 'Checksum verification failed for the downloaded archive.'
+      }
+    }
+  }
   Expand-Archive -Path $zip -DestinationPath $temp -Force
   $binary = Join-Path $temp 'sftui.exe'
   if (-not (Test-Path $binary)) {

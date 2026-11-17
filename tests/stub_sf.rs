@@ -211,8 +211,12 @@ fn every_screen_renders_without_panicking() {
         id: 1,
         command: "sf org list --json".to_owned(),
         purpose: "orgs".to_owned(),
+        executable: "sf".into(),
+        argv: vec!["org".to_owned(), "list".to_owned()],
         lines: Vec::new(),
-        status: None,
+        line_bytes: 0,
+        exit_code: None,
+        finished: false,
         json: Some(serde_json::json!({"result":{"status":"ok"}})),
         result: None,
     });
@@ -231,9 +235,13 @@ fn every_screen_renders_without_panicking() {
                 assert!(rendered.contains("[r] Retrieve"), "quick actions missing");
                 assert!(rendered.contains("Home"), "current tab missing");
             }
+            if (width, height) == (120, 40) && tab == sftui::app::Tab::Home {
+                assert!(rendered.contains("[1] Home"), "tab bar missing");
+                assert!(rendered.contains("Tab next"), "key hints missing");
+            }
         }
         for modal in [
-            sftui::app::Modal::Help,
+            sftui::app::Modal::Help { scroll: 0 },
             sftui::app::Modal::Message {
                 title: "Notice".to_owned(),
                 message: "Synthetic modal".to_owned(),
@@ -252,6 +260,24 @@ fn every_screen_renders_without_panicking() {
                     sftui::app::PromptField::new("Third", "value three"),
                 ],
                 focus: 0,
+            },
+            sftui::app::Modal::OrgMenu { selected: 0 },
+            sftui::app::Modal::TestHistory {
+                runs: Vec::new(),
+                selected: 0,
+            },
+            sftui::app::Modal::TestConfirm {
+                entries: Vec::new(),
+                focus: 0,
+                show_command: false,
+                org: None,
+            },
+            sftui::app::Modal::TransferConfirm {
+                retrieve: false,
+                entries: Vec::new(),
+                focus: 0,
+                show_command: false,
+                options: sftui::sf::deploy::TransferOptions::default(),
             },
         ] {
             app.modal = Some(modal);

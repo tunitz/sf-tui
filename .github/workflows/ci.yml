@@ -45,7 +45,20 @@ jobs:
         shell: bash
         run: |
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            ./target/release/sftui.exe --version || true
+            ./target/release/sftui.exe --version
           else
-            ./target/release/sftui --version || true
+            ./target/release/sftui --version
           fi
+
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain components
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-tests
+      - name: Tests
+        run: cargo test --all-targets --locked

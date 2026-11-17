@@ -33,7 +33,8 @@ patch number. Do not bump the minor version during initial development.
 - `sftui-<version>-x86_64-pc-windows-msvc.zip`
 
 Each archive contains only the `sftui` executable (or `sftui.exe`). No README, license file,
-fixture or extra helper is shipped inside a binary asset.
+fixture or extra helper is shipped inside a binary asset. The release also publishes a
+`SHA256SUMS` file; both installers verify it when the release provides it.
 
 ## Verification
 

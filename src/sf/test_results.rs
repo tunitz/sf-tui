@@ -61,11 +61,8 @@ pub fn load(config_dir: &Path) -> Vec<TestRun> {
 }
 
 pub fn save(config_dir: &Path, runs: &[TestRun]) -> std::io::Result<()> {
-    std::fs::create_dir_all(config_dir)?;
-    std::fs::write(
-        path(config_dir),
-        serde_json::to_vec_pretty(runs).unwrap_or_default(),
-    )
+    let bytes = serde_json::to_vec_pretty(runs).unwrap_or_default();
+    crate::fsutil::write_private(&path(config_dir), &bytes)
 }
 
 pub fn record(config_dir: &Path, run: TestRun) -> Vec<TestRun> {

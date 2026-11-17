@@ -7,8 +7,7 @@ installed on your machine: it does not store credentials, and all authentication
 in its own home directory.
 
 The interface opens on a **Home** screen ordered by frequency: retrieve and deploy first, Apex
-test run/results second, metadata creation third, and org login last (you only need it occasionally).
-Behind it are:
+test run/results second, metadata creation, org management and login after that. Behind it are:
 
 - **focused screens** for org operations and metadata deploy/retrieve, with project paths and the
   default org pre-filled so you do not retype them;
@@ -43,6 +42,18 @@ it anywhere on your PATH. An optional version argument selects a specific releas
 
 You can override the install directory on Unix with `SFTUI_INSTALL_DIR`.
 
+## Update
+
+```sh
+sftui update           # install the newest release
+sftui update --check   # report whether a newer release exists
+sftui update --force   # reinstall the newest release even if versions match
+```
+
+The updater reads the latest GitHub release, downloads the archive for the current platform,
+verifies `SHA256SUMS`, and replaces the executable. If the install directory is not writable,
+re-run the installer instead.
+
 ## Requirements
 
 Install the [Salesforce CLI](https://developer.salesforce.com/tools/salesforcecli) first. If `sf`
@@ -57,11 +68,14 @@ For a nonstandard location, set `SFTUI_SF_PATH` to the full path of the executab
 Home is just the menu:
 
 ```text
-[1] Retrieve        [2] Deploy        [3] Run tests
-[4] Org
+[r] Retrieve   [d] Deploy   [t] Apex Tests   [c] Create
+[o] Orgs       [a] Log in   [g] Results
 ```
 
-Global: `Tab` next screen · `h` Home · `Esc` cancel/back · `?` help · `q` quit.
+Global on list screens: `Tab` next screen · `1-9` jump · `h` Home · `Esc` back ·
+`?` help · `y` copy · `F5` refresh · `q` quit (asks while a job runs).
+`Ctrl+X` cancels the newest running job; `Ctrl+C` cancels it or quits when idle.
+`Ctrl+Y` copies the current selection while a search field has focus.
 
 Apex Tests follows the same pattern: type to find real test classes (`*Test.cls` or `@IsTest`),
 `Space` check/uncheck, `Enter` confirm. Results are saved locally (last 50 runs) and shown with
@@ -70,17 +84,22 @@ screen to view previous runs. The Org menu replaces the old login shortcut: chec
 switch, login, delete/logout or reauth.
 
 On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
-`Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`. `Esc` goes back. The search is async and debounced; selected components keep their source
-paths and become `--metadata` entries in the command.
+`Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`; typing keeps
+your existing selection. `Esc` goes back.
 
 The confirmation dialog shows every selected component as a checkbox: `Space` toggles, `↑↓` moves,
 `c` shows the exact command, `v/t/w` toggle deploy options, `g` cycles orgs, `Enter` runs and `Esc`
 goes back.
 
 Every command result is rendered human-readable immediately: status, counts, per-item pass/fail
-rows with `[✓]`/`[x]` icons, color-coded metric chips, progress bars and section headers. Raw
-stdout/JSON is behind `o`. Apex test results show per-class coverage with percent, covered/total
-lines and uncovered counts; press `v` to view saved runs.
+rows with `[✓]`/`[✗]` icons, color-coded metric chips, progress bars and section headers. Long
+results scroll with `↑↓`/`PgUp`/`PgDn`; raw stdout/JSON is behind `o`/`z`. The Output screen keeps
+the last 40 commands, lets you switch records with `↑↓`, and reruns the selected one with `r`.
+Apex test results show per-class coverage with percent, covered/total lines and uncovered counts;
+press `v` to view saved runs.
+
+The interface uses terminal default colors for body text and reverse video for selection, and
+honors `NO_COLOR` by stripping color while keeping bold/reverse emphasis.
 
 ## Configuration
 
@@ -92,8 +111,9 @@ Configuration lives in a per-user directory chosen by the `directories` crate:
 
 Set `SFTUI_CONFIG_DIR` to use a different directory. The TOML file contains `favorites`
 (command id plus preset flags), `recent_runs` and `theme.accent` (`cyan`, `green`, `yellow`,
-`blue`, `magenta`, `red`). It is created on first exit. A `catalog-cache.json` file beside it
-stores the last successful `sf commands --json` response for seven days.
+`blue`, `magenta`, `red`). It is written atomically with owner-only permissions on Unix, and is
+updated when favorites/presets change and on exit. A `catalog-cache.json` file beside it stores
+the last successful `sf commands --json` response for seven days.
 
 ## Development
 

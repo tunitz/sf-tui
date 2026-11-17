@@ -82,9 +82,9 @@ impl SuggestionSet {
                 .cloned()
                 .collect();
         }
-        let mut scored: Vec<(SuggestionItem, i64)> = Vec::new();
+        let mut scored: Vec<(usize, i64)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for item in &self.items {
+        for (index, item) in self.items.iter().enumerate() {
             let score = if item.name_lower == query_lower {
                 100_000
             } else if item.name_lower.contains(&query_lower) {
@@ -96,14 +96,14 @@ impl SuggestionSet {
             } else {
                 continue;
             };
-            if seen.insert(item.value.clone()) {
-                scored.push((item.clone(), score));
+            if seen.insert(item.value.as_str()) {
+                scored.push((index, score));
             }
         }
         if scored.len() < limit {
             let tokens: Vec<&str> = query_lower.split_whitespace().collect();
-            for item in &self.items {
-                if seen.contains(&item.value) {
+            for (index, item) in self.items.iter().enumerate() {
+                if seen.contains(item.value.as_str()) {
                     continue;
                 }
                 let mut total = 0i64;
@@ -119,8 +119,8 @@ impl SuggestionSet {
                         }
                     }
                 }
-                if matched && seen.insert(item.value.clone()) {
-                    scored.push((item.clone(), total));
+                if matched && seen.insert(item.value.as_str()) {
+                    scored.push((index, total));
                 }
             }
         }
@@ -128,16 +128,25 @@ impl SuggestionSet {
             right
                 .1
                 .cmp(&left.1)
-                .then_with(|| left.0.path.is_empty().cmp(&right.0.path.is_empty()))
-                .then_with(|| left.0.value.cmp(&right.0.value))
+                .then_with(|| {
+                    self.items[left.0]
+                        .path
+                        .is_empty()
+                        .cmp(&self.items[right.0].path.is_empty())
+                })
+                .then_with(|| self.items[left.0].value.cmp(&self.items[right.0].value))
         });
         scored.truncate(limit);
-        scored.into_iter().map(|(item, _)| item).collect()
+        scored
+            .into_iter()
+            .map(|(index, _)| self.items[index].clone())
+            .collect()
     }
 }
 
 /// Apex classes from the project index, used by the test-run search screen.
 pub fn test_suggestions(all: &SuggestionSet, project: Option<&SfProject>) -> SuggestionSet {
+    let mut remaining_bytes: u64 = 8 * 1024 * 1024;
     SuggestionSet {
         kind: SuggestionKind::Transfer,
         items: all
@@ -153,9 +162,17 @@ pub fn test_suggestions(all: &SuggestionSet, project: Option<&SfProject>) -> Sug
                 let Some(project) = project else {
                     return false;
                 };
-                let Ok(source) = std::fs::read_to_string(project.root.join(&item.path)) else {
+                let path = project.root.join(&item.path);
+                let Ok(metadata) = std::fs::metadata(&path) else {
                     return false;
                 };
+                if metadata.len() > remaining_bytes || metadata.len() > 1024 * 1024 {
+                    return false;
+                }
+                let Ok(source) = std::fs::read_to_string(&path) else {
+                    return false;
+                };
+                remaining_bytes = remaining_bytes.saturating_sub(metadata.len());
                 source.to_ascii_lowercase().contains("@istest")
             })
             .cloned()

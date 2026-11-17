@@ -104,6 +104,20 @@ pub fn parse_current_org(value: &Value) -> Option<String> {
     {
         return Some(org.to_owned());
     }
+    // `sf config get --json` also returns an array of {name, value} entries on some versions.
+    if let Some(entries) = result.as_array() {
+        for entry in entries {
+            let name = string_field(entry, "name").unwrap_or_default();
+            if name.eq_ignore_ascii_case("target-org")
+                && let Some(org) = string_field(entry, "value")
+            {
+                return Some(org);
+            }
+        }
+    }
+    if let Some(org) = result.as_str().filter(|org| !org.is_empty()) {
+        return Some(org.to_owned());
+    }
     if let Some(Value::Array(items)) = result.get("aliases")
         && let Some(alias) = items.iter().filter_map(Value::as_str).next()
     {
@@ -170,7 +184,8 @@ fn display_value(value: &Value) -> String {
         Value::Number(number) => number.to_string(),
         Value::Null => String::new(),
         Value::Array(_) | Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| "unprintable".to_owned())
+            serde_json::to_string(&crate::json_view::sanitize(value))
+                .unwrap_or_else(|_| "unprintable".to_owned())
         }
     }
 }
@@ -219,6 +234,11 @@ mod tests {
         assert_eq!(parse_current_org(&config).as_deref(), Some("test-scratch"));
         let display = serde_json::json!({"result":{"username":"test@example.invalid","aliases":["test-scratch"]}});
         assert_eq!(parse_current_org(&display).as_deref(), Some("test-scratch"));
+        let entries = serde_json::json!({"result":[
+            {"name":"target-org","value":"test-dev"},
+            {"name":"other","value":"ignored"}
+        ]});
+        assert_eq!(parse_current_org(&entries).as_deref(), Some("test-dev"));
     }
 
     #[test]
@@ -228,12 +248,15 @@ mod tests {
             "instanceUrl": "https://example.invalid.my.salesforce.com",
             "accessToken": "super-secret-token",
             "sfdxAuthUrl": "force://super-secret",
+            "auth": {"refreshToken": "nested-secret"},
             "id": "00D000000000001"
         }});
         let detail = parse_org_display(&value);
         assert_eq!(detail.username, "test-user@example.invalid");
         assert!(!detail.fields.iter().any(|(key, value)| {
-            key.to_ascii_lowercase().contains("token") || value.contains("super-secret")
+            key.to_ascii_lowercase().contains("token")
+                || value.contains("super-secret")
+                || value.contains("nested-secret")
         }));
     }
 }

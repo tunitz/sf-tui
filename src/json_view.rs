@@ -16,7 +16,11 @@ const MAX_ROWS: usize = 200;
 const MAX_CELL: usize = 120;
 
 /// Build a table from arrays of objects, objects, or scalar JSON values.
+///
+/// The common `{ "status": 0, "result": … }` envelope is unwrapped first so result views show
+/// the payload rather than a single opaque `result` cell.
 pub fn table(value: &Value) -> JsonView {
+    let value = value.get("result").unwrap_or(value);
     match value {
         Value::Array(items) => {
             let objects: Vec<&Value> = items.iter().filter(|item| item.is_object()).collect();
@@ -80,6 +84,20 @@ pub fn table(value: &Value) -> JsonView {
     }
 }
 
+/// Remove sensitive fields at every depth before a value is stored or rendered.
+pub fn sanitize(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| !is_sensitive(key))
+                .map(|(key, value)| (key.clone(), sanitize(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(sanitize).collect()),
+        other => other.clone(),
+    }
+}
+
 fn is_sensitive(key: &str) -> bool {
     let normalized: String = key.chars().filter(char::is_ascii_alphanumeric).collect();
     SENSITIVE_FIELDS
@@ -95,7 +113,7 @@ fn cell(value: &Value) -> String {
             let elements: Vec<String> = items.iter().map(cell).collect();
             elements.join(", ")
         }
-        Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+        Value::Object(_) => serde_json::to_string(&sanitize(value)).unwrap_or_default(),
         other => other.to_string(),
     };
     let single_line = text.replace(['\n', '\r'], " ");
@@ -134,6 +152,32 @@ mod tests {
                 .flatten()
                 .any(|cell| cell.contains("secret"))
         );
+    }
+
+    #[test]
+    fn nested_credentials_are_removed() {
+        let value = serde_json::json!({
+            "result": {"username":"one@test.invalid","auth":{"accessToken":"secret","id":"00D"}}
+        });
+        let view = table(&value);
+        assert!(
+            !view
+                .rows
+                .iter()
+                .flatten()
+                .any(|cell| cell.contains("secret"))
+        );
+        assert!(!view.headers.iter().any(|header| header.contains("Token")));
+        assert!(sanitize(&value).get("result").is_some());
+    }
+
+    #[test]
+    fn result_envelope_is_unwrapped_for_tables() {
+        let value = serde_json::json!({"status":0,"result":{"username":"one@test.invalid"}});
+        let view = table(&value);
+        assert_eq!(view.headers, vec!["field".to_owned(), "value".to_owned()]);
+        assert!(view.rows.iter().any(|row| row[0] == "username"));
+        assert!(!view.rows.iter().any(|row| row[0] == "result"));
     }
 
     #[test]

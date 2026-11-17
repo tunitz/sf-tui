@@ -1,6 +1,7 @@
 //! The SF CLI integration layer: detection, process execution and response parsing.
 
 pub mod catalog;
+pub mod commands;
 pub mod deploy;
 pub mod detect;
 pub mod metadata;
@@ -222,7 +223,7 @@ pub fn install_instructions() -> Vec<(&'static str, &'static str)> {
             ("winget", "winget install Salesforce.CLI"),
             (
                 "Installer (per-user)",
-                "https://developer.salesforce.com/tools/salesforcecli",
+                "start \"\" https://developer.salesforce.com/tools/salesforcecli",
             ),
             ("npm (no admin)", "npm install -g @salesforce/cli"),
         ]
@@ -242,7 +243,7 @@ pub fn install_instructions() -> Vec<(&'static str, &'static str)> {
             ("bun (no admin)", "bun add -g @salesforce/cli"),
             (
                 "Tarball",
-                "https://developer.salesforce.com/tools/salesforcecli",
+                "xdg-open https://developer.salesforce.com/tools/salesforcecli",
             ),
         ]
     }

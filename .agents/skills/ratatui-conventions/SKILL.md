@@ -11,15 +11,18 @@ description: How this repository structures its ratatui/crossterm event loop, ap
   hook must restore the terminal before delegating to the previous hook.
 - The binary draws the first frame before probing the Salesforce CLI. Startup stages arrive as
   `AppEvent::Startup` and are shown in the Home screen and header with elapsed seconds.
-- The loop waits on `tokio::select!` between a 100 ms ticker and the application event channel.
+- The loop waits on `tokio::select!` between a 250 ms ticker and the application event channel.
   Terminal events are drained with `crossterm::event::poll(Duration::ZERO)` and `read()`, so the
-  event loop never blocks waiting for a key.
+  event loop never blocks waiting for a key. Queued application events are drained before drawing,
+  and a frame is drawn only when state changed (or a spinner is active).
 - Only handle `KeyEventKind::Press` to avoid double handling on Windows key-repeat. Search screens
   and modals must consume all keys; global digits/hotkeys must never fire while text is being
   entered or a dialog is open.
-- Long-running child processes never run in the UI thread. They stream `SfEvent`s into `AppEvent`s
-  through a bounded-lifetime channel, with one `RunningJob` per child tracked in the app.
-- `Ctrl+C` cancels the newest job; with no job it quits. `Esc` clears status/cancels a transfer.
+- Long-running child processes never run in the UI thread. Each child streams line events into
+  `AppEvent`s, with one `RunningJob` per child tracked in the app. The event queue is drained
+  before each frame and retained output is byte-capped; do not add a full frame per line.
+- `Ctrl+C` cancels the newest job; with no job it quits. `Ctrl+X` cancels the newest job. `Esc`
+  goes back one screen and never cancels a job. `q` asks before quitting while a job runs.
 
 ## Application state
 

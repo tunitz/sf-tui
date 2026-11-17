@@ -23,12 +23,6 @@ pub enum ConfigError {
         #[source]
         source: toml::de::Error,
     },
-    #[error("could not create configuration directory {path}: {source}")]
-    CreateDir {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
     #[error("could not write configuration at {path}: {source}")]
     Write {
         path: PathBuf,
@@ -90,6 +84,17 @@ impl Config {
         Self::load_from(Self::path()?)
     }
 
+    /// Load configuration, falling back to defaults with a human-readable reason.
+    ///
+    /// A malformed or unreadable file must never prevent the TUI from starting. The original is
+    /// left on disk so the user can inspect it; the next save replaces it atomically.
+    pub fn load_or_recover() -> (Self, Option<String>) {
+        match Self::load() {
+            Ok(config) => (config, None),
+            Err(error) => (Self::default(), Some(error.to_string())),
+        }
+    }
+
     /// Load configuration from an explicit path. A missing file is not an error.
     pub fn load_from(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -119,19 +124,15 @@ impl Config {
     /// Persist the configuration to an explicit path.
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDir {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
         let contents = toml::to_string_pretty(self).map_err(|source| ConfigError::Write {
             path: path.to_path_buf(),
             source: std::io::Error::other(source.to_string()),
         })?;
-        std::fs::write(path, contents).map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
+        crate::fsutil::write_private(path, contents.as_bytes()).map_err(|source| {
+            ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            }
         })
     }
 
@@ -216,6 +217,21 @@ mod tests {
         let error = Config::load_from(&path).expect_err("parse must fail");
         assert!(error.to_string().contains("could not parse configuration"));
         assert!(error.to_string().contains("bad.toml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nested").join("config.toml");
+        Config::default().save_to(&path).expect("save");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

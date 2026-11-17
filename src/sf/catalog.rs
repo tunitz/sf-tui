@@ -104,7 +104,8 @@ pub fn cache_path(config_dir: &Path) -> PathBuf {
 /// Read a cached catalog only when it is newer than `max_age`.
 pub fn read_cache(path: &Path, max_age: Duration) -> Option<Vec<CommandSpec>> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    if modified.elapsed().unwrap_or_default() > max_age {
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    if age > max_age {
         return None;
     }
     let cache: CacheFile = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
@@ -113,9 +114,6 @@ pub fn read_cache(path: &Path, max_age: Duration) -> Option<Vec<CommandSpec>> {
 
 /// Store the raw `sf commands --json` response for the next launch.
 pub fn write_cache(path: &Path, raw_json: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let saved_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -124,7 +122,7 @@ pub fn write_cache(path: &Path, raw_json: &str) -> std::io::Result<()> {
         saved_at,
         json: raw_json.to_owned(),
     };
-    std::fs::write(path, serde_json::to_vec(&cache).unwrap_or_default())
+    crate::fsutil::write_private(path, &serde_json::to_vec(&cache).unwrap_or_default())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -417,7 +415,11 @@ pub fn category_for(id: &str) -> String {
         "Other".to_owned()
     } else {
         let name = known.to_owned();
-        name[0..1].to_uppercase() + &name[1..]
+        let mut characters = name.chars();
+        match characters.next() {
+            Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+            None => "Other".to_owned(),
+        }
     }
 }
 
@@ -533,5 +535,10 @@ mod tests {
         assert_eq!(hits[0].command.id, "org list");
         assert!(hits[0].matched.is_some());
         assert!(search(&catalog.commands, "zzzznotacommand", 5).is_empty());
+    }
+
+    #[test]
+    fn category_capitalization_handles_non_ascii_prefixes() {
+        assert_eq!(category_for("éclair run"), "Éclair");
     }
 }

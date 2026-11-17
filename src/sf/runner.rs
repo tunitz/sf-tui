@@ -38,6 +38,10 @@ pub enum SfEvent {
     },
 }
 
+/// Upper bound for retained stdout/stderr per process. The UI also caps streamed lines.
+const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_STREAM_LINE_CHARS: usize = 4_000;
+
 /// Captured result of a finished process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessOutcome {
@@ -82,6 +86,17 @@ impl RunningJob {
     /// Request cooperative termination. Returns false if the job already finished.
     pub fn cancel(self) -> bool {
         self.cancel.send(()).is_ok()
+    }
+
+    /// Request termination and wait for the capture task to finish.
+    pub async fn cancel_and_join(self) -> ProcessOutcome {
+        let RunningJob { cancel, task, .. } = self;
+        let _ = cancel.send(());
+        task.await.unwrap_or(ProcessOutcome {
+            exit_code: None,
+            stdout: String::new(),
+            stderr: "process task was cancelled".to_owned(),
+        })
     }
 
     /// Await the underlying task, e.g. during application shutdown.
@@ -153,7 +168,7 @@ where
     spawn_with_env(executable, argv, job_id, events, map, &[])
 }
 
-fn spawn_with_env<E, F>(
+pub fn spawn_with_env<E, F>(
     executable: &Path,
     argv: &[String],
     job_id: u64,
@@ -249,12 +264,21 @@ where
     let mut captured = String::new();
     let mut lines = BufReader::new(pipe).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        captured.push_str(&line);
-        captured.push('\n');
+        if captured.len() < MAX_CAPTURE_BYTES {
+            captured.push_str(&line);
+            captured.push('\n');
+        }
+        let text = if line.chars().count() > MAX_STREAM_LINE_CHARS {
+            let mut shortened: String = line.chars().take(MAX_STREAM_LINE_CHARS).collect();
+            shortened.push('…');
+            shortened
+        } else {
+            line
+        };
         let _ = events.send(map(SfEvent::Line(JobLine {
             job_id,
             stream,
-            text: line,
+            text,
         })));
     }
     captured
@@ -329,15 +353,18 @@ pub async fn capture_with_env(
 
 /// Parse a JSON document embedded in text that may contain other CLI chatter.
 pub fn parse_json_document(text: &str) -> Option<serde_json::Value> {
-    let starts = [text.find('{'), text.find('[')]
-        .into_iter()
-        .flatten()
-        .min()?;
-    for end in (starts..text.len()).rev() {
-        if text.as_bytes()[end] != b'}' && text.as_bytes()[end] != b']' {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str(&text[starts..=end]) {
+    if let Ok(value) = serde_json::from_str(text.trim()) {
+        return Some(value);
+    }
+    // Try the first few `{`/`[` positions. A bracketed warning before the document used to make
+    // the old min-start heuristic fail even when a valid object followed.
+    for (index, _) in text
+        .char_indices()
+        .filter(|(_, character)| *character == '{' || *character == '[')
+        .take(256)
+    {
+        let mut deserializer = serde_json::Deserializer::from_str(&text[index..]);
+        if let Ok(value) = serde::Deserialize::deserialize(&mut deserializer) {
             return Some(value);
         }
     }
@@ -351,6 +378,13 @@ mod tests {
     #[test]
     fn json_document_is_extracted_from_noisy_output() {
         let text = "warning: deprecated flag\n{\"status\":0,\"result\":{\"ok\":true}}\n";
+        let value = parse_json_document(text).expect("parse");
+        assert_eq!(value["result"]["ok"], true);
+    }
+
+    #[test]
+    fn json_document_survives_a_bracketed_warning() {
+        let text = "[WARNING] plugin notice\n{\"status\":0,\"result\":{\"ok\":true}}\n";
         let value = parse_json_document(text).expect("parse");
         assert_eq!(value["result"]["ok"], true);
     }

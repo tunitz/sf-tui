@@ -64,6 +64,30 @@ else
   exit 1
 fi
 
+sums_url="https://github.com/${REPOSITORY}/releases/download/v${VERSION}/SHA256SUMS"
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$sums_url" -o "$tmpdir/SHA256SUMS" 2>/dev/null || rm -f "$tmpdir/SHA256SUMS"
+elif command -v wget >/dev/null 2>&1; then
+  wget -q -O "$tmpdir/SHA256SUMS" "$sums_url" 2>/dev/null || rm -f "$tmpdir/SHA256SUMS"
+fi
+if [ -f "$tmpdir/SHA256SUMS" ]; then
+  expected=$(grep -E "  ${archive}$" "$tmpdir/SHA256SUMS" | awk '{print $1}' | head -n 1)
+  if [ -n "$expected" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      actual=$(sha256sum "$tmpdir/$archive" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+      actual=$(shasum -a 256 "$tmpdir/$archive" | awk '{print $1}')
+    else
+      echo "sftui installer: no SHA-256 tool found; skipping checksum verification" >&2
+      actual=""
+    fi
+    if [ -n "$actual" ] && [ "$actual" != "$expected" ]; then
+      echo "sftui installer: checksum verification failed" >&2
+      exit 1
+    fi
+  fi
+fi
+
 tar -xzf "$tmpdir/$archive" -C "$tmpdir"
 if [ ! -f "$tmpdir/sftui" ]; then
   echo "sftui installer: archive did not contain the sftui executable" >&2

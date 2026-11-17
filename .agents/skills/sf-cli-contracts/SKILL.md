@@ -12,12 +12,12 @@ Fields absent in one CLI version must degrade to empty values rather than fail.
 
 | Command | Consumed shape | Notes |
 | --- | --- | --- |
-| `version --json` | `result.version` or a plain version token | Probe runs before the UI with a 12 s timeout |
+| `version --json` | `result.version` or a plain version token | Probe runs with a 5 s timeout |
 | `commands --json` | `result[]` with `id`, `summary`, `description`, `flags`, `examples`, optional `category` | Missing list falls back to the snapshot |
 | `<command> --help` | plain text | Flag lines such as `-o, --target-org <value> ... (required)` are parsed for the detail pane |
 | `org list --json` | `result.scratchOrgs[]`, `result.nonScratchOrgs[]` | `aliases` may be a string or array; flags `isDefaultUsername`, `isDefaultDevHubUsername` |
 | `org display --json` | `result{}` | Filter `accessToken`, `refreshToken`, `sfdxAuthUrl`, `password`, `clientSecret`, `privateKey` |
-| `config get target-org --json` | `result.target-org` | Probed at startup to show the current org; falls back to `org display --json` |
+| `config get target-org --json` | `result.target-org`, a string, or an array of `{name,value}` entries | Probed at startup to show the current org; falls back to `org display --json` |
 | `project deploy start --json` | `result.id` | Job id drives `project deploy report --json --job-id <id>`; flags: `--source-dir`, `--dry-run`, `--metadata`, `--test-level` |
 | component completion | all project files (cap 50k), package.xml `<types>`, common metadata types | `src/sf/metadata.rs` detects Apex by extension, ranks `Type:Name` candidates with a fast substring pass, shows source paths; `PromptField` debounces re-ranking by 90 ms and supports multi-select with Space |
 | `project deploy report --json` | `result.status`, `result.components` | `components` may be counters (`total`, `successes`, `failed`) or an array of per-component objects |
@@ -37,8 +37,10 @@ It is generated from the public sfcli command reference:
 3. Keep only the fields above; write compact JSON to `data/commands.json`.
 4. Run `cargo test sf::catalog` and check that the catalog has more than 250 commands.
 
-The live catalog from `sf commands --json` replaces the snapshot at startup when available; F5 in
-the Catalog refreshes it again.
+The bundled snapshot is always used at startup. A cached `sf commands --json` response is read
+when it is younger than seven days, and F5 in the Catalog tab performs an explicit live refresh
+that replaces the catalog and updates the cache. JSON extraction tolerates bracketed warning
+lines before the document.
 
 ## Synthetic stub fixtures
 

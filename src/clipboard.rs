@@ -44,14 +44,14 @@ pub fn copy(text: &str) -> Result<(), ClipboardError> {
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
+        let mut last_error = ClipboardError::NoHelper;
         for helper in ["xclip", "xsel", "wl-copy"] {
             match pipe_to(helper, text) {
                 Ok(()) => return Ok(()),
-                Err(ClipboardError::NoHelper) => continue,
-                Err(error) => return Err(error),
+                Err(error) => last_error = error,
             }
         }
-        Err(ClipboardError::NoHelper)
+        Err(last_error)
     }
 }
 

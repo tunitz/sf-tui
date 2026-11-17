@@ -147,14 +147,21 @@ impl TransferOptions {
         if self.retrieve {
             return None;
         }
-        Some(vec![
+        let mut argv = vec![
             "project".to_owned(),
             "deploy".to_owned(),
             "report".to_owned(),
             "--job-id".to_owned(),
             job_id.to_owned(),
-            "--json".to_owned(),
-        ])
+        ];
+        if let Some(org) = &self.target_org
+            && !org.is_empty()
+        {
+            argv.push("--target-org".to_owned());
+            argv.push(org.clone());
+        }
+        argv.push("--json".to_owned());
+        Some(argv)
     }
 }
 
@@ -182,7 +189,13 @@ impl TransferReport {
     pub fn is_complete(&self) -> bool {
         matches!(
             self.status.to_ascii_lowercase().as_str(),
-            "succeeded" | "completed" | "failed" | "canceled" | "cancelled"
+            "succeeded"
+                | "succeededpartial"
+                | "partiallysucceeded"
+                | "completed"
+                | "failed"
+                | "canceled"
+                | "cancelled"
         )
     }
 }
@@ -315,6 +328,28 @@ mod tests {
             ]
         );
         assert!(options.report_argv("0Af000000000001").is_none());
+    }
+
+    #[test]
+    fn report_argv_keeps_the_target_org() {
+        let options = TransferOptions {
+            target_org: Some("dev".to_owned()),
+            ..TransferOptions::default()
+        };
+        let expected: Vec<String> = [
+            "project",
+            "deploy",
+            "report",
+            "--job-id",
+            "0Af000000000001",
+            "--target-org",
+            "dev",
+            "--json",
+        ]
+        .iter()
+        .map(|part| (*part).to_owned())
+        .collect();
+        assert_eq!(options.report_argv("0Af000000000001"), Some(expected));
     }
 
     #[test]
