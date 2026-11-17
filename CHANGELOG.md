@@ -4,6 +4,22 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.18] - 2026-11-17
+
+### Added
+
+- `F4` switches the default org from any screen: a small picker marks the current default, Enter
+  sets `target-org` for the project, F5 refreshes the list and `l` starts a login. The header
+  updates immediately.
+
+### Changed
+
+- Key hints now live only in the footer (and inside dialogs). Screen headings, the Orgs detail
+  pane, the coverage pane title and the Home body no longer repeat command lists; navigation no
+  longer writes hints into the status line.
+- The footer carries up to seven keys where they fit, ordered by what matters on that screen;
+  narrower terminals drop the least important ones instead of wrapping.
+
 ## [0.1.17] - 2026-11-17
 
 ### Fixed

@@ -267,6 +267,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             ("↑↓", "move"),
             ("Enter", "open"),
             ("F2", "jobs"),
+            ("F4", "org"),
             ("?", "help"),
             ("q", "quit"),
         ],
@@ -308,10 +309,12 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         }
         Tab::Orgs => vec![
             ("Enter", "details"),
-            ("o", "open"),
-            ("F2", "jobs"),
-            ("F5", "refresh"),
+            ("d", "default"),
+            ("F4", "switch org"),
+            ("l", "login"),
             ("Esc", "back"),
+            ("x", "logout"),
+            ("F5", "refresh"),
         ],
         Tab::Setup => vec![
             ("Enter", "run"),
@@ -355,24 +358,6 @@ fn keycap_pairs_line(
             Style::default().fg(Color::DarkGray),
         ));
         used += piece;
-    }
-    Line::from(spans)
-}
-
-fn keycap(key: &str, label: &str, color: Color) -> Span<'static> {
-    Span::styled(
-        format!("[{key}] {label}"),
-        Style::default().fg(color).add_modifier(Modifier::BOLD),
-    )
-}
-
-fn action_bar<'a>(items: Vec<(&'a str, &'a str)>, app: &App) -> Line<'a> {
-    let mut spans = vec![faint("Actions  ")];
-    for (index, (key, label)) in items.iter().enumerate() {
-        if index > 0 {
-            spans.push(faint("  |  "));
-        }
-        spans.push(keycap(key, label, accent(app)));
     }
     Line::from(spans)
 }
@@ -426,10 +411,6 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
             app.job_count()
         ))));
     }
-    lines.push(Line::from(" "));
-    lines.push(Line::from(faint(
-        "↑↓ move · Enter open · F2 jobs · ? help · q quit",
-    )));
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
@@ -491,18 +472,16 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
 
     let footer = if has_coverage && app.tests_focus == TestsFocus::Coverage {
         let classes = latest.map_or(0, |result| result.coverage.len());
-        format!("coverage focused — {classes} classes · ↑↓ scroll · Tab search · Esc back")
+        format!("coverage focused — {classes} classes")
     } else {
         let mut text = format!("{} selected", state.checked().len());
         if state.searching {
-            text.push_str("                        searching…");
+            text.push_str("   searching…");
         } else if state.needs_search() {
-            text.push_str("                        [Enter] search");
-        } else {
-            text.push_str("              [Space] select   [Enter] confirm");
+            text.push_str("   results out of date");
         }
         if has_coverage {
-            text.push_str("   [Tab] coverage");
+            text.push_str("   coverage available");
         }
         text
     };
@@ -560,15 +539,7 @@ fn render_test_list(
 
 fn draw_test_coverage(frame: &mut Frame, area: Rect, app: &App, result: &crate::app::ResultView) {
     let focused = app.tests_focus == TestsFocus::Coverage;
-    let title = if focused {
-        "COVERAGE — focused · Tab search · ↑↓ scroll"
-    } else {
-        "coverage — Tab to focus"
-    };
-    let mut cover_block = block(title, app);
-    if focused {
-        cover_block = cover_block.border_style(Style::default().fg(accent(app)));
-    }
+    let cover_block = pane_block("coverage", app, focused);
     frame.render_widget(cover_block.clone(), area);
     let inner = cover_block.inner(area);
     let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
@@ -705,14 +676,6 @@ fn strong_line(text: &str, color: Color) -> Line<'static> {
 fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
     let density = density(area);
     if density != Density::Roomy {
-        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(strong(
-                "Orgs — Enter details | o open | l login | F5 refresh",
-                accent(app),
-            ))),
-            sections[0],
-        );
         let show_status = density == Density::Compact;
         let rows: Vec<Row> = app
             .org_state
@@ -755,7 +718,7 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
                 .block(block("orgs", app))
                 .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("›"),
-            sections[1],
+            area,
             &mut state,
         );
         if app.org_state.orgs.is_empty() {
@@ -765,7 +728,7 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
                 } else {
                     "No orgs loaded — F5 to refresh"
                 }))),
-                sections[1],
+                area,
             );
         }
         return;
@@ -817,7 +780,7 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
             if app.org_state.loading {
                 "orgs — loading…"
             } else {
-                "orgs — F5 to refresh"
+                "orgs"
             },
             app,
         ))
@@ -846,17 +809,6 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
         )));
         lines.push(Line::from(faint("Credentials are never displayed.")));
     }
-    lines.push(Line::from(" "));
-    lines.push(action_bar(
-        vec![
-            ("Enter", "details"),
-            ("o", "open"),
-            ("d", "default"),
-            ("l", "login"),
-            ("x", "logout"),
-        ],
-        app,
-    ));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(block("organization", app)),
         columns[1],
@@ -977,16 +929,17 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(Text::from(latest)), sections[3]);
     }
     let count = state.checked().len();
+    let status = if state.searching {
+        "searching…"
+    } else if state.needs_search() {
+        "results out of date"
+    } else {
+        ""
+    };
     frame.render_widget(
         Line::from(vec![
             faint(format!("{count} selected")),
-            faint(if state.searching {
-                "                            searching…"
-            } else if state.needs_search() {
-                "                            [Enter] search"
-            } else {
-                "                  [Space] select   [Enter] confirm"
-            }),
+            faint(format!("   {status}")),
         ]),
         sections[4],
     );
@@ -1238,10 +1191,7 @@ fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
     if density != Density::Roomy {
         let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(area);
         frame.render_widget(
-            Paragraph::new(Line::from(strong(
-                "Setup — Enter install | r re-probe | Tab leave",
-                accent(app),
-            ))),
+            Paragraph::new(Line::from(strong("Setup", accent(app)))),
             sections[0],
         );
         let items: Vec<ListItem> = crate::sf::install_instructions()
@@ -1649,6 +1599,89 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                 area,
             );
         }
+        Modal::SwitchOrg { selected } => {
+            let width = 78u16.min(frame.area().width);
+            let rows = app.org_state.orgs.len();
+            let height = (rows as u16)
+                .saturating_add(6)
+                .min(frame.area().height.saturating_sub(2))
+                .max(7);
+            let area = centered(frame.area(), width, height);
+            frame.render_widget(Clear, area);
+            let outer = pane_block("Switch default org", app, true);
+            frame.render_widget(outer.clone(), area);
+            let inner = outer.inner(area);
+            let sections =
+                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+            if app.org_state.orgs.is_empty() {
+                let text = if app.org_state.loading {
+                    "Loading orgs…"
+                } else {
+                    "No orgs yet — press l to log in, F5 to refresh"
+                };
+                frame.render_widget(Paragraph::new(Line::from(faint(text))), sections[0]);
+            } else {
+                let items: Vec<ListItem> = app
+                    .org_state
+                    .orgs
+                    .iter()
+                    .map(|org| {
+                        let marker = if org.is_default { "★" } else { " " };
+                        let mut spans = vec![
+                            Span::styled(
+                                format!(" {marker} "),
+                                Style::default().fg(if org.is_default {
+                                    accent(app)
+                                } else {
+                                    Color::DarkGray
+                                }),
+                            ),
+                            Span::styled(
+                                truncated(&org.label(), 24),
+                                Style::default()
+                                    .fg(Color::Reset)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ];
+                        if org.label() != org.username {
+                            spans.push(faint(format!("  {}", truncated(&org.username, 30))));
+                        }
+                        if !org.connected_status.is_empty() {
+                            spans.push(faint(format!("  {}", org.connected_status)));
+                        }
+                        ListItem::new(Line::from(spans))
+                    })
+                    .collect();
+                let mut state = ListState::default();
+                state.select(Some((*selected).min(rows.saturating_sub(1))));
+                frame.render_stateful_widget(
+                    List::new(items)
+                        .highlight_style(
+                            Style::default()
+                                .bg(Color::DarkGray)
+                                .fg(Color::Reset)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol("›"),
+                    sections[0],
+                    &mut state,
+                );
+            }
+            frame.render_widget(
+                Paragraph::new(keycap_pairs_line(
+                    &[
+                        ("↑↓", "select"),
+                        ("Enter", "switch"),
+                        ("F5", "refresh"),
+                        ("l", "log in"),
+                        ("Esc", "close"),
+                    ],
+                    app,
+                    usize::from(inner.width),
+                )),
+                sections[1],
+            );
+        }
         Modal::Jobs {
             selected,
             focus,
@@ -1938,6 +1971,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Ctrl+Y", "copy while typing in a search field"),
     ("F5", "refresh orgs or component search"),
     ("F2", "open the jobs window from any screen"),
+    ("F4", "switch the default org from any screen"),
     (
         "F2 (jobs)",
         "↑↓ select · Enter open · Tab move focus · Esc back",

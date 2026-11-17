@@ -259,7 +259,7 @@ fn every_screen_renders_without_panicking() {
             }
             if (width, height) == (120, 40) && tab == sftui::app::Tab::Home {
                 assert!(!rendered.contains("[1]"), "tab bar must be gone");
-                assert!(rendered.contains("F2 jobs"), "key hints missing");
+                assert!(rendered.contains("[F2] jobs"), "key hints missing");
             }
         }
         for modal in [
@@ -273,6 +273,7 @@ fn every_screen_renders_without_panicking() {
                 message: "Synthetic confirmation".to_owned(),
                 action: sftui::app::PendingAction::None,
             },
+            sftui::app::Modal::SwitchOrg { selected: 0 },
             sftui::app::Modal::Prompt {
                 title: "Prompt".to_owned(),
                 kind: sftui::app::PromptKind::TargetOrg,

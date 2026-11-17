@@ -67,6 +67,8 @@ For a nonstandard location, set `SFTUI_SF_PATH` to the full path of the executab
 
 ## Keybindings
 
+All key hints live on the footer line; screens and the header carry context only.
+
 The menu is the whole navigation:
 
 ```text
@@ -75,7 +77,7 @@ The menu is the whole navigation:
 ```
 
 Global: `h` Menu · `Esc` previous screen · `?` help · `y` copy · `F5` refresh ·
-`F2` Jobs · `q` quit (asks while a job runs).
+`F2` Jobs · `F4` switch the default org · `q` quit (asks while a job runs).
 `Ctrl+X` cancels the newest job; `Ctrl+C` cancels it or quits when idle.
 `Ctrl+Y` copies the current selection while a search field has focus.
 
@@ -98,8 +100,9 @@ row per test class with `[✓]`/`[✗]`, the method outcomes underneath, and a c
 every class the CLI returned: percent, covered/total lines and a bar. The table is on the Tests
 screen (`Tab` focuses it and `↑↓` scrolls) and in the full result view. Per-class rows come from
 the org; to include classes the run did not touch, turn off *Store Only Aggregate Code Coverage* in
-Setup › Apex Test Execution. The Organization screen handles login: check the current org, switch,
-login, delete/logout or reauth.
+Setup › Apex Test Execution. The Organization screen lists orgs and their detail, and handles login, logout and the default
+org. `F4` opens the same choice from any screen: pick an org, Enter sets it as `target-org` for
+the project and the header updates immediately.
 
 On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
 `Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`; typing keeps

@@ -662,6 +662,9 @@ pub enum Modal {
         message: String,
         action: PendingAction,
     },
+    SwitchOrg {
+        selected: usize,
+    },
     Jobs {
         selected: usize,
         focus: JobsFocus,
@@ -1753,6 +1756,10 @@ impl App {
             self.open_jobs();
             return;
         }
+        if key.code == KeyCode::F(4) {
+            self.open_switch_org();
+            return;
+        }
         if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
             self.transfer_key(key);
             return;
@@ -1814,7 +1821,8 @@ impl App {
             }
         }
         self.tab = tab;
-        self.notice(format!("{} — {}", self.tab.label(), self.tab_action_hint()));
+        // Key hints live in the footer; navigation itself needs no status text.
+        self.status.clear();
     }
 
     fn go_home(&mut self) {
@@ -1824,22 +1832,7 @@ impl App {
     fn go_back(&mut self) {
         let previous = self.tab_history.pop().unwrap_or(Tab::Home);
         self.tab = previous;
-        self.notice(format!(
-            "Back to {} — {}",
-            self.tab.label(),
-            self.tab_action_hint()
-        ));
-    }
-
-    fn tab_action_hint(&self) -> &'static str {
-        match self.tab {
-            Tab::Home => "↑↓ move · Enter open · F2 jobs",
-            Tab::Retrieve => "type component · Enter search · Space select · Enter confirm",
-            Tab::Deploy => "type component · Enter search · Space select · Enter confirm",
-            Tab::Tests => "type test class · Enter search · Space select · Enter confirm",
-            Tab::Orgs => "Enter details · o open · l login",
-            Tab::Setup => "Enter installer · r re-probe",
-        }
+        self.notice(format!("Back to {}", self.tab.label()));
     }
 
     fn refresh_current_tab(&mut self) {
@@ -2343,6 +2336,24 @@ impl App {
     }
 
     /// Open the global Jobs window, selecting the newest running job or the newest result.
+    /// F4: pick the default org from anywhere without visiting the Orgs screen.
+    fn open_switch_org(&mut self) {
+        if self.startup.installation.is_none() {
+            self.error("Salesforce CLI is not installed");
+            return;
+        }
+        if self.org_state.orgs.is_empty() && !self.org_state.loading {
+            self.refresh_orgs();
+        }
+        let selected = self
+            .org_state
+            .orgs
+            .iter()
+            .position(|org| org.is_default)
+            .unwrap_or(0);
+        self.modal = Some(Modal::SwitchOrg { selected });
+    }
+
     fn open_jobs(&mut self) {
         let rows = self.job_rows();
         let selected = rows
@@ -2548,6 +2559,67 @@ impl App {
                 scroll,
                 follow,
             } => self.handle_jobs_key(selected, focus, scroll, follow, key),
+            Modal::SwitchOrg { mut selected } => {
+                let count = self.org_state.orgs.len();
+                match key.code {
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.modal = Some(Modal::SwitchOrg { selected });
+                    }
+                    KeyCode::Down => {
+                        if count > 0 {
+                            selected = (selected + 1).min(count - 1);
+                        }
+                        self.modal = Some(Modal::SwitchOrg { selected });
+                    }
+                    KeyCode::PageUp => {
+                        selected = selected.saturating_sub(10);
+                        self.modal = Some(Modal::SwitchOrg { selected });
+                    }
+                    KeyCode::PageDown => {
+                        if count > 0 {
+                            selected = (selected + 10).min(count - 1);
+                        }
+                        self.modal = Some(Modal::SwitchOrg { selected });
+                    }
+                    KeyCode::F(5) => {
+                        self.refresh_orgs();
+                        self.modal = Some(Modal::SwitchOrg { selected });
+                    }
+                    KeyCode::Char('l') => {
+                        self.open_prompt(
+                            "Log in",
+                            PromptKind::LoginWeb,
+                            vec![PromptField::new("Alias", "")],
+                        );
+                    }
+                    KeyCode::Enter => {
+                        let Some(org) = self.org_state.orgs.get(selected) else {
+                            self.notice("No orgs loaded yet — F5 refreshes the list");
+                            self.modal = Some(Modal::SwitchOrg { selected });
+                            return;
+                        };
+                        let username = org.username.clone();
+                        let label = org.label();
+                        if org.is_default {
+                            self.notice(format!("{label} is already the default org"));
+                            self.modal = None;
+                            return;
+                        }
+                        // Optimistic header update; the org refresh confirms it.
+                        self.startup.current_org = Some(label.clone());
+                        self.spawn(
+                            crate::sf::commands::config_set("target-org", &username),
+                            JobPurpose::OrgAction {
+                                description: format!("Default org set to {label}"),
+                            },
+                        );
+                        self.modal = None;
+                    }
+                    KeyCode::Esc => self.modal = None,
+                    _ => self.modal = Some(Modal::SwitchOrg { selected }),
+                }
+            }
             Modal::TestConfirm {
                 mut entries,
                 mut focus,
@@ -4023,6 +4095,46 @@ mod tests {
         app.handle_key(key(KeyCode::F(2)));
         app.handle_key(key(KeyCode::Down));
         assert!(matches!(app.modal, Some(Modal::Jobs { .. })));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn f4_opens_the_org_switcher_at_the_default_org() {
+        let mut app = test_app();
+        app.startup.installation = Some(crate::sf::detect::SfInstallation {
+            executable: std::path::PathBuf::from("sf"),
+            source: "test".to_owned(),
+        });
+        app.org_state.orgs = vec![
+            crate::sf::org::OrgSummary {
+                username: "a@example.invalid".to_owned(),
+                aliases: vec!["a".to_owned()],
+                org_id: String::new(),
+                is_default: false,
+                is_devhub: false,
+                connected_status: "Connected".to_owned(),
+                instance_url: String::new(),
+                scratch: true,
+            },
+            crate::sf::org::OrgSummary {
+                username: "b@example.invalid".to_owned(),
+                aliases: vec!["b".to_owned()],
+                org_id: String::new(),
+                is_default: true,
+                is_devhub: false,
+                connected_status: "Connected".to_owned(),
+                instance_url: String::new(),
+                scratch: true,
+            },
+        ];
+        app.handle_key(key(KeyCode::F(4)));
+        match app.modal {
+            Some(Modal::SwitchOrg { selected }) => assert_eq!(selected, 1),
+            ref other => panic!("expected the org switcher, got {other:?}"),
+        }
+        app.handle_key(key(KeyCode::Down));
+        assert!(matches!(app.modal, Some(Modal::SwitchOrg { selected: 1 })));
         app.handle_key(key(KeyCode::Esc));
         assert!(app.modal.is_none());
     }
