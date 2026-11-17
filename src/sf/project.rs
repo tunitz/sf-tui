@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-const MAX_ENTRIES: usize = 4_000;
-const MAX_DEPTH: usize = 8;
+const MAX_ENTRIES: usize = 50_000;
+const MAX_DEPTH: usize = 12;
 const IGNORED_DIRS: &[&str] = &[".git", ".sf", ".sfdx", "node_modules", "target", ".vscode"];
 
 /// Errors from loading an SFDX project.

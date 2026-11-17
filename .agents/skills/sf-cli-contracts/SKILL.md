@@ -19,7 +19,7 @@ Fields absent in one CLI version must degrade to empty values rather than fail.
 | `org display --json` | `result{}` | Filter `accessToken`, `refreshToken`, `sfdxAuthUrl`, `password`, `clientSecret`, `privateKey` |
 | `config get target-org --json` | `result.target-org` | Probed at startup to show the current org; falls back to `org display --json` |
 | `project deploy start --json` | `result.id` | Job id drives `project deploy report --json --job-id <id>`; flags: `--source-dir`, `--dry-run`, `--metadata`, `--test-level` |
-| component completion | local source files, package.xml `<types>`, common metadata types | `src/sf/metadata.rs` ranks `Type:Name` candidates, shows source paths, and caches results per keystroke in `PromptField` |
+| component completion | all project files (cap 50k), package.xml `<types>`, common metadata types | `src/sf/metadata.rs` detects Apex by extension, ranks `Type:Name` candidates, shows source paths; `PromptField` debounces re-ranking by 90 ms |
 | `project deploy report --json` | `result.status`, `result.components` | `components` may be counters (`total`, `successes`, `failed`) or an array of per-component objects |
 | `project retrieve start --json` | final result directly | There is no `project retrieve report`; run it with `--wait` and read the returned components |
 

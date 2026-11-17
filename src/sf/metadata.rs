@@ -347,6 +347,34 @@ mod tests {
     }
 
     #[test]
+    fn long_underscored_apex_class_name_is_found() {
+        let name = "C3S_TRG26_FeedBackLoopHandler";
+        let relative = format!("force-app/main/default/classes/{name}.cls");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(&relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        std::fs::write(&path, "public class C3S_TRG26_FeedBackLoopHandler {}")
+            .expect("write class");
+        let project = SfProject {
+            root: dir.path().to_path_buf(),
+            package_directories: vec!["force-app".to_owned()],
+            source_api_version: None,
+            manifests: Vec::new(),
+            source_files: vec![relative.clone()],
+        };
+        let set = transfer_suggestions(Some(&project));
+        eprintln!(
+            "set contains: {:?}",
+            set.items
+                .iter()
+                .find(|item| item.value.contains("FeedBack"))
+        );
+        let hits = set.filter(name, 5);
+        eprintln!("hits: {:?}", hits);
+        assert!(hits.iter().any(|item| item.value.contains(name)));
+    }
+
+    #[test]
     fn create_template_lookup_is_case_insensitive() {
         assert_eq!(
             create_template_for("apexclass").map(|template| template.label),

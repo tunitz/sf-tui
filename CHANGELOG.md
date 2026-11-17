@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.1.5] - 2026-11-17
+
+### Fixed
+
+- Apex classes are indexed by file extension and the project scan now covers up to 50,000 files
+  at greater depth, so long names such as `C3S_TRG26_FeedBackLoopHandler` are found.
+- Search input now debounces fuzzy work by 90 ms for both component suggestions and the catalog;
+  pasted text no longer triggers a full re-rank per character.
+- Suggestion ranking precomputes lowercase keys and uses an unstable sort for large projects.
+
+[0.1.5]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.5
+
 ## [0.1.4] - 2026-11-17
 
 ### Fixed

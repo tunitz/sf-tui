@@ -167,6 +167,8 @@ pub struct StartupStage {
 #[derive(Debug, Clone, Default)]
 pub struct CatalogState {
     pub query: String,
+    pub active_query: String,
+    pub query_changed_at: Option<Instant>,
     pub search_focused: bool,
     pub selected_id: Option<String>,
     pub help_for: Option<String>,
@@ -275,7 +277,11 @@ pub struct PromptField {
     pub suggestion_index: Option<usize>,
     cached_query: String,
     cached_suggestions: Vec<SuggestionItem>,
+    suggestion_dirty: bool,
+    last_edit: Instant,
 }
+
+const SUGGESTION_DEBOUNCE: Duration = Duration::from_millis(90);
 
 impl PromptField {
     pub fn new(label: impl Into<String>, value: impl Into<String>) -> Self {
@@ -289,25 +295,39 @@ impl PromptField {
             suggestion_index: None,
             cached_query: String::new(),
             cached_suggestions: Vec::new(),
+            suggestion_dirty: false,
+            last_edit: Instant::now(),
         }
     }
 
     pub fn with_suggestions(mut self, suggestion_set: SuggestionSet) -> Self {
         self.suggestion_set = Some(suggestion_set);
-        self.refresh_suggestions();
+        self.suggestion_dirty = true;
+        self.ensure_suggestions();
         self
     }
 
-    /// Recompute suggestions only after the text actually changes, not on every frame.
-    pub fn refresh_suggestions(&mut self) {
+    /// Mark the candidate list stale without doing any fuzzy work in the key handler.
+    pub fn mark_edited(&mut self) {
+        self.suggestion_dirty = true;
+        self.last_edit = Instant::now();
+    }
+
+    pub fn debounce_ready(&self) -> bool {
+        self.suggestion_dirty && self.last_edit.elapsed() >= SUGGESTION_DEBOUNCE
+    }
+
+    /// Recompute only when stale; navigation calls this directly so it never sees old results.
+    pub fn ensure_suggestions(&mut self) {
+        if !self.suggestion_dirty {
+            return;
+        }
+        self.suggestion_dirty = false;
         self.suggestion_index = None;
         let Some(set) = &self.suggestion_set else {
             self.cached_suggestions.clear();
             return;
         };
-        if self.cached_query == self.value && !self.cached_suggestions.is_empty() {
-            return;
-        }
         self.cached_query = self.value.clone();
         self.cached_suggestions = set.filter(&self.value, 5);
     }
@@ -699,6 +719,21 @@ impl App {
 
     pub async fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
+        if let Some(Modal::Prompt { fields, .. }) = self.modal.as_mut()
+            && fields.iter().any(PromptField::debounce_ready)
+        {
+            for field in fields.iter_mut() {
+                field.ensure_suggestions();
+            }
+        }
+        if self.catalog_state.query != self.catalog_state.active_query
+            && self
+                .catalog_state
+                .query_changed_at
+                .is_some_and(|when| when.elapsed() >= SUGGESTION_DEBOUNCE)
+        {
+            self.catalog_state.active_query = self.catalog_state.query.clone();
+        }
         if self
             .probe_task
             .as_ref()
@@ -1095,7 +1130,7 @@ impl App {
 
     pub fn catalog_rows(&self) -> Vec<CatalogRow> {
         let catalog = &self.startup.catalog;
-        let query = self.catalog_state.query.trim();
+        let query = self.catalog_state.active_query.trim();
         if query.is_empty() {
             let mut rows = vec![CatalogRow::Header(
                 "Popular — your five most used commands".to_owned(),
@@ -1173,16 +1208,20 @@ impl App {
                         self.catalog_state.search_focused = false;
                     } else {
                         self.catalog_state.query.clear();
+                        self.catalog_state.active_query.clear();
                     }
                 }
                 KeyCode::Backspace => {
                     self.catalog_state.query.pop();
-                    self.catalog_state.selected_id = self.selected_catalog_id();
+                    self.catalog_state.query_changed_at = Some(Instant::now());
                 }
-                KeyCode::Enter => self.catalog_state.search_focused = false,
+                KeyCode::Enter => {
+                    self.catalog_state.search_focused = false;
+                    self.catalog_state.active_query = self.catalog_state.query.clone();
+                }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.catalog_state.query.push(character);
-                    self.catalog_state.selected_id = None;
+                    self.catalog_state.query_changed_at = Some(Instant::now());
                 }
                 KeyCode::Up | KeyCode::Down => {
                     self.move_catalog(if key.code == KeyCode::Up { -1 } else { 1 })
@@ -1663,6 +1702,9 @@ impl App {
             } => match key.code {
                 KeyCode::Esc => self.notice("Cancelled"),
                 KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+                    if let Some(field) = fields.get_mut(focus) {
+                        field.ensure_suggestions();
+                    }
                     let suggestions = fields.get(focus).map(suggestions_for).unwrap_or_default();
                     let use_suggestions = !suggestions.is_empty()
                         && (key.code == KeyCode::Tab || focus_has_suggestions(&fields, focus));
@@ -1698,6 +1740,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(field) = fields.get_mut(focus) {
+                        field.ensure_suggestions();
                         let suggestions = suggestions_for(field);
                         if field.suggestion_index.is_some() || suggestions.len() == 1 {
                             accept_suggestion(Some(field), &suggestions);
@@ -1716,7 +1759,7 @@ impl App {
                             .unwrap_or(0);
                         field.value.replace_range(previous..field.cursor, "");
                         field.cursor = previous;
-                        field.refresh_suggestions();
+                        field.mark_edited();
                     }
                     self.modal = Some(Modal::Prompt {
                         title,
@@ -1751,7 +1794,7 @@ impl App {
                     if let Some(field) = fields.get_mut(focus) {
                         field.value.insert(field.cursor, character);
                         field.cursor += character.len_utf8();
-                        field.refresh_suggestions();
+                        field.mark_edited();
                     }
                     self.modal = Some(Modal::Prompt {
                         title,
@@ -2169,7 +2212,8 @@ fn accept_suggestion(field: Option<&mut PromptField>, suggestions: &[SuggestionI
     if let Some(suggestion) = suggestions.get(index) {
         field.value = suggestion.value.clone();
         field.cursor = field.value.len();
-        field.refresh_suggestions();
+        field.mark_edited();
+        field.ensure_suggestions();
     }
 }
 
@@ -2416,6 +2460,23 @@ mod tests {
     }
 
     #[test]
+    fn suggestions_wait_for_the_debounce_before_recomputing() {
+        let mut field = PromptField::new("Component", "Demo").with_suggestions(
+            crate::sf::metadata::SuggestionSet::new(
+                crate::sf::metadata::SuggestionKind::Transfer,
+                vec!["ApexClass:Demo".to_owned()],
+            ),
+        );
+        field.value.push('X');
+        field.mark_edited();
+        assert!(!field.debounce_ready());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(field.debounce_ready());
+        field.ensure_suggestions();
+        assert!(field.cached_suggestions().is_empty());
+    }
+
+    #[test]
     fn prompt_suggestions_are_cached_until_text_changes() {
         let mut field = PromptField::new("Component", "Demo").with_suggestions(
             crate::sf::metadata::SuggestionSet::new(
@@ -2425,7 +2486,8 @@ mod tests {
         );
         assert_eq!(field.cached_suggestions().len(), 1);
         field.value = "Other".to_owned();
-        field.refresh_suggestions();
+        field.mark_edited();
+        field.ensure_suggestions();
         assert_eq!(field.cached_suggestions()[0].value, "Flow:Other");
     }
 
