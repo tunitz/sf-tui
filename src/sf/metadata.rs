@@ -264,21 +264,28 @@ fn component_from_path(path: &str) -> Option<(String, String)> {
     if stem.is_empty() {
         return None;
     }
-    let kind = match folder {
-        "classes" => "ApexClass",
-        "triggers" => "ApexTrigger",
-        "flows" => "Flow",
-        "objects" if parts.len() > 3 && parts[parts.len() - 2] == "fields" => "CustomField",
-        "objects" => "CustomObject",
-        "layouts" => "Layout",
-        "permissionSets" => "PermissionSet",
-        "profiles" => "Profile",
-        "staticresources" => "StaticResource",
-        "labels" => "CustomLabel",
-        "aura" | "lwc" => "LightningComponentBundle",
-        "pages" => "ApexPage",
-        "flexipages" => "FlexiPage",
-        _ => return None,
+    // File extensions win: Salesforce projects sometimes keep Apex outside `classes/`.
+    let kind = if file.contains(".cls-meta.xml") || file.ends_with(".cls") {
+        "ApexClass"
+    } else if file.contains(".trigger-meta.xml") || file.ends_with(".trigger") {
+        "ApexTrigger"
+    } else {
+        match folder {
+            "classes" => "ApexClass",
+            "triggers" => "ApexTrigger",
+            "flows" => "Flow",
+            "objects" if parts.len() > 3 && parts[parts.len() - 2] == "fields" => "CustomField",
+            "objects" => "CustomObject",
+            "layouts" => "Layout",
+            "permissionSets" => "PermissionSet",
+            "profiles" => "Profile",
+            "staticresources" => "StaticResource",
+            "labels" => "CustomLabel",
+            "aura" | "lwc" => "LightningComponentBundle",
+            "pages" => "ApexPage",
+            "flexipages" => "FlexiPage",
+            _ => return None,
+        }
     };
     let name = if kind == "CustomField" && parts.len() > 3 {
         parts[parts.len() - 3]
@@ -314,6 +321,10 @@ mod tests {
         assert_eq!(value, "ApexClass:Demo");
         assert_eq!(path, "force-app/main/default/classes/Demo.cls");
         assert!(component_from_path("force-app/main/default/flows/Demo.flow-meta.xml").is_some());
+        assert_eq!(
+            component_from_path("src/apex/Demo.cls").map(|(value, _)| value),
+            Some("ApexClass:Demo".to_owned())
+        );
     }
 
     #[test]

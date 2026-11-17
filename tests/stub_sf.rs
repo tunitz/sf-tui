@@ -123,6 +123,7 @@ async fn staged_startup_reports_progress_and_caches_the_catalog() {
     let mut saw_detected = false;
     let mut saw_version = false;
     let mut saw_catalog = false;
+    let mut saw_org = false;
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(event) = rx.recv().await {
             match event {
@@ -130,6 +131,7 @@ async fn staged_startup_reports_progress_and_caches_the_catalog() {
                 StartupEvent::Detected(_) => saw_detected = true,
                 StartupEvent::Version(version) => saw_version = version == "99.0.0",
                 StartupEvent::Catalog(catalog) => saw_catalog = catalog.commands.len() == 1,
+                StartupEvent::CurrentOrg(org) => saw_org = org == "test-scratch",
                 StartupEvent::Finished => break,
                 StartupEvent::Notice(_) => {}
             }
@@ -138,7 +140,7 @@ async fn staged_startup_reports_progress_and_caches_the_catalog() {
     .await
     .expect("startup probe finished");
     let startup = task.await.expect("probe task");
-    assert!(saw_stage && saw_detected && saw_version && saw_catalog);
+    assert!(saw_stage && saw_detected && saw_version && saw_catalog && saw_org);
     assert_eq!(startup.version.as_deref(), Some("99.0.0"));
     assert!(dir.path().join(sftui::sf::catalog::CACHE_FILE).is_file());
 }
@@ -166,6 +168,7 @@ fn every_screen_renders_without_panicking() {
         Startup {
             installation: None,
             version: Some("99.0.0".to_owned()),
+            current_org: Some("test-scratch".to_owned()),
             catalog: test_catalog(),
             notices: vec!["synthetic notice".to_owned()],
         },
@@ -236,6 +239,7 @@ fn prompt_overlay_renders_with_a_cursor() {
         Startup {
             installation: None,
             version: None,
+            current_org: None,
             catalog: test_catalog(),
             notices: Vec::new(),
         },

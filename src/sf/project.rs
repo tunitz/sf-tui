@@ -97,18 +97,17 @@ pub fn load_project(root: PathBuf) -> Result<SfProject, ProjectError> {
         .collect();
     let mut manifests = Vec::new();
     let mut source_files = Vec::new();
-    for directory in &package_directories {
-        let base = root.join(directory);
-        let entries = walk(&base);
-        let mut paths: Vec<String> = entries.iter().map(|path| relative(&root, path)).collect();
-        paths.sort();
-        paths.dedup();
-        for path in paths {
-            if path.ends_with("package.xml") {
-                manifests.push(path);
-            } else {
-                source_files.push(path);
-            }
+    // Scan the project root, not only declared package directories: Apex can live in custom
+    // folders and still need to be searchable by name.
+    let entries = walk(&root);
+    let mut paths: Vec<String> = entries.iter().map(|path| relative(&root, path)).collect();
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        if path.ends_with("package.xml") {
+            manifests.push(path);
+        } else {
+            source_files.push(path);
         }
     }
     Ok(SfProject {
@@ -274,6 +273,30 @@ mod tests {
                 .source_files
                 .iter()
                 .any(|path| path.ends_with("Demo.cls"))
+        );
+    }
+
+    #[test]
+    fn project_scan_includes_sources_outside_declared_package_dirs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        fs::write(
+            dir.path().join("sfdx-project.json"),
+            r#"{"packageDirectories":[{"path":"force-app","default":true}]}"#,
+        )
+        .expect("write project");
+        let apex = dir.path().join("src/apex");
+        fs::create_dir_all(&apex).expect("create dirs");
+        fs::write(
+            apex.join("DemoController.cls"),
+            "public class DemoController {}",
+        )
+        .expect("write class");
+        let project = load_project(dir.path().to_path_buf()).expect("load");
+        assert!(
+            project
+                .source_files
+                .iter()
+                .any(|path| path.ends_with("DemoController.cls"))
         );
     }
 

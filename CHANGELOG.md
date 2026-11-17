@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.1.4] - 2026-11-17
+
+### Fixed
+
+- Apex classes are suggested by name even when they live outside declared package directories;
+  type detection now also uses file extensions such as `.cls` and `.trigger`.
+- The current Salesforce org is probed at startup and shown in the header, Home context and the
+  Org field of retrieve/deploy prompts.
+- Suggestion source paths are muted gray text with no background highlight.
+
+[0.1.4]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.4
+
 ## [0.1.3] - 2026-11-16
 
 ### Added

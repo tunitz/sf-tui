@@ -541,6 +541,10 @@ impl App {
             AppEvent::Startup(sf::StartupEvent::Version(version)) => {
                 self.startup.version = Some(version);
             }
+            AppEvent::Startup(sf::StartupEvent::CurrentOrg(org)) => {
+                self.startup.current_org = Some(org);
+                self.notice("Current org loaded");
+            }
             AppEvent::Startup(sf::StartupEvent::Catalog(catalog)) => {
                 self.startup.catalog = catalog;
                 if let Some(id) = self.catalog_state.selected_id.clone()
@@ -1083,6 +1087,7 @@ impl App {
             .iter()
             .find(|org| org.is_default)
             .map(|org| org.label())
+            .or_else(|| self.startup.current_org.clone())
             .unwrap_or_default()
     }
 
@@ -2252,6 +2257,7 @@ mod tests {
             Startup {
                 installation: None,
                 version: None,
+                current_org: None,
                 catalog: Catalog {
                     commands: vec![
                         CommandSpec {

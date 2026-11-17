@@ -21,6 +21,7 @@ use self::runner::{RunnerError, parse_json_document};
 pub struct Startup {
     pub installation: Option<SfInstallation>,
     pub version: Option<String>,
+    pub current_org: Option<String>,
     pub catalog: Catalog,
     pub notices: Vec<String>,
 }
@@ -30,6 +31,7 @@ impl Startup {
         Self {
             installation: None,
             version: None,
+            current_org: None,
             catalog: catalog::snapshot(),
             notices: Vec::new(),
         }
@@ -46,6 +48,7 @@ pub enum StartupEvent {
     Stage(&'static str),
     Detected(SfInstallation),
     Version(String),
+    CurrentOrg(String),
     Catalog(Catalog),
     Notice(String),
     Finished,
@@ -172,10 +175,51 @@ pub async fn probe_with(
         }
     };
 
-    let (version, catalog) = tokio::join!(version_probe, catalog_probe);
+    let org_probe = async {
+        let argv = installation.argv(&[
+            "config".to_owned(),
+            "get".to_owned(),
+            "target-org".to_owned(),
+            "--json".to_owned(),
+        ]);
+        if let Ok(outcome) = runner::capture_with_env(
+            &installation.executable,
+            &argv,
+            Duration::from_secs(4),
+            runner::sf_env(),
+        )
+        .await
+            && let Some(value) = parse_json_document(&outcome.stdout)
+            && let Some(org) = org::parse_current_org(&value)
+        {
+            send(StartupEvent::CurrentOrg(org.clone()));
+            return Some(org);
+        }
+        let argv =
+            installation.argv(&["org".to_owned(), "display".to_owned(), "--json".to_owned()]);
+        if let Ok(outcome) = runner::capture_with_env(
+            &installation.executable,
+            &argv,
+            Duration::from_secs(6),
+            runner::sf_env(),
+        )
+        .await
+            && let Some(value) = parse_json_document(&outcome.stdout)
+            && let Some(org) = org::parse_current_org(&value)
+        {
+            send(StartupEvent::CurrentOrg(org.clone()));
+            return Some(org);
+        }
+        None
+    };
+
+    let (version, catalog, current_org) = tokio::join!(version_probe, catalog_probe, org_probe);
     if let Some(version) = version {
         result.version = Some(version.clone());
         send(StartupEvent::Version(version));
+    }
+    if let Some(org) = current_org {
+        result.current_org = Some(org);
     }
     if let Some(catalog) = catalog {
         result.catalog = catalog.clone();

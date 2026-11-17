@@ -136,6 +136,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         faint(format!(" v{}", env!("CARGO_PKG_VERSION"))),
         faint(format!("  |  sf {version}")),
         faint(format!("  |  project {project}")),
+        faint(format!("  |  org {}", app.org_target_hint())),
         Span::styled(
             format!("  |  {activity}"),
             Style::default().fg(if app.startup_stage.done && !app.busy() {
@@ -186,9 +187,9 @@ fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, density: Densit
     };
     if density == Density::Tiny {
         let text = format!(
-            "SFTUI {} | sf {} | {activity}",
+            "SFTUI {} | {} | {activity}",
             short_tab(app.tab),
-            app.startup.version.as_deref().unwrap_or("...")
+            app.org_target_hint()
         );
         frame.render_widget(
             Paragraph::new(Line::from(strong(
@@ -202,9 +203,9 @@ fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, density: Densit
     let info = Line::from(vec![
         strong("SFTUI", accent(app)),
         faint(format!(
-            " v{} | sf {} | {activity}",
+            " v{} | {} | {activity}",
             env!("CARGO_PKG_VERSION"),
-            app.startup.version.as_deref().unwrap_or("...")
+            app.org_target_hint()
         )),
     ]);
     let mut tabs = vec![faint("Tab:").clone()];
@@ -1618,7 +1619,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                                     usize::from(area.width).saturating_sub(12)
                                 )
                             ),
-                            Style::default().bg(Color::DarkGray).fg(Color::White),
+                            Style::default().fg(Color::DarkGray),
                         )));
                     }
                 }

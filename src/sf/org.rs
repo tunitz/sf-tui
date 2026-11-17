@@ -93,6 +93,25 @@ pub fn parse_org_list(value: &Value) -> Vec<OrgSummary> {
     orgs
 }
 
+/// Read the configured default org from `sf config get target-org --json` or an org display result.
+pub fn parse_current_org(value: &Value) -> Option<String> {
+    let result = value.get("result").unwrap_or(value);
+    if let Some(org) = result
+        .get("target-org")
+        .or_else(|| result.get("targetOrg"))
+        .and_then(Value::as_str)
+        .filter(|org| !org.is_empty())
+    {
+        return Some(org.to_owned());
+    }
+    if let Some(Value::Array(items)) = result.get("aliases")
+        && let Some(alias) = items.iter().filter_map(Value::as_str).next()
+    {
+        return Some(alias.to_owned());
+    }
+    string_field(result, "username")
+}
+
 /// Convert `org display` result fields into displayable key/value pairs.
 pub fn parse_org_display(value: &Value) -> OrgDetail {
     let result = value.get("result").unwrap_or(value);
@@ -192,6 +211,14 @@ mod tests {
         assert!(orgs.iter().any(|org| org.scratch && org.is_default));
         assert!(orgs.iter().any(|org| !org.scratch && org.is_devhub));
         assert!(orgs.iter().any(|org| org.label() == "test-devhub"));
+    }
+
+    #[test]
+    fn current_org_is_read_from_config_or_display() {
+        let config = serde_json::json!({"result":{"target-org":"test-scratch"}});
+        assert_eq!(parse_current_org(&config).as_deref(), Some("test-scratch"));
+        let display = serde_json::json!({"result":{"username":"test@example.invalid","aliases":["test-scratch"]}});
+        assert_eq!(parse_current_org(&display).as_deref(), Some("test-scratch"));
     }
 
     #[test]
