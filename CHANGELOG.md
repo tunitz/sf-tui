@@ -3,6 +3,23 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.1.6] - 2026-11-17
+
+### Added
+
+- Multi-select checkboxes in the component search: `Space` checks/unchecks, `Enter` confirms.
+- Confirmation dialog after selecting components, showing the exact command with one key to run or
+  cancel; the intermediate Deploy/Retrieve path picker is no longer part of the quick flow.
+- Project suggestion index is cached per project and reused across prompts.
+
+### Changed
+
+- Search uses a fast substring pass over precomputed lowercase keys and only falls back to fuzzy
+  matching for remaining slots; typing and pasting stay responsive on large projects.
+- Debounce remains 90 ms for component and catalog search.
+
+[0.1.6]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.6
+
 ## [0.1.5] - 2026-11-17
 
 ### Fixed

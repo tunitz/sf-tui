@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -273,8 +274,10 @@ pub struct PromptField {
     pub label: String,
     pub value: String,
     pub cursor: usize,
-    pub suggestion_set: Option<SuggestionSet>,
+    pub suggestion_set: Option<Arc<SuggestionSet>>,
     pub suggestion_index: Option<usize>,
+    pub selected: Vec<String>,
+    pub multi_select: bool,
     cached_query: String,
     cached_suggestions: Vec<SuggestionItem>,
     suggestion_dirty: bool,
@@ -293,6 +296,8 @@ impl PromptField {
             cursor,
             suggestion_set: None,
             suggestion_index: None,
+            selected: Vec::new(),
+            multi_select: false,
             cached_query: String::new(),
             cached_suggestions: Vec::new(),
             suggestion_dirty: false,
@@ -300,11 +305,24 @@ impl PromptField {
         }
     }
 
-    pub fn with_suggestions(mut self, suggestion_set: SuggestionSet) -> Self {
+    pub fn with_suggestions(mut self, suggestion_set: Arc<SuggestionSet>) -> Self {
         self.suggestion_set = Some(suggestion_set);
         self.suggestion_dirty = true;
         self.ensure_suggestions();
         self
+    }
+
+    pub fn multi_select(mut self) -> Self {
+        self.multi_select = true;
+        self
+    }
+
+    pub fn toggle_current(&mut self, value: &str) {
+        if let Some(position) = self.selected.iter().position(|item| item == value) {
+            self.selected.remove(position);
+        } else {
+            self.selected.push(value.to_owned());
+        }
     }
 
     /// Mark the candidate list stale without doing any fuzzy work in the key handler.
@@ -363,6 +381,7 @@ pub enum PendingAction {
     RefreshOrgs,
     RunTransfer,
     RunInstaller { command: String },
+    RunPrepared { argv: Vec<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -410,6 +429,7 @@ pub struct App {
     pub modal: Option<Modal>,
     pub setup_selected: usize,
     tab_history: Vec<Tab>,
+    suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
     ticks: usize,
     probe_task: Option<JoinHandle<()>>,
     event_tx: UnboundedSender<AppEvent>,
@@ -451,6 +471,7 @@ impl App {
             modal: None,
             setup_selected: 0,
             tab_history: Vec::new(),
+            suggestion_cache: None,
             ticks: 0,
             probe_task: None,
             event_tx,
@@ -1052,8 +1073,27 @@ impl App {
             }
             "sf project retrieve start" | "sf project deploy start" => {
                 let retrieve = action.command == "sf project retrieve start";
-                let suggestions =
-                    crate::sf::metadata::transfer_suggestions(self.deploy_state.project.as_ref());
+                let root = self
+                    .deploy_state
+                    .project
+                    .as_ref()
+                    .map(|project| project.root.clone())
+                    .unwrap_or_default();
+                if self
+                    .suggestion_cache
+                    .as_ref()
+                    .is_none_or(|(cached_root, _)| cached_root != &root)
+                {
+                    let set = Arc::new(crate::sf::metadata::transfer_suggestions(
+                        self.deploy_state.project.as_ref(),
+                    ));
+                    self.suggestion_cache = Some((root, set));
+                }
+                let suggestions = self
+                    .suggestion_cache
+                    .as_ref()
+                    .map(|(_, set)| Arc::clone(set))
+                    .unwrap_or_else(|| Arc::new(crate::sf::metadata::transfer_suggestions(None)));
                 self.open_prompt(
                     if retrieve {
                         "Retrieve metadata"
@@ -1066,7 +1106,9 @@ impl App {
                         PromptKind::QuickDeploy
                     },
                     vec![
-                        PromptField::new("Component", "").with_suggestions(suggestions),
+                        PromptField::new("Component", "")
+                            .with_suggestions(suggestions)
+                            .multi_select(),
                         PromptField::new("Org", target),
                     ],
                 );
@@ -1088,7 +1130,7 @@ impl App {
                     PromptKind::CreateMetadata,
                     vec![
                         PromptField::new("Template", "")
-                            .with_suggestions(crate::sf::metadata::create_suggestions()),
+                            .with_suggestions(Arc::new(crate::sf::metadata::create_suggestions())),
                         PromptField::new("Name", ""),
                         PromptField::new("Org", target),
                     ],
@@ -1790,6 +1832,24 @@ impl App {
                         focus,
                     });
                 }
+                KeyCode::Char(' ') if fields.get(focus).is_some_and(|field| field.multi_select) => {
+                    if let Some(field) = fields.get_mut(focus) {
+                        field.ensure_suggestions();
+                        let value = field
+                            .cached_suggestions()
+                            .get(field.suggestion_index.unwrap_or(0))
+                            .map(|item| item.value.clone());
+                        if let Some(value) = value {
+                            field.toggle_current(&value);
+                        }
+                    }
+                    self.modal = Some(Modal::Prompt {
+                        title,
+                        kind,
+                        fields,
+                        focus,
+                    });
+                }
                 KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if let Some(field) = fields.get_mut(focus) {
                         field.value.insert(field.cursor, character);
@@ -1834,30 +1894,44 @@ impl App {
             }
             PromptKind::QuickRetrieve | PromptKind::QuickDeploy => {
                 let retrieve = matches!(kind, PromptKind::QuickRetrieve);
-                let component = values.first().map(String::as_str).unwrap_or("").trim();
-                let target = values.get(1).filter(|org| !org.is_empty()).cloned();
-                let (mode, paths, metadata) = if component.is_empty() {
-                    (
-                        PayloadMode::Source,
-                        split_names(&self.project_source_paths()),
-                        Vec::new(),
-                    )
-                } else if component.contains(':') || !component.contains('/') {
-                    (PayloadMode::Metadata, Vec::new(), split_names(component))
-                } else {
-                    (PayloadMode::Source, split_names(component), Vec::new())
-                };
-                self.deploy_state.selected_component = metadata.first().cloned();
-                {
-                    let options = &mut self.deploy_state.options;
-                    options.retrieve = retrieve;
-                    options.target_org = target;
-                    options.mode = mode;
-                    options.paths = paths;
-                    options.metadata_names = metadata;
+                let component_field = fields.first();
+                let mut components: Vec<String> = component_field
+                    .map(|field| field.selected.clone())
+                    .unwrap_or_default();
+                if components.is_empty() {
+                    components = values
+                        .first()
+                        .map(|value| split_names(value))
+                        .unwrap_or_default();
                 }
-                self.set_tab(Tab::Deploy);
-                self.notice("Ready — Enter runs");
+                if components.is_empty() {
+                    self.error("Select at least one component with Space, or type a name");
+                    return;
+                }
+                let mut argv: Vec<String> = vec![
+                    "project".to_owned(),
+                    if retrieve { "retrieve" } else { "deploy" }.to_owned(),
+                    "start".to_owned(),
+                ];
+                for component in components {
+                    argv.push("--metadata".to_owned());
+                    argv.push(component);
+                }
+                if let Some(org) = values.get(1).filter(|org| !org.is_empty()) {
+                    argv.push("--target-org".to_owned());
+                    argv.push(org.clone());
+                }
+                argv.push("--json".to_owned());
+                let command = format!("sf {}", argv.join(" "));
+                self.modal = Some(Modal::Confirm {
+                    title: if retrieve {
+                        "Confirm retrieve".to_owned()
+                    } else {
+                        "Confirm deploy".to_owned()
+                    },
+                    message: format!("{command}\n\nEnter runs · Esc back"),
+                    action: PendingAction::RunPrepared { argv },
+                });
             }
             PromptKind::CreateMetadata => {
                 let template_input = values.first().map(String::as_str).unwrap_or("");
@@ -2092,6 +2166,17 @@ impl App {
             PendingAction::RefreshOrgs => self.refresh_orgs(),
             PendingAction::RunTransfer => self.run_transfer(),
             PendingAction::RunInstaller { command } => self.run_installer(&command),
+            PendingAction::RunPrepared { argv } => {
+                let id = argv.iter().take(3).cloned().collect::<Vec<_>>().join(" ");
+                let display = format!("sf {}", argv.join(" "));
+                self.spawn(
+                    argv,
+                    JobPurpose::Command {
+                        id,
+                        command: display,
+                    },
+                );
+            }
         }
     }
 
@@ -2422,9 +2507,10 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
-        assert_eq!(app.deploy_state.options.mode, PayloadMode::Metadata);
-        assert!(!app.deploy_state.options.metadata_names.is_empty());
-        assert!(app.deploy_state.options.metadata_names[0].contains("Apex"));
+        match app.modal.as_ref() {
+            Some(Modal::Confirm { message, .. }) => assert!(message.contains("--metadata")),
+            other => panic!("expected confirmation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2438,7 +2524,7 @@ mod tests {
     }
 
     #[test]
-    fn quick_transfer_preselects_the_chosen_component() {
+    fn quick_transfer_builds_a_confirmation_without_the_picker() {
         let mut app = test_app();
         app.submit_prompt(
             &PromptKind::QuickRetrieve,
@@ -2447,16 +2533,33 @@ mod tests {
                 PromptField::new("Org", String::new()),
             ],
         );
-        assert_eq!(
-            app.deploy_state.selected_component.as_deref(),
-            Some("ApexClass:Demo")
-        );
-        assert!(
-            app.deploy_state
-                .options
-                .metadata_names
-                .contains(&"ApexClass:Demo".to_owned())
-        );
+        match app.modal.as_ref() {
+            Some(Modal::Confirm { title, message, .. }) => {
+                assert_eq!(title, "Confirm retrieve");
+                assert!(
+                    message.contains("sf project retrieve start --metadata ApexClass:Demo --json")
+                );
+            }
+            other => panic!("expected confirmation, got {other:?}"),
+        }
+        assert_eq!(app.tab, Tab::Home);
+    }
+
+    #[test]
+    fn space_toggles_multiple_components_before_confirming() {
+        let mut app = test_app();
+        app.tab = Tab::Home;
+        app.handle_key(key(KeyCode::Char('d')));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+        match app.modal.as_ref() {
+            Some(Modal::Confirm { message, .. }) => {
+                assert_eq!(message.matches("--metadata").count(), 2);
+            }
+            other => panic!("expected confirmation, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2465,7 +2568,8 @@ mod tests {
             crate::sf::metadata::SuggestionSet::new(
                 crate::sf::metadata::SuggestionKind::Transfer,
                 vec!["ApexClass:Demo".to_owned()],
-            ),
+            )
+            .into(),
         );
         field.value.push('X');
         field.mark_edited();
@@ -2482,7 +2586,8 @@ mod tests {
             crate::sf::metadata::SuggestionSet::new(
                 crate::sf::metadata::SuggestionKind::Transfer,
                 vec!["ApexClass:Demo".to_owned(), "Flow:Other".to_owned()],
-            ),
+            )
+            .into(),
         );
         assert_eq!(field.cached_suggestions().len(), 1);
         field.value = "Other".to_owned();
@@ -2501,11 +2606,12 @@ mod tests {
                 PromptField::new("Target org", String::new()),
             ],
         );
-        assert_eq!(app.deploy_state.options.mode, PayloadMode::Metadata);
-        assert_eq!(
-            app.deploy_state.options.metadata_names,
-            vec!["ApexClass:Demo"]
-        );
+        match app.modal.as_ref() {
+            Some(Modal::Confirm { message, .. }) => {
+                assert!(message.contains("--metadata ApexClass:Demo"));
+            }
+            other => panic!("expected confirmation, got {other:?}"),
+        }
     }
 
     #[test]

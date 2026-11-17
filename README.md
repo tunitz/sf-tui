@@ -93,11 +93,11 @@ scratch org with an alias, definition file and duration.
 ### Deploy or retrieve metadata
 
 From Home press `r` or `d`, then type part of a component name — for example `apex demo` or
-`flow`. `sftui` fuzzy-searches local source files, `package.xml` manifests and common metadata
-types, showing suggestions such as `ApexClass:Demo`. Use `↑↓` to pick a suggestion and `Enter` to
-accept; leave the field blank to use all package directories from `sfdx-project.json`. The target
-org defaults to your CLI default. The command is prepared on the Deploy/Retrieve screen; press
-`Enter` there to run. You can still pick a manifest or individual paths with `Space`.
+`flow`. `sftui` searches the local source files and `package.xml` manifests, showing matches with
+their source paths. Use `↑↓` to move, `Space` to check/uncheck as many components as you want, and
+`Enter` to confirm. A single dialog then shows the exact command (one `--metadata` per component,
+defaulting to the current org); press `Enter` to run or `Esc` to go back. There is no intermediate
+path picker in this flow — the project path comes from the matched file.
 
 Deploy uses `sf project deploy start --source-dir …` with `--dry-run` for validation, and an async
 job id triggers `sf project deploy report --json --job-id …` polling with a spinner and component

@@ -1599,8 +1599,27 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                     let chosen = active && field.suggestion_index.unwrap_or(0) == index;
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("    {} ", if chosen { ">" } else { " " }),
-                            Style::default().fg(if chosen { accent(app) } else { Color::DarkGray }),
+                            format!(
+                                "    {} ",
+                                if field.multi_select {
+                                    if field.selected.contains(&suggestion.value) {
+                                        "[x]"
+                                    } else {
+                                        "[ ]"
+                                    }
+                                } else if chosen {
+                                    ">"
+                                } else {
+                                    " "
+                                }
+                            ),
+                            Style::default().fg(
+                                if chosen || field.selected.contains(&suggestion.value) {
+                                    accent(app)
+                                } else {
+                                    Color::DarkGray
+                                },
+                            ),
                         ),
                         Span::styled(
                             truncated(
@@ -1626,7 +1645,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                 lines.push(Line::from(" "));
             }
             lines.push(Line::from(faint(
-                "Enter accept/submit · ↑↓ suggestions · Tab next field · Esc cancel",
+                "Space select · Enter confirm · ↑↓ suggestions · Tab next field · Esc cancel",
             )));
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block(title.clone(), app)),

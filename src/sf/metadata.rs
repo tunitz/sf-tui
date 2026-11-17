@@ -27,13 +27,27 @@ pub enum SuggestionKind {
 pub struct SuggestionItem {
     pub value: String,
     pub path: String,
+    value_lower: String,
+    name_lower: String,
+    path_lower: String,
 }
 
 impl SuggestionItem {
     pub fn new(value: impl Into<String>, path: impl Into<String>) -> Self {
+        let value = value.into();
+        let path = path.into();
+        let value_lower = value.to_ascii_lowercase();
+        let name_lower = value
+            .split_once(':')
+            .map_or(value_lower.as_str(), |(_, name)| name)
+            .to_ascii_lowercase();
+        let path_lower = path.to_ascii_lowercase();
         Self {
-            value: value.into(),
-            path: path.into(),
+            value,
+            path,
+            value_lower,
+            name_lower,
+            path_lower,
         }
     }
 }
@@ -56,42 +70,61 @@ impl SuggestionSet {
         }
     }
 
-    /// Rank candidates by fuzzy score, preferring real project components and name matches.
+    /// Fast substring ranking first; fuzzy matching only fills remaining slots.
     pub fn filter(&self, query: &str, limit: usize) -> Vec<SuggestionItem> {
-        let tokens: Vec<&str> = query.split_whitespace().collect();
         let query_lower = query.trim().to_ascii_lowercase();
-        let mut scored: Vec<(SuggestionItem, i64)> = self
-            .items
-            .iter()
-            .filter_map(|item| {
+        if query_lower.is_empty() {
+            return self
+                .items
+                .iter()
+                .filter(|item| !item.path.is_empty() || self.kind == SuggestionKind::Create)
+                .take(limit)
+                .cloned()
+                .collect();
+        }
+        let mut scored: Vec<(SuggestionItem, i64)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for item in &self.items {
+            let score = if item.name_lower == query_lower {
+                100_000
+            } else if item.name_lower.contains(&query_lower) {
+                50_000
+            } else if item.value_lower.contains(&query_lower) {
+                20_000
+            } else if item.path_lower.contains(&query_lower) {
+                5_000
+            } else {
+                continue;
+            };
+            if seen.insert(item.value.clone()) {
+                scored.push((item.clone(), score));
+            }
+        }
+        if scored.len() < limit {
+            let tokens: Vec<&str> = query_lower.split_whitespace().collect();
+            for item in &self.items {
+                if seen.contains(&item.value) {
+                    continue;
+                }
                 let mut total = 0i64;
+                let mut matched = true;
                 for token in &tokens {
-                    let score =
-                        MATCHER.with(|matcher| matcher.borrow().fuzzy_match(&item.value, token))?;
-                    total = total.checked_add(score)?;
-                }
-                if !query_lower.is_empty() {
-                    let value_lower = item.value.to_ascii_lowercase();
-                    let name = item
-                        .value
-                        .split_once(':')
-                        .map_or(item.value.as_str(), |(_, name)| name);
-                    let name_lower = name.to_ascii_lowercase();
-                    if name_lower == query_lower {
-                        total += 5_000;
-                    } else if name_lower.contains(&query_lower) {
-                        total += 2_500;
-                    } else if value_lower.contains(&query_lower) {
-                        total += 1_000;
-                    }
-                    if item.path.to_ascii_lowercase().contains(&query_lower) {
-                        total += 250;
+                    match MATCHER
+                        .with(|matcher| matcher.borrow().fuzzy_match(&item.value_lower, token))
+                    {
+                        Some(score) => total = total.saturating_add(score),
+                        None => {
+                            matched = false;
+                            break;
+                        }
                     }
                 }
-                Some((item.clone(), total))
-            })
-            .collect();
-        scored.sort_by(|left, right| {
+                if matched && seen.insert(item.value.clone()) {
+                    scored.push((item.clone(), total));
+                }
+            }
+        }
+        scored.sort_unstable_by(|left, right| {
             right
                 .1
                 .cmp(&left.1)
