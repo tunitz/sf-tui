@@ -38,7 +38,7 @@ It is generated from the public sfcli command reference:
 4. Run `cargo test sf::catalog` and check that the catalog has more than 250 commands.
 
 The bundled snapshot is always used at startup. A cached `sf commands --json` response is read
-when it is younger than seven days, and F5 in the Catalog tab performs an explicit live refresh
+when it is younger than seven days, and F5 on the Catalog screen performs an explicit live refresh
 that replaces the catalog and updates the cache. JSON extraction tolerates bracketed warning
 lines before the document.
 

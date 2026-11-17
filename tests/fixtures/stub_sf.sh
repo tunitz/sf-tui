@@ -18,19 +18,19 @@ case "$*" in
   "org display --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"username":"test-scratch@example.invalid","instanceUrl":"https://example.invalid.my.salesforce.com","id":"00D000000000001","accessToken":"SYNTHETIC-DO-NOT-USE"}}'
     ;;
-  "project deploy start --source-dir force-app --json" | "project deploy start --source-dir force-app --target-org test-scratch --json")
+  "project deploy start --source-dir force-app --json" | "project deploy start --source-dir force-app --target-org test-scratch --json" | "project deploy start --metadata ApexClass --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Queued"}}'
     ;;
   "project retrieve start --metadata ApexClass --json" | "project retrieve start --metadata CustomLabel --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000002","status":"Succeeded"}}'
     ;;
-  "apex run test --result-format json --wait 10 --json" | "apex run test --result-format json --wait 10 --class-names DemoTest --target-org test-scratch --json")
+  "apex run test --result-format json --code-coverage --wait 10 --json" | "apex run test --result-format json --code-coverage --wait 10 --class-names DemoTest --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"81%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"codecoverage":[{"name":"Demo","percentage":"81%","numLinesCovered":17,"numLinesUncovered":4}]}}'
     ;;
   "apex run test --result-format human --wait 10 --class-names DemoTest --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}'
     ;;
-  "project deploy report --job-id 0Af000000000001 --json")
+  "project deploy report --job-id 0Af000000000001 --json" | "project deploy report --job-id 0Af000000000001 --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}'
     ;;
   project*retrieve*start*metadata*)

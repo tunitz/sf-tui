@@ -91,11 +91,61 @@ pub fn transfer_result(
     retrieve: bool,
     report: &TransferReport,
     job_id: Option<&str>,
+    requested: &[String],
 ) -> ResultView {
     let ok = !report.status.eq_ignore_ascii_case("failed")
         && !report.status.eq_ignore_ascii_case("error")
         && report.failed == 0;
-    let items = if report.components.is_empty() {
+    let component_row = |component: &crate::sf::deploy::ComponentResult| {
+        let failed = matches!(
+            component.status.to_ascii_lowercase().as_str(),
+            "failed" | "error" | "failure"
+        );
+        ResultItem {
+            ok: !failed && component.problem.is_empty(),
+            label: if component.component_type.is_empty() {
+                component.name.clone()
+            } else {
+                format!("{}:{}", component.component_type, component.name)
+            },
+            detail: if component.problem.is_empty() {
+                component.status.clone()
+            } else {
+                format!("{} — {}", component.status, component.problem)
+            },
+            progress: None,
+        }
+    };
+
+    let items = if !requested.is_empty() {
+        requested
+            .iter()
+            .map(|name| {
+                report
+                    .components
+                    .iter()
+                    .find(|component| {
+                        let full = if component.component_type.is_empty() {
+                            component.name.clone()
+                        } else {
+                            format!("{}:{}", component.component_type, component.name)
+                        };
+                        &full == name || &component.name == name
+                    })
+                    .map(component_row)
+                    .unwrap_or_else(|| ResultItem {
+                        ok,
+                        label: name.clone(),
+                        detail: if report.status.is_empty() {
+                            if ok { "Succeeded" } else { "Failed" }.to_owned()
+                        } else {
+                            report.status.clone()
+                        },
+                        progress: None,
+                    })
+            })
+            .collect()
+    } else if report.components.is_empty() {
         vec![ResultItem {
             ok,
             label: if retrieve {
@@ -107,30 +157,18 @@ pub fn transfer_result(
             progress: None,
         }]
     } else {
-        report
-            .components
-            .iter()
-            .map(|component| {
-                let failed = matches!(
-                    component.status.to_ascii_lowercase().as_str(),
-                    "failed" | "error" | "failure"
-                );
-                ResultItem {
-                    ok: !failed && component.problem.is_empty(),
-                    label: if component.component_type.is_empty() {
-                        component.name.clone()
-                    } else {
-                        format!("{}:{}", component.component_type, component.name)
-                    },
-                    detail: if component.problem.is_empty() {
-                        component.status.clone()
-                    } else {
-                        format!("{} — {}", component.status, component.problem)
-                    },
-                    progress: None,
-                }
-            })
-            .collect()
+        report.components.iter().map(component_row).collect()
+    };
+
+    let (total, succeeded, failed) = if requested.is_empty() || report.total > 0 {
+        (report.total, report.succeeded, report.failed)
+    } else {
+        let count = requested.len();
+        if ok {
+            (count, count, 0)
+        } else {
+            (count, 0, count)
+        }
     };
     ResultView {
         kind: if retrieve {
@@ -145,10 +183,7 @@ pub fn transfer_result(
         },
         status: report.status.clone(),
         ok,
-        summary: format!(
-            "{} total · {} succeeded · {} failed",
-            report.total, report.succeeded, report.failed
-        ),
+        summary: format!("{total} total · {succeeded} succeeded · {failed} failed"),
         items,
         coverage: Vec::new(),
         sections: Vec::new(),
@@ -157,7 +192,34 @@ pub fn transfer_result(
 
 pub fn apex_result(run: &TestRun) -> ResultView {
     let ok = run.outcome.eq_ignore_ascii_case("Passed") || run.outcome.eq_ignore_ascii_case("Pass");
-    let items = run
+    let mut classes: Vec<(String, usize, usize, bool)> = Vec::new();
+    for test in &run.tests {
+        let class = test
+            .name
+            .split_once('.')
+            .map_or(test.name.as_str(), |(class, _)| class);
+        let passed = !matches!(
+            test.outcome.to_ascii_lowercase().as_str(),
+            "fail" | "failed" | "compilefail"
+        );
+        if let Some(entry) = classes.iter_mut().find(|entry| entry.0 == class) {
+            entry.1 += 1;
+            entry.2 += usize::from(passed);
+            entry.3 &= passed;
+        } else {
+            classes.push((class.to_owned(), 1, usize::from(passed), passed));
+        }
+    }
+    let class_rows: Vec<ResultItem> = classes
+        .into_iter()
+        .map(|(class, total, passed, class_ok)| ResultItem {
+            ok: class_ok,
+            label: class,
+            detail: format!("{passed}/{total} methods passed"),
+            progress: None,
+        })
+        .collect();
+    let method_rows: Vec<ResultItem> = run
         .tests
         .iter()
         .map(|test| ResultItem {
@@ -196,6 +258,13 @@ pub fn apex_result(run: &TestRun) -> ResultView {
             },
         })
         .collect();
+    let mut sections = Vec::new();
+    if !method_rows.is_empty() {
+        sections.push(ResultSection {
+            title: "TEST METHODS".to_owned(),
+            rows: method_rows,
+        });
+    }
     ResultView {
         kind: ResultKind::ApexTests,
         title: "Apex tests".to_owned(),
@@ -205,9 +274,9 @@ pub fn apex_result(run: &TestRun) -> ResultView {
             "{} run · {} passed · {} failed · {} skipped · coverage {}",
             run.tests_run, run.passing, run.failing, run.skipped, run.coverage
         ),
-        items,
+        items: class_rows,
         coverage,
-        sections: Vec::new(),
+        sections,
     }
 }
 
@@ -246,8 +315,50 @@ mod tests {
             }],
             ..TransferReport::default()
         };
-        let view = transfer_result(false, &report, None);
+        let view = transfer_result(false, &report, None, &[]);
         assert!(!view.ok);
         assert!(view.items.iter().any(|item| !item.ok));
+    }
+
+    #[test]
+    fn transfer_result_lists_every_requested_item_when_the_cli_reports_none() {
+        let report = TransferReport {
+            status: "Succeeded".to_owned(),
+            ..TransferReport::default()
+        };
+        let requested = vec![
+            "ApexClass:One".to_owned(),
+            "ApexClass:Two".to_owned(),
+            "Flow:Three".to_owned(),
+        ];
+        let view = transfer_result(true, &report, None, &requested);
+        assert!(view.ok);
+        assert_eq!(view.items.len(), 3);
+        assert!(view.items.iter().all(|item| item.ok));
+        assert_eq!(view.summary, "3 total · 3 succeeded · 0 failed");
+    }
+
+    #[test]
+    fn transfer_result_marks_a_requested_item_from_the_cli_status() {
+        let report = TransferReport {
+            status: "Failed".to_owned(),
+            total: 2,
+            succeeded: 1,
+            failed: 1,
+            components: vec![crate::sf::deploy::ComponentResult {
+                name: "Two".to_owned(),
+                component_type: "ApexClass".to_owned(),
+                status: "Failed".to_owned(),
+                problem: "compile error".to_owned(),
+            }],
+            ..TransferReport::default()
+        };
+        let requested = vec!["ApexClass:One".to_owned(), "ApexClass:Two".to_owned()];
+        let view = transfer_result(false, &report, None, &requested);
+        assert_eq!(view.items.len(), 2);
+        // The CLI reported no per-item status for One, so it follows the overall failure.
+        assert!(!view.items[0].ok);
+        assert!(!view.items[1].ok);
+        assert!(view.items[1].detail.contains("compile error"));
     }
 }

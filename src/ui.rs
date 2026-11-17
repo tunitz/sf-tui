@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs,
+    Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
 
 use crate::app::{App, CatalogRow, Modal, Tab};
@@ -40,9 +40,7 @@ fn short_tab(tab: Tab) -> &'static str {
         Tab::Deploy => "Deploy",
         Tab::Tests => "Tests",
         Tab::Catalog => "Cat",
-        Tab::Favorites => "Fav",
         Tab::Orgs => "Orgs",
-        Tab::Output => "Out",
         Tab::Setup => "Setup",
     }
 }
@@ -80,25 +78,23 @@ fn truncated(text: &str, max: usize) -> String {
 /// Draw the complete frame, including any modal overlay.
 pub fn draw(frame: &mut Frame, app: &App) {
     let density = density(frame.area());
-    let (header_height, footer_height) = match density {
-        Density::Roomy | Density::Compact => (2, 2),
-        Density::Tiny => (1, 1),
+    let footer_height = match density {
+        Density::Roomy | Density::Compact => 2,
+        Density::Tiny => 1,
     };
     let layout = Layout::vertical([
-        Constraint::Length(header_height),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(footer_height),
     ])
     .split(frame.area());
-    draw_header(frame, layout[0], app, density);
+    draw_header(frame, layout[0], app);
     match app.tab {
         Tab::Home => draw_home(frame, layout[1], app),
         Tab::Retrieve | Tab::Deploy => draw_transfer(frame, layout[1], app),
         Tab::Tests => draw_tests(frame, layout[1], app),
         Tab::Catalog => draw_catalog(frame, layout[1], app),
-        Tab::Favorites => draw_favorites(frame, layout[1], app),
         Tab::Orgs => draw_orgs(frame, layout[1], app),
-        Tab::Output => draw_output(frame, layout[1], app),
         Tab::Setup => draw_setup(frame, layout[1], app),
     }
     draw_footer(frame, layout[2], app, density);
@@ -117,7 +113,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App, density: Density) {
+fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     let version = app.startup.version.as_deref().unwrap_or("detecting…");
     let project = if app.deploy_state.project_loading {
         "scanning…".to_owned()
@@ -133,62 +129,20 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App, density: Density) {
     let activity = if !app.startup_stage.done {
         format!("{spinner} {}", app.startup_stage.label)
     } else if app.busy() {
-        format!(
-            "{spinner} running {}",
-            app.active_job_label().unwrap_or_default()
-        )
+        format!("{spinner} {} job(s)", app.job_count())
     } else {
         "ready".to_owned()
     };
-
-    if density == Density::Tiny {
-        let text = format!(
-            "SFTUI {} | {} | {activity}",
-            short_tab(app.tab),
-            app.org_display()
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncated(&text, area.width.saturating_sub(1) as usize),
-                Style::default().fg(accent(app)),
-            ))),
-            area,
-        );
-        return;
-    }
-
     let info = Line::from(vec![
         strong("SFTUI", accent(app)),
         faint(format!(
-            " v{} | sf {version} | project {project} | org {} | {activity}",
+            " v{} | {} | sf {version} | project {project} | org {} | {activity}",
             env!("CARGO_PKG_VERSION"),
+            short_tab(app.tab),
             app.org_display()
         )),
     ]);
-    let tabs = app.tabs();
-    let labels: Vec<String> = tabs
-        .iter()
-        .enumerate()
-        .map(|(index, tab)| {
-            if density == Density::Roomy {
-                format!("[{}] {}", index + 1, tab.label())
-            } else {
-                format!("[{}]{}", index + 1, short_tab(*tab))
-            }
-        })
-        .collect();
-    let tabs = Tabs::new(labels)
-        .select(tabs.iter().position(|tab| *tab == app.tab).unwrap_or(0))
-        .style(Style::default().fg(Color::Gray))
-        .highlight_style(
-            Style::default()
-                .fg(accent(app))
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )
-        .divider("│");
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-    frame.render_widget(Paragraph::new(info), sections[0]);
-    frame.render_widget(tabs, sections[1]);
+    frame.render_widget(Paragraph::new(info), area);
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
@@ -227,22 +181,21 @@ fn key_hints(app: &App) -> String {
     let typing = matches!(app.tab, Tab::Retrieve | Tab::Deploy | Tab::Tests)
         || (app.tab == Tab::Catalog && app.catalog_state.search_focused);
     let common = if typing {
-        "Esc back · Ctrl+Y copy · Ctrl+X cancel · Ctrl+C cancel/quit"
+        "F2 history · Esc back · Ctrl+Y copy · Ctrl+X cancel"
     } else {
-        "Tab next · ? help · q quit · y copy · Ctrl+X cancel · Esc back"
+        "? help · q quit · y copy · F2 history · Ctrl+X cancel · Esc back"
     };
     let specific = match app.tab {
-        Tab::Home => "r retrieve · d deploy · t tests · c create · o orgs · a login · g results",
+        Tab::Home => "↑↓ move · Enter open · F2 history",
         Tab::Retrieve | Tab::Deploy | Tab::Tests => {
             "type · Enter search · Space select · Enter confirm"
         }
         Tab::Catalog => "/ search · Enter help · r run · f favorite",
-        Tab::Favorites => "Enter run · Ctrl+↑↓ reorder · e preset · x remove",
         Tab::Orgs => "Enter details · o open · d default · l login · x logout · F5 refresh",
-        Tab::Output => "↑↓ records · j/k scroll · o details · z JSON · r rerun · v history",
         Tab::Setup => "Enter run installer · r re-probe",
     };
-    format!("{common}   |   {specific}")
+    // Screen-specific keys come first so a narrow terminal truncates the generic hints instead.
+    format!("{specific}   |   {common}")
 }
 
 fn keycap(key: &str, label: &str, color: Color) -> Span<'static> {
@@ -279,9 +232,9 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
             faint(format!("   project {project} · org {}", app.org_display())),
         ]),
         Line::from(" "),
-        strong_line("QUICK ACTIONS", accent(app)),
+        strong_line("MENU", accent(app)),
     ];
-    for (index, action) in crate::app::QUICK_ACTIONS.iter().enumerate() {
+    for (index, item) in crate::app::MENU_ITEMS.iter().enumerate() {
         let selected = index == app.home_state.selected;
         lines.push(Line::from(vec![
             Span::styled(
@@ -293,7 +246,7 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
                 }),
             ),
             Span::styled(
-                format!("[{}] ", action.key),
+                format!("[{}] ", item.key),
                 Style::default()
                     .fg(if selected {
                         accent(app)
@@ -303,7 +256,7 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                action.label,
+                item.label,
                 if selected {
                     Style::default()
                         .fg(accent(app))
@@ -321,36 +274,28 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
             area.width.saturating_sub(2) as usize,
         ))));
     }
-    if !app.config.recent_runs.is_empty() {
+    if app.busy() {
         lines.push(Line::from(" "));
-        lines.push(strong_line("RECENT", accent(app)));
-        for run in app.config.recent_runs.iter().take(3) {
-            let ok = run.exit_code == Some(0);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if ok { "[✓] " } else { "[✗] " },
-                    Style::default().fg(if ok { Color::Green } else { Color::Red }),
-                ),
-                Span::styled(
-                    truncated(&run.command, area.width.saturating_sub(6) as usize),
-                    Style::default(),
-                ),
-            ]));
-        }
+        lines.push(Line::from(faint(format!(
+            "{} job(s) running or queued",
+            app.job_count()
+        ))));
     }
     lines.push(Line::from(" "));
     lines.push(Line::from(faint(
-        "↑↓ move · Enter run · ? help · q quit · y copy",
+        "↑↓ move · Enter open · F2 history · ? help · q quit",
     )));
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
     let state = &app.test_search;
+    let latest = latest_result_lines(app, crate::app::TaskKind::Tests);
     let sections = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(2),
+        Constraint::Length(latest.len() as u16),
         Constraint::Length(1),
     ])
     .split(area);
@@ -427,6 +372,9 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
         sections[2],
         &mut list_state,
     );
+    if !latest.is_empty() {
+        frame.render_widget(Paragraph::new(Text::from(latest)), sections[3]);
+    }
     frame.render_widget(
         Line::from(vec![
             faint(format!("{} selected", state.checked().len())),
@@ -438,7 +386,7 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
                 "              [Space] select   [Enter] confirm"
             }),
         ]),
-        sections[3],
+        sections[4],
     );
 }
 
@@ -720,134 +668,6 @@ fn strong_line(text: &str, color: Color) -> Line<'static> {
     ))
 }
 
-fn draw_favorites(frame: &mut Frame, area: Rect, app: &App) {
-    let density = density(area);
-    if density != Density::Roomy {
-        let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(2)]).split(area);
-        frame.render_widget(
-            Paragraph::new(Line::from(strong(
-                "Favorites — Enter run | e preset | x remove",
-                accent(app),
-            ))),
-            sections[0],
-        );
-        let items: Vec<ListItem> = app
-            .config
-            .favorites
-            .iter()
-            .enumerate()
-            .map(|(index, favorite)| {
-                let flags = favorite.preset_flags.join(" ");
-                ListItem::new(Line::from(vec![
-                    strong(format!("{} ", index + 1), accent(app)),
-                    Span::styled(favorite.id.clone(), Style::default().fg(Color::Reset)),
-                    faint(truncated(&format!("  {flags}"), 24)),
-                ]))
-            })
-            .collect();
-        let mut state = ListState::default();
-        state.select(if app.config.favorites.is_empty() {
-            None
-        } else {
-            Some(app.favorites_state.selected)
-        });
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(block("starred", app))
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-                .highlight_symbol("›"),
-            sections[1],
-            &mut state,
-        );
-        return;
-    }
-    let columns =
-        Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).split(area);
-    let items: Vec<ListItem> = app
-        .config
-        .favorites
-        .iter()
-        .enumerate()
-        .map(|(index, favorite)| {
-            let flags = if favorite.preset_flags.is_empty() {
-                "no preset flags".to_owned()
-            } else {
-                favorite.preset_flags.join(" ")
-            };
-            ListItem::new(vec![
-                Line::from(Span::styled(
-                    format!("{} {}", index + 1, favorite.id),
-                    Style::default().fg(Color::Reset),
-                )),
-                Line::from(Span::styled(
-                    format!("    {flags}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        })
-        .collect();
-    let mut state = ListState::default();
-    state.select(if app.config.favorites.is_empty() {
-        None
-    } else {
-        Some(app.favorites_state.selected)
-    });
-    let list = List::new(items)
-        .block(block("starred commands", app))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("› ");
-    frame.render_stateful_widget(list, columns[0], &mut state);
-    let mut lines = vec![
-        strong_line("ONE-KEY RUN", accent(app)),
-        Line::from(faint(
-            "Enter runs the selected favorite with its preset flags.",
-        )),
-        Line::from(" "),
-    ];
-    if let Some(id) = app.selected_favorite_id() {
-        let favorite = app
-            .config
-            .favorites
-            .iter()
-            .find(|favorite| favorite.id == id);
-        lines.push(Line::from(strong(format!("sf {}", id), Color::Reset)));
-        if let Some(favorite) = favorite {
-            lines.push(Line::from(faint(format!(
-                "flags: {}",
-                favorite.preset_flags.join(" ")
-            ))));
-        }
-        if let Some(command) = app.startup.catalog.command(&id) {
-            lines.push(Line::from(" "));
-            lines.push(Line::from(Span::styled(
-                truncated(
-                    &command.summary,
-                    columns[1].width.saturating_sub(4) as usize,
-                ),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-    } else {
-        lines.push(Line::from(faint(
-            "Press f in the Catalog to star a command.",
-        )));
-    }
-    lines.push(Line::from(" "));
-    lines.push(action_bar(
-        vec![
-            ("Enter", "run"),
-            ("e", "preset"),
-            ("x", "remove"),
-            ("y", "copy"),
-        ],
-        app,
-    ));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(block("favorite detail", app)),
-        columns[1],
-    );
-}
-
 fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
     let density = density(area);
     if density != Density::Roomy {
@@ -1009,12 +829,48 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn latest_result_lines(app: &App, kind: crate::app::TaskKind) -> Vec<Line<'static>> {
+    let Some(result) = app.latest_result(kind) else {
+        return Vec::new();
+    };
+    let color = if result.ok { Color::Green } else { Color::Red };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("[{}] ", if result.ok { "✓" } else { "✗" }),
+            Style::default().fg(color),
+        ),
+        strong("LATEST RESULT ", accent(app)),
+        Span::styled(
+            format!("{} · {}", result.status, result.summary),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled("   F2 history", Style::default().fg(Color::DarkGray)),
+    ])];
+    for item in result.items.iter().take(4) {
+        lines.push(result_item_line(item));
+    }
+    if result.items.len() > 4 {
+        lines.push(Line::from(faint(format!(
+            "   … {} more · F2 opens the full result",
+            result.items.len() - 4
+        ))));
+    }
+    lines
+}
+
 fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
     let state = &app.transfer_search;
+    let kind = if state.retrieve {
+        crate::app::TaskKind::Retrieve
+    } else {
+        crate::app::TaskKind::Deploy
+    };
+    let latest = latest_result_lines(app, kind);
     let sections = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(2),
+        Constraint::Length(latest.len() as u16),
         Constraint::Length(1),
     ])
     .split(area);
@@ -1096,6 +952,9 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         sections[2],
         &mut list_state,
     );
+    if !latest.is_empty() {
+        frame.render_widget(Paragraph::new(Text::from(latest)), sections[3]);
+    }
     let count = state.checked().len();
     frame.render_widget(
         Line::from(vec![
@@ -1108,7 +967,7 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
                 "                  [Space] select   [Enter] confirm"
             }),
         ]),
-        sections[3],
+        sections[4],
     );
 }
 
@@ -1249,17 +1108,13 @@ fn result_item_line(item: &crate::app::ResultItem) -> Line<'static> {
 fn pinned_lines(
     frame: &mut Frame,
     area: Rect,
-    app: &App,
     lines: Vec<Line<'static>>,
     hints: String,
+    scroll: usize,
 ) {
     let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
     let max_scroll = lines.len().saturating_sub(usize::from(sections[0].height));
-    let scroll = app
-        .output_state
-        .scroll
-        .min(max_scroll)
-        .min(u16::MAX as usize) as u16;
+    let scroll = scroll.min(max_scroll).min(u16::MAX as usize) as u16;
     frame.render_widget(
         Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
         sections[0],
@@ -1273,6 +1128,7 @@ fn draw_result_view(
     app: &App,
     record: &crate::app::OutputRecord,
     result: &crate::app::ResultView,
+    scroll: usize,
 ) {
     let color = if result.ok { Color::Green } else { Color::Red };
     let mut lines = vec![
@@ -1349,17 +1205,23 @@ fn draw_result_view(
             }
         }
     }
-    let mut hints = "[j/k/PgDn] scroll   [o] raw   [z] JSON   [r] rerun".to_owned();
+    let mut hints = "[j/k/PgDn] scroll   [o] raw output   [z] JSON".to_owned();
     if result.kind == crate::app::ResultKind::ApexTests {
-        hints.push_str("   [v] history");
+        hints.push_str("   [v] saved runs");
     }
     hints.push_str("   [Esc] back");
-    pinned_lines(frame, area, app, lines, hints);
+    pinned_lines(frame, area, lines, hints, scroll);
 }
 
-fn draw_output_detail(frame: &mut Frame, area: Rect, app: &App, record: &crate::app::OutputRecord) {
+fn draw_output_detail(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    record: &crate::app::OutputRecord,
+    scroll: usize,
+) {
     if let Some(result) = &record.result {
-        draw_result_view(frame, area, app, record, result);
+        draw_result_view(frame, area, app, record, result, scroll);
         return;
     }
     let label = match (record.finished, record.exit_code) {
@@ -1378,7 +1240,7 @@ fn draw_output_detail(frame: &mut Frame, area: Rect, app: &App, record: &crate::
         strong(record.purpose.to_uppercase(), accent(app))
             + Span::styled(" — ", Style::default().fg(Color::DarkGray))
             + strong(label, color),
-        Line::from(faint(&record.command)),
+        Line::from(faint(record.display_command())),
         Line::from(" "),
     ];
     if app.output_state.show_details || !record.finished {
@@ -1411,69 +1273,10 @@ fn draw_output_detail(frame: &mut Frame, area: Rect, app: &App, record: &crate::
             }
         }
     } else {
-        lines.push(Line::from(faint(
-            "[o] details   [z] JSON   [r] rerun   [Esc] back",
-        )));
+        lines.push(Line::from(faint("[o] details   [z] JSON   [Esc] back")));
     }
-    let hints = "[↑↓ records]   [j/k] scroll   [o] details   [z] JSON   [r] rerun   [Esc] back";
-    pinned_lines(frame, area, app, lines, hints.to_owned());
-}
-
-fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
-    if app.output_state.records.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No commands yet. Press r to retrieve or d to deploy from Home.")
-                .block(block("output", app)),
-            area,
-        );
-        return;
-    }
-    let selected = app
-        .output_state
-        .selected
-        .min(app.output_state.records.len().saturating_sub(1));
-    let Some(record) = app.output_state.records.get(selected) else {
-        return;
-    };
-    if density(area) == Density::Roomy && app.output_state.records.len() > 1 {
-        let columns = Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)])
-            .split(area);
-        let width = columns[0].width.saturating_sub(3) as usize;
-        let items: Vec<ListItem> = app
-            .output_state
-            .records
-            .iter()
-            .map(|record| {
-                ListItem::new(Line::from(Span::styled(
-                    truncated(&record.label(), width),
-                    Style::default(),
-                )))
-            })
-            .collect();
-        let mut state = ListState::default();
-        state.select(Some(selected));
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(block("commands", app))
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-                .highlight_symbol("› "),
-            columns[0],
-            &mut state,
-        );
-        draw_output_detail(frame, columns[1], app, record);
-        return;
-    }
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-    frame.render_widget(
-        Paragraph::new(Line::from(faint(format!(
-            "record {}/{} — ↑↓ switch · {}",
-            selected + 1,
-            app.output_state.records.len(),
-            record.label()
-        )))),
-        sections[0],
-    );
-    draw_output_detail(frame, sections[1], app, record);
+    let hints = "[j/k] scroll   [o] details   [z] JSON   [Esc] back";
+    pinned_lines(frame, area, lines, hints.to_owned(), scroll);
 }
 
 fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
@@ -1583,6 +1386,110 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
+fn record_status(record: &crate::app::OutputRecord) -> (&'static str, Color) {
+    if record.queued {
+        ("…", Color::Yellow)
+    } else if !record.finished {
+        ("▶", Color::Yellow)
+    } else {
+        match record.exit_code {
+            Some(0) => ("✓", Color::Green),
+            Some(_) => ("✗", Color::Red),
+            None => ("■", Color::Yellow),
+        }
+    }
+}
+
+fn draw_task_history(frame: &mut Frame, app: &App, kind: crate::app::TaskKind, selected: usize) {
+    let records = app.task_records(kind);
+    let saved = if kind == crate::app::TaskKind::Tests {
+        app.test_runs.len()
+    } else {
+        0
+    };
+    let total = records.len() + saved;
+    let area = centered(
+        frame.area(),
+        110,
+        (total as u16 + 4).min(frame.area().height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, area);
+    let width = area.width.saturating_sub(4) as usize;
+    let mut items: Vec<ListItem> = Vec::with_capacity(total);
+    for record in &records {
+        let (icon, color) = record_status(record);
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("[{icon}] "), Style::default().fg(color)),
+            Span::styled(
+                truncated(&record.label(), width.saturating_sub(4)),
+                Style::default(),
+            ),
+        ])));
+    }
+    if kind == crate::app::TaskKind::Tests {
+        for run in &app.test_runs {
+            let passed = run.outcome.eq_ignore_ascii_case("Passed")
+                || run.outcome.eq_ignore_ascii_case("Pass");
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    if passed { "[✓] " } else { "[✗] " },
+                    Style::default().fg(if passed { Color::Green } else { Color::Red }),
+                ),
+                Span::styled(
+                    format!(
+                        "saved  {}",
+                        truncated(&run.command, width.saturating_sub(10))
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])));
+        }
+    }
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(selected.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block(
+                format!(
+                    "{} history — Enter open · x cancel · Esc close",
+                    kind.label()
+                ),
+                app,
+            ))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("› "),
+        area,
+        &mut state,
+    );
+}
+
+fn draw_job_result(
+    frame: &mut Frame,
+    app: &App,
+    kind: crate::app::TaskKind,
+    record_id: u64,
+    scroll: usize,
+) {
+    let Some(record) = app
+        .output_state
+        .records
+        .iter()
+        .find(|record| record.id == record_id)
+    else {
+        return;
+    };
+    let area = centered(frame.area(), 110, frame.area().height.saturating_sub(2));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        block(format!("{} — job #{record_id}", kind.label()), app),
+        area,
+    );
+    let inner = block(format!("{} — job #{record_id}", kind.label()), app).inner(area);
+    draw_output_detail(frame, inner, app, record, scroll);
+}
+
 fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
     match modal {
         Modal::Help { scroll } => {
@@ -1631,36 +1538,15 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                 area,
             );
         }
-        Modal::OrgMenu { selected } => {
-            let items = crate::app::ORG_MENU;
-            let lines: Vec<Line> = items
-                .iter()
-                .enumerate()
-                .map(|(index, label)| {
-                    Line::from(Span::styled(
-                        format!(
-                            "{} [{}] {}",
-                            if index == *selected { "›" } else { " " },
-                            index + 1,
-                            label
-                        ),
-                        Style::default().fg(if index == *selected {
-                            accent(app)
-                        } else {
-                            Color::Reset
-                        }),
-                    ))
-                })
-                .chain(std::iter::once(Line::from(faint(
-                    "↑↓ move   Enter select   Esc close",
-                ))))
-                .collect();
-            let area = centered(frame.area(), 52, lines.len() as u16 + 2);
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                Paragraph::new(Text::from(lines)).block(block("Org", app)),
-                area,
-            );
+        Modal::TaskHistory { kind, selected } => {
+            draw_task_history(frame, app, *kind, *selected);
+        }
+        Modal::JobResult {
+            kind,
+            record_id,
+            scroll,
+        } => {
+            draw_job_result(frame, app, *kind, *record_id, *scroll);
         }
         Modal::TestHistory { runs, selected } => {
             let mut lines = vec![
@@ -2008,17 +1894,13 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
 
 const HELP_ROWS: &[(&str, &str)] = &[
     (
-        "Home r/d/t/c/o/a/g",
-        "retrieve · deploy · tests · create · orgs · login · results",
+        "Menu r/d/c/t/o/l",
+        "retrieve · deploy · create · tests · organization · catalog",
     ),
-    ("Tab / 1-9", "next screen / jump directly"),
-    ("Enter", "the highlighted action"),
+    ("Enter", "the highlighted menu entry"),
     ("?", "show this help; any key closes it"),
-    ("h", "go Home from any screen"),
-    (
-        "Esc",
-        "back one level; a job is never cancelled by navigation",
-    ),
+    ("h", "go to the Menu from any screen"),
+    ("Esc", "back to the previous screen; jobs keep running"),
     ("q", "quit; asks first while a job is running"),
     (
         "Ctrl+X / Ctrl+C",
@@ -2027,6 +1909,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("y", "copy the current command/selection"),
     ("Ctrl+Y", "copy while typing in a search field"),
     ("F5", "refresh orgs, catalog or component search"),
+    ("F2", "open the current task's job history"),
     ("/ (Catalog)", "fuzzy search the full CLI catalog"),
     ("Enter (Catalog)", "load live --help for the selection"),
     ("f / e (Catalog)", "favorite / edit preset flags"),
@@ -2041,7 +1924,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "validate / test level / ignore warnings",
     ),
     ("↑↓ PgUp/PgDn", "move or scroll lists and results"),
-    ("z / v / r (Output)", "JSON · saved test runs · rerun"),
+    ("z / v (result)", "raw JSON · saved test runs"),
 ];
 
 #[cfg(test)]

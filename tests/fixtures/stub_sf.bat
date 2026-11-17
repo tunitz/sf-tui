@@ -30,7 +30,11 @@ if "%*"=="project deploy report --job-id 0Af000000000001 --json" (
   echo {"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}
   exit /b 0
 )
-if "%*"=="apex run test --result-format json --wait 10 --class-names DemoTest --target-org test-scratch --json" (
+if "%*"=="project deploy report --job-id 0Af000000000001 --target-org test-scratch --json" (
+  echo {"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}
+  exit /b 0
+)
+if "%*"=="apex run test --result-format json --code-coverage --wait 10 --class-names DemoTest --target-org test-scratch --json" (
   echo {"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":1,"passing":1,"failing":0},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"}]}}
   exit /b 0
 )
@@ -42,11 +46,23 @@ if "%*"=="project deploy start --source-dir force-app --json" (
   echo {"status":0,"result":{"id":"0Af000000000001","status":"Queued"}}
   exit /b 0
 )
+if "%*"=="project deploy start --metadata ApexClass --target-org test-scratch --json" (
+  echo {"status":0,"result":{"id":"0Af000000000001","status":"Queued"}}
+  exit /b 0
+)
+if "%*"=="project deploy report --job-id 0Af000000000001 --json" (
+  echo {"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}
+  exit /b 0
+)
+if "%*"=="project deploy report --job-id 0Af000000000001 --target-org test-scratch --json" (
+  echo {"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}
+  exit /b 0
+)
 if "%*"=="project retrieve start --metadata ApexClass --json" (
   echo {"status":0,"result":{"id":"0Af000000000002","status":"Succeeded"}}
   exit /b 0
 )
-if "%*"=="apex run test --result-format json --wait 10 --json" (
+if "%*"=="apex run test --result-format json --code-coverage --wait 10 --json" (
   echo {"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}
   exit /b 0
 )

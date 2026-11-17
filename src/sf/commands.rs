@@ -12,6 +12,7 @@ pub fn apex_test_argv(class_names: &[String], org: Option<&str>) -> Vec<String> 
         "test".to_owned(),
         "--result-format".to_owned(),
         "json".to_owned(),
+        "--code-coverage".to_owned(),
         "--wait".to_owned(),
         APEX_WAIT_MINUTES.to_owned(),
     ];
@@ -106,6 +107,7 @@ mod tests {
         let argv = apex_test_argv(&classes, Some("dev"));
         assert!(argv.contains(&"--result-format".to_owned()));
         assert!(argv.contains(&"json".to_owned()));
+        assert!(argv.contains(&"--code-coverage".to_owned()));
         assert!(argv.contains(&"--target-org".to_owned()));
         assert_eq!(
             apex_test_display(&classes, Some("dev")),

@@ -4,6 +4,34 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.15] - 2026-11-17
+
+### Added
+
+- Retrieve, deploy and Apex test runs now execute in parallel: up to four commands run at once
+  and further requests wait in a queue that starts them automatically. Each screen keeps its own
+  job history on `F2`, with `Enter` for the full result and `x` to cancel a running or queued job.
+  Finishing jobs are announced in the status line and never change the screen you are on.
+- Every retrieve/deploy result lists each requested metadata item with a `[✓]`/`[✗]` row, even
+  when the CLI reports no component-level status, so the requested set is always visible.
+- Apex test runs always pass `--code-coverage`, and results group into one row per test class with
+  its method outcomes and per-class coverage underneath.
+- The latest finished result for a task also stays on that task's own screen.
+
+### Changed
+
+- The tab bar is gone. The Home screen is a plain Menu (Retrieve Metadata, Deploy Metadata,
+  Create Metadata, Apex Tests, Organization, Command Catalog); `h` opens the Menu, `Esc` returns
+  to the previous screen, and the `Tab`/`1-9` shortcuts were removed.
+- The header shows the resolved default org (alias, else username) instead of the words
+  "default org"; the default org is resolved as soon as `sf` is detected.
+- The Home screen no longer lists recent commands; history lives with the task that produced it.
+- Typing is responsive: terminal input is read on a dedicated thread so keystrokes no longer wait
+  for the animation tick, and the component index is built off-thread instead of on the UI thread.
+- The deprecated `sfdx` CLI is no longer detected or translated; only `sf` is used.
+- Corrected the CLI environment variable to `SF_DISABLE_AUTOUPDATE`.
+- Result screens no longer advertise keys that are not implemented.
+
 ## [0.1.14] - 2026-11-17
 
 ### Added

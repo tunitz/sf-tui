@@ -6,11 +6,13 @@ A single-binary terminal UI for the Salesforce CLI. `sftui` wraps the `sf` execu
 installed on your machine: it does not store credentials, and all authentication stays with `sf`
 in its own home directory.
 
-The interface opens on a **Home** screen ordered by frequency: retrieve and deploy first, Apex
-test run/results second, metadata creation, org management and login after that. Behind it are:
+The interface opens on a **Menu**: Retrieve Metadata, Deploy Metadata, Create Metadata, Apex
+Tests, Organization and the command catalog. Each entry opens a focused screen, with project paths
+and the default org pre-filled so you do not retype them. `Esc` returns to the previous screen and
+`h` returns to the Menu; there is no tab bar.
 
-- **focused screens** for org operations and metadata deploy/retrieve, with project paths and the
-  default org pre-filled so you do not retype them;
+- **focused screens** for retrieve, deploy, Apex tests and org operations, each with its own job
+  history;
 - a **generic command catalog** covering the full `sf` CLI surface (fuzzy search, favorites,
   preset flags, exact invocation and streamed output).
 
@@ -58,45 +60,51 @@ re-run the installer instead.
 
 Install the [Salesforce CLI](https://developer.salesforce.com/tools/salesforcecli) first. If `sf`
 is not found, `sftui` opens a Setup screen with per-platform, no-admin install commands, an
-installer runner and a re-probe key. A legacy `sfdx` installation is detected and common commands
-are translated automatically.
+installer runner and a re-probe key. The deprecated `sfdx` CLI is not used or translated: install
+`sf` instead.
 
 For a nonstandard location, set `SFTUI_SF_PATH` to the full path of the executable.
 
 ## Keybindings
 
-Home is just the menu:
+The menu is the whole navigation:
 
 ```text
-[r] Retrieve   [d] Deploy   [t] Apex Tests   [c] Create
-[o] Orgs       [a] Log in   [g] Results
+[r] Retrieve Metadata   [d] Deploy Metadata   [c] Create Metadata
+[t] Apex Tests          [o] Organization      [l] Command Catalog
 ```
 
-Global on list screens: `Tab` next screen · `1-9` jump · `h` Home · `Esc` back ·
-`?` help · `y` copy · `F5` refresh · `q` quit (asks while a job runs).
-`Ctrl+X` cancels the newest running job; `Ctrl+C` cancels it or quits when idle.
+Global: `h` Menu · `Esc` previous screen · `?` help · `y` copy · `F5` refresh ·
+`F2` this task's job history · `q` quit (asks while a job runs).
+`Ctrl+X` cancels the newest job; `Ctrl+C` cancels it or quits when idle.
 `Ctrl+Y` copies the current selection while a search field has focus.
 
+Retrieve, deploy and test runs execute in the background. Up to four commands run in parallel and
+anything beyond that waits in a queue, starting automatically as slots free up. Leaving a screen
+never stops a job: start a retrieve, go back, start a deploy and a test run, and keep browsing.
+Finishing jobs are announced in the status line instead of stealing the screen; `F2` opens that
+screen's job history, where `Enter` shows the full result and `x` cancels a running or queued job.
+
 Apex Tests follows the same pattern: type to find real test classes (`*Test.cls` or `@IsTest`),
-`Space` check/uncheck, `Enter` confirm. Results are saved locally (last 50 runs) and shown with
-highlights first — outcome, failures, coverage — then per-class coverage. Press `v` on the result
-screen to view previous runs. The Org menu replaces the old login shortcut: check current org,
-switch, login, delete/logout or reauth.
+`Space` check/uncheck, `Enter` confirm. Runs use `--code-coverage`, so results show one row per
+test class with `[✓]`/`[✗]`, the method outcomes underneath and per-class coverage with percent,
+covered/total lines and uncovered counts. Results are saved locally (last 50 runs); `v` on a
+result opens the saved runs. The Organization screen handles login: check the current org, switch,
+login, delete/logout or reauth.
 
 On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
 `Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`; typing keeps
-your existing selection. `Esc` goes back.
+your existing selection, and returning to the screen keeps it too. `Esc` goes back.
 
 The confirmation dialog shows every selected component as a checkbox: `Space` toggles, `↑↓` moves,
 `c` shows the exact command, `v/t/w` toggle deploy options, `g` cycles orgs, `Enter` runs and `Esc`
 goes back.
 
-Every command result is rendered human-readable immediately: status, counts, per-item pass/fail
-rows with `[✓]`/`[✗]` icons, color-coded metric chips, progress bars and section headers. Long
-results scroll with `↑↓`/`PgUp`/`PgDn`; raw stdout/JSON is behind `o`/`z`. The Output screen keeps
-the last 40 commands, lets you switch records with `↑↓`, and reruns the selected one with `r`.
-Apex test results show per-class coverage with percent, covered/total lines and uncovered counts;
-press `v` to view saved runs.
+Every command result is rendered human-readable immediately: status, counts, one `[✓]`/`[✗]` row
+per requested metadata item, color-coded metric chips, progress bars and section headers. The
+latest finished result also stays visible at the bottom of its own screen (`…` means still
+running, `✓` succeeded, `✗` failed). Long results scroll with `↑↓`/`PgUp`/`PgDn`; raw stdout/JSON
+is behind `o`/`z`.
 
 The interface uses terminal default colors for body text and reverse video for selection, and
 honors `NO_COLOR` by stripping color while keeping bold/reverse emphasis.
@@ -110,7 +118,7 @@ Configuration lives in a per-user directory chosen by the `directories` crate:
 - Windows: `%APPDATA%\sf-tui\config\config.toml`
 
 Set `SFTUI_CONFIG_DIR` to use a different directory. The TOML file contains `favorites`
-(command id plus preset flags), `recent_runs` and `theme.accent` (`cyan`, `green`, `yellow`,
+(command id plus preset flags) and `theme.accent` (`cyan`, `green`, `yellow`,
 `blue`, `magenta`, `red`). It is written atomically with owner-only permissions on Unix, and is
 updated when favorites/presets change and on exit. A `catalog-cache.json` file beside it stores
 the last successful `sf commands --json` response for seven days.

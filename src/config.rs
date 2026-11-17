@@ -32,22 +32,12 @@ pub enum ConfigError {
 }
 
 const CONFIG_FILE: &str = "config.toml";
-const MAX_RECENT_RUNS: usize = 100;
-
 /// A command marked as a favorite, with optional pre-filled flags.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Favorite {
     pub id: String,
     #[serde(default)]
     pub preset_flags: Vec<String>,
-}
-
-/// A previously executed command line.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecentRun {
-    pub command: String,
-    #[serde(default)]
-    pub exit_code: Option<i32>,
 }
 
 /// Persisted appearance settings.
@@ -72,8 +62,6 @@ impl Default for Theme {
 pub struct Config {
     #[serde(default)]
     pub favorites: Vec<Favorite>,
-    #[serde(default)]
-    pub recent_runs: Vec<RecentRun>,
     #[serde(default)]
     pub theme: Theme,
 }
@@ -188,14 +176,6 @@ impl Config {
     pub fn remove_favorite(&mut self, id: &str) {
         self.favorites.retain(|favorite| favorite.id != id);
     }
-
-    /// Record an executed command, keeping the most recent entries first.
-    pub fn record_run(&mut self, command: impl Into<String>, exit_code: Option<i32>) {
-        let command = command.into();
-        self.recent_runs.retain(|run| run.command != command);
-        self.recent_runs.insert(0, RecentRun { command, exit_code });
-        self.recent_runs.truncate(MAX_RECENT_RUNS);
-    }
 }
 
 #[cfg(test)]
@@ -267,17 +247,5 @@ mod tests {
         assert_eq!(config.favorites[0].id, "a");
         assert!(!config.toggle_favorite("c"));
         assert_eq!(config.favorites.len(), 2);
-    }
-
-    #[test]
-    fn recent_runs_are_unique_bounded_and_newest_first() {
-        let mut config = Config::default();
-        for index in 0..120 {
-            config.record_run(format!("sf org list --{index}"), Some(0));
-        }
-        config.record_run("sf org list --0", Some(1));
-        assert!(config.recent_runs.len() <= MAX_RECENT_RUNS);
-        assert_eq!(config.recent_runs[0].command, "sf org list --0");
-        assert_eq!(config.recent_runs[0].exit_code, Some(1));
     }
 }

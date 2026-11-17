@@ -8,7 +8,7 @@ use ratatui::backend::TestBackend;
 use sftui::app::{App, OutputRecord};
 use sftui::config::Config;
 use sftui::sf::catalog::{Catalog, CatalogSource, CommandSpec};
-use sftui::sf::detect::{SfFlavor, SfInstallation};
+use sftui::sf::detect::SfInstallation;
 use sftui::sf::runner::{self, OutputStream, SfEvent};
 use sftui::sf::{Startup, StartupEvent};
 use sftui::ui;
@@ -42,7 +42,6 @@ fn stub_installation() -> SfInstallation {
         } else {
             "stub_sf.sh"
         }),
-        flavor: SfFlavor::Sf,
         source: "test fixture".to_owned(),
     }
 }
@@ -209,20 +208,22 @@ fn every_screen_renders_without_panicking() {
     );
     app.output_state.records.push(OutputRecord {
         id: 1,
-        command: "sf org list --json".to_owned(),
-        purpose: "orgs".to_owned(),
+        command: "sf project deploy start --json".to_owned(),
+        purpose: "Deploy".to_owned(),
+        task: sftui::app::TaskKind::Deploy,
         executable: "sf".into(),
-        argv: vec!["org".to_owned(), "list".to_owned()],
+        argv: vec!["project".to_owned(), "deploy".to_owned()],
         lines: Vec::new(),
         line_bytes: 0,
         exit_code: None,
         finished: false,
+        queued: false,
         json: Some(serde_json::json!({"result":{"status":"ok"}})),
         result: None,
     });
     for (width, height) in [(120, 40), (80, 24), (60, 16), (48, 12)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
-        for tab in app.tabs() {
+        for tab in app.screens() {
             app.tab = tab;
             terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
             let buffer = terminal.backend().buffer();
@@ -232,12 +233,12 @@ fn every_screen_renders_without_panicking() {
                 "empty frame at {width}x{height} on {tab:?}"
             );
             if (width, height) == (60, 16) && tab == sftui::app::Tab::Home {
-                assert!(rendered.contains("[r] Retrieve"), "quick actions missing");
-                assert!(rendered.contains("Home"), "current tab missing");
+                assert!(rendered.contains("[r] Retrieve"), "menu missing");
+                assert!(rendered.contains("MENU"), "menu heading missing");
             }
             if (width, height) == (120, 40) && tab == sftui::app::Tab::Home {
-                assert!(rendered.contains("[1] Home"), "tab bar missing");
-                assert!(rendered.contains("Tab next"), "key hints missing");
+                assert!(!rendered.contains("[1]"), "tab bar must be gone");
+                assert!(rendered.contains("F2 history"), "key hints missing");
             }
         }
         for modal in [
@@ -261,7 +262,6 @@ fn every_screen_renders_without_panicking() {
                 ],
                 focus: 0,
             },
-            sftui::app::Modal::OrgMenu { selected: 0 },
             sftui::app::Modal::TestHistory {
                 runs: Vec::new(),
                 selected: 0,

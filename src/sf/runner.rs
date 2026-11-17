@@ -116,7 +116,7 @@ pub fn sf_env() -> &'static [(&'static str, &'static str)] {
     &[
         ("SF_SKIP_NEW_VERSION_CHECK", "true"),
         ("SF_DISABLE_TELEMETRY", "true"),
-        ("SFDX_DISABLE_AUTOUPDATE", "true"),
+        ("SF_DISABLE_AUTOUPDATE", "true"),
     ]
 }
 

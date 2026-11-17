@@ -3,8 +3,9 @@
 ## Purpose
 
 `sftui` is a single-binary, cross-platform terminal UI that wraps an installed Salesforce CLI
-(`sf`, with a legacy `sfdx` fallback). It provides a fuzzy-searchable catalog of the full CLI
-command surface plus focused Org and Deploy/Retrieve screens. It never stores credentials; all
+(`sf`; the deprecated `sfdx` CLI is not detected, invoked or translated). It provides a
+fuzzy-searchable catalog of the full CLI command surface plus focused retrieve, deploy, Apex test
+and org screens. It never stores credentials; all
 authentication remains with the Salesforce CLI in its own home directory.
 
 ## Layout
@@ -16,7 +17,7 @@ src/app.rs             application state, key dispatch, background job ownership
 src/ui.rs              all ratatui rendering
 src/view.rs            pure result-view construction
 src/update.rs           self-update from GitHub releases with checksum verification
-src/config.rs          TOML config, favorites, recent runs, theme
+src/config.rs          TOML config, favorites, theme
 src/fsutil.rs          atomic, owner-only state-file writes
 data/commands.json     bundled command catalog snapshot; cached refresh lives beside config.toml
 src/sf/metadata.rs     component/template suggestion candidates (fuzzy completion)
@@ -50,10 +51,13 @@ To debug the interface, run the release binary inside a terminal at least 100x30
 - **Error handling:** domain modules return typed `thiserror` errors. `anyhow` is reserved for the
   binary boundary and the terminal lifecycle. Never panic on user input, files or CLI output.
 - **Async boundaries:** every spawned task has an owner. Process tasks return through a tracked
-  job map and an application event channel; cancellation is explicit. The UI thread never awaits
-  a long-running CLI command directly. CLI discovery, probing and project scanning happen after
-  the first frame so a slow Windows `sf` process is visible as progress, never as a blank screen.
-  Process output is drained in batches before each frame.
+  job map and an application event channel; cancellation is explicit. Up to four user commands run
+  in parallel and the rest wait in a FIFO queue (`pending_jobs`); each job is tagged with a
+  `TaskKind` so a screen can list only its own history. The UI thread never awaits a long-running
+  CLI command directly. CLI discovery, probing, project scanning and component-index building
+  happen off-thread so a slow Windows `sf` process is visible as progress, never as a blank
+  screen. Terminal input is read by a dedicated thread so keystrokes are never gated on the
+  animation tick. Process output is drained in batches before each frame.
 - **JSON parsing:** treat all CLI output as untrusted. Parse defensively with `serde_json::Value`
   helpers, accept both `result`-wrapped and bare shapes, and never print tokens, auth URLs,
   passwords or secrets. Snapshot and fixture data must be synthetic only.

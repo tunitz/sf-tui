@@ -1,7 +1,7 @@
 //! Application state, key dispatch and ownership of background SF jobs.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,23 +33,19 @@ pub enum Tab {
     Tests,
     Deploy,
     Catalog,
-    Favorites,
     Orgs,
-    Output,
     Setup,
 }
 
 impl Tab {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Home => "Home",
+            Self::Home => "Menu",
             Self::Retrieve => "Retrieve",
             Self::Tests => "Tests",
             Self::Deploy => "Deploy",
             Self::Catalog => "Catalog",
-            Self::Favorites => "Favorites",
             Self::Orgs => "Orgs",
-            Self::Output => "Output",
             Self::Setup => "Setup",
         }
     }
@@ -59,15 +55,33 @@ impl Tab {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPurpose {
     CatalogRefresh,
-    Command { id: String, command: String },
-    Help { id: String },
+    Command {
+        id: String,
+        command: String,
+    },
+    Help {
+        id: String,
+    },
     OrgList,
-    OrgDetail { username: String },
-    OrgAction { description: String },
-    Transfer { options: TransferOptions },
-    Report { options: TransferOptions },
-    Installer { command: String },
-    ApexTests { command: String },
+    OrgDetail {
+        username: String,
+    },
+    OrgAction {
+        description: String,
+    },
+    Transfer {
+        options: TransferOptions,
+    },
+    Report {
+        options: TransferOptions,
+        transfer_job: u64,
+    },
+    Installer {
+        command: String,
+    },
+    ApexTests {
+        command: String,
+    },
 }
 
 impl JobPurpose {
@@ -108,6 +122,11 @@ pub enum AppEvent {
         project: Option<SfProject>,
         error: Option<String>,
     },
+    Suggestions {
+        root: PathBuf,
+        all: Arc<SuggestionSet>,
+        tests: Arc<SuggestionSet>,
+    },
     Notice {
         text: String,
         error: bool,
@@ -126,14 +145,6 @@ pub enum CatalogRow {
     },
 }
 
-pub const ORG_MENU: &[&str] = &[
-    "Check current org",
-    "Switch org",
-    "Login org",
-    "Delete org",
-    "Reauth org",
-];
-
 const POPULAR_COMMAND_IDS: &[&str] = &[
     "org login web",
     "project retrieve start",
@@ -142,49 +153,54 @@ const POPULAR_COMMAND_IDS: &[&str] = &[
     "logic get test",
 ];
 
-/// A task-oriented shortcut shown first on the Home screen.
-#[derive(Debug, Clone, Copy)]
-pub struct QuickAction {
-    pub key: char,
-    pub label: &'static str,
-    pub command: &'static str,
+/// A destination or action on the main menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    Retrieve,
+    Deploy,
+    Create,
+    Tests,
+    Organizations,
+    Catalog,
 }
 
-pub const QUICK_ACTIONS: &[QuickAction] = &[
-    QuickAction {
+#[derive(Debug, Clone, Copy)]
+pub struct MenuItem {
+    pub key: char,
+    pub label: &'static str,
+    pub action: MenuAction,
+}
+
+pub const MENU_ITEMS: &[MenuItem] = &[
+    MenuItem {
         key: 'r',
-        label: "Retrieve metadata",
-        command: "sf project retrieve start",
+        label: "Retrieve Metadata",
+        action: MenuAction::Retrieve,
     },
-    QuickAction {
+    MenuItem {
         key: 'd',
-        label: "Deploy metadata",
-        command: "sf project deploy start",
+        label: "Deploy Metadata",
+        action: MenuAction::Deploy,
     },
-    QuickAction {
+    MenuItem {
+        key: 'c',
+        label: "Create Metadata",
+        action: MenuAction::Create,
+    },
+    MenuItem {
         key: 't',
         label: "Apex Tests",
-        command: "sf apex run test",
+        action: MenuAction::Tests,
     },
-    QuickAction {
-        key: 'c',
-        label: "Create metadata",
-        command: "sf template generate",
-    },
-    QuickAction {
+    MenuItem {
         key: 'o',
-        label: "Orgs",
-        command: "sf org",
+        label: "Organization",
+        action: MenuAction::Organizations,
     },
-    QuickAction {
-        key: 'a',
-        label: "Log in",
-        command: "sf org login web",
-    },
-    QuickAction {
-        key: 'g',
-        label: "Results",
-        command: "sf apex get test",
+    MenuItem {
+        key: 'l',
+        label: "Command Catalog",
+        action: MenuAction::Catalog,
     },
 ];
 
@@ -211,11 +227,6 @@ pub struct CatalogState {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct FavoritesState {
-    pub selected: usize,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct OrgState {
     pub orgs: Vec<OrgSummary>,
     pub selected: usize,
@@ -230,10 +241,16 @@ pub struct DeployState {
     pub project_error: Option<String>,
     pub project_loading: bool,
     pub options: TransferOptions,
-    pub job_id: Option<String>,
-    pub poll_after: Option<Instant>,
-    pub report_failures: u32,
-    pub report_attempts: u32,
+}
+
+/// A deploy accepted by the org whose report still has to be polled.
+#[derive(Debug, Clone)]
+struct DeployReport {
+    server_job_id: String,
+    options: TransferOptions,
+    poll_after: Instant,
+    attempts: u32,
+    failures: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -339,25 +356,53 @@ pub struct ResultView {
     pub sections: Vec<ResultSection>,
 }
 
+/// The task a recorded job belongs to, used by per-screen history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskKind {
+    Retrieve,
+    Deploy,
+    Tests,
+    Catalog,
+    Organization,
+    Setup,
+}
+
+impl TaskKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Retrieve => "Retrieve",
+            Self::Deploy => "Deploy",
+            Self::Tests => "Apex tests",
+            Self::Catalog => "Command catalog",
+            Self::Organization => "Organization",
+            Self::Setup => "Setup",
+        }
+    }
+}
+
 /// A single recorded command invocation and its streamed output.
 #[derive(Debug, Clone)]
 pub struct OutputRecord {
     pub id: u64,
     pub command: String,
     pub purpose: String,
+    pub task: TaskKind,
     pub executable: PathBuf,
     pub argv: Vec<String>,
     pub lines: Vec<JobLine>,
     pub line_bytes: usize,
     pub exit_code: Option<i32>,
     pub finished: bool,
+    pub queued: bool,
     pub json: Option<Value>,
     pub result: Option<ResultView>,
 }
 
 impl OutputRecord {
     pub fn label(&self) -> String {
-        let state = if !self.finished {
+        let state = if self.queued {
+            "queued".to_owned()
+        } else if !self.finished {
             "running".to_owned()
         } else {
             match self.exit_code {
@@ -366,7 +411,16 @@ impl OutputRecord {
                 None => "stopped".to_owned(),
             }
         };
-        format!("#{} [{}] {}", self.id, state, self.command)
+        format!("#{} [{}] {}", self.id, state, self.display_command())
+    }
+
+    /// The command with its executable path shortened, for history rows and result headers.
+    pub fn display_command(&self) -> String {
+        let prefix = self.executable.display().to_string();
+        self.command
+            .strip_prefix(&prefix)
+            .map(|rest| format!("sf{rest}"))
+            .unwrap_or_else(|| self.command.clone())
     }
 }
 
@@ -380,8 +434,6 @@ type CatalogRowsCache = RefCell<Option<(u64, String, Rc<Vec<CatalogRow>>)>>;
 #[derive(Debug, Clone, Default)]
 pub struct OutputState {
     pub records: Vec<OutputRecord>,
-    pub selected: usize,
-    pub scroll: usize,
     pub show_json: bool,
     pub show_details: bool,
 }
@@ -392,29 +444,27 @@ impl OutputState {
         id: u64,
         command: String,
         purpose: &str,
+        task: TaskKind,
         executable: PathBuf,
         argv: Vec<String>,
-        focus: bool,
     ) {
         self.records.push(OutputRecord {
             id,
             command,
             purpose: purpose.to_owned(),
+            task,
             executable,
             argv,
             lines: Vec::new(),
             line_bytes: 0,
             exit_code: None,
             finished: false,
+            queued: true,
             json: None,
             result: None,
         });
         if self.records.len() > MAX_RECORDS {
             self.records.remove(0);
-        }
-        if focus {
-            self.selected = self.records.len().saturating_sub(1);
-            self.scroll = 0;
         }
     }
 
@@ -550,12 +600,18 @@ pub enum Modal {
         message: String,
         action: PendingAction,
     },
-    OrgMenu {
-        selected: usize,
-    },
     TestHistory {
         runs: Vec<TestRun>,
         selected: usize,
+    },
+    TaskHistory {
+        kind: TaskKind,
+        selected: usize,
+    },
+    JobResult {
+        kind: TaskKind,
+        record_id: u64,
+        scroll: usize,
     },
     TestRun {
         run: TestRun,
@@ -588,6 +644,15 @@ struct JobEntry {
     finished_seen: bool,
 }
 
+struct PendingJob {
+    id: u64,
+    executable: PathBuf,
+    argv: Vec<String>,
+    purpose: JobPurpose,
+}
+
+const MAX_PARALLEL_JOBS: usize = 4;
+
 /// Root application state.
 pub struct App {
     pub startup: Startup,
@@ -600,7 +665,6 @@ pub struct App {
     pub status: String,
     pub status_error: bool,
     pub catalog_state: CatalogState,
-    pub favorites_state: FavoritesState,
     pub org_state: OrgState,
     pub deploy_state: DeployState,
     pub transfer_search: TransferSearchState,
@@ -612,6 +676,7 @@ pub struct App {
     tab_history: Vec<Tab>,
     suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
     test_suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
+    suggestions_building: bool,
     catalog_revision: u64,
     catalog_rows_cache: CatalogRowsCache,
     ticks: usize,
@@ -622,6 +687,8 @@ pub struct App {
     event_tx: UnboundedSender<AppEvent>,
     event_rx: UnboundedReceiver<AppEvent>,
     jobs: HashMap<u64, JobEntry>,
+    pending_jobs: VecDeque<PendingJob>,
+    deploy_reports: HashMap<u64, DeployReport>,
     next_job_id: u64,
 }
 
@@ -651,7 +718,6 @@ impl App {
                 selected_id,
                 ..CatalogState::default()
             },
-            favorites_state: FavoritesState::default(),
             org_state: OrgState::default(),
             deploy_state: DeployState::default(),
             transfer_search: TransferSearchState::new(false),
@@ -663,6 +729,7 @@ impl App {
             tab_history: Vec::new(),
             suggestion_cache: None,
             test_suggestion_cache: None,
+            suggestions_building: false,
             catalog_revision: 0,
             catalog_rows_cache: RefCell::new(None),
             ticks: 0,
@@ -673,16 +740,12 @@ impl App {
             event_tx,
             event_rx,
             jobs: HashMap::new(),
+            pending_jobs: VecDeque::new(),
+            deploy_reports: HashMap::new(),
             next_job_id: 1,
         };
         app.start_project_scan();
         app.test_runs = test_results::load(&app.config_dir);
-        app.config
-            .recent_runs
-            .retain(|run| !is_secret_command(&run.command));
-        for run in &mut app.config.recent_runs {
-            run.command = redact_command(&run.command);
-        }
         app.status = "Starting sftui — the interface is ready while sf is probed".to_owned();
         app.start_probe();
         app
@@ -703,21 +766,20 @@ impl App {
         }));
     }
 
-    pub fn tabs(&self) -> Vec<Tab> {
-        let mut tabs = vec![
+    /// Screens rendered by headless smoke tests; navigation itself is menu-only.
+    pub fn screens(&self) -> Vec<Tab> {
+        let mut screens = vec![
             Tab::Home,
             Tab::Retrieve,
             Tab::Deploy,
             Tab::Tests,
             Tab::Catalog,
-            Tab::Favorites,
             Tab::Orgs,
-            Tab::Output,
         ];
         if self.startup_stage.done && !self.startup.is_ready() {
-            tabs.push(Tab::Setup);
+            screens.push(Tab::Setup);
         }
-        tabs
+        screens
     }
 
     pub fn accent(&self) -> ratatui::style::Color {
@@ -800,6 +862,9 @@ impl App {
             }
             AppEvent::Startup(sf::StartupEvent::Detected(installation)) => {
                 self.startup.installation = Some(installation);
+                if self.org_state.orgs.is_empty() && !self.org_state.loading {
+                    self.refresh_orgs();
+                }
             }
             AppEvent::Startup(sf::StartupEvent::Version(version)) => {
                 self.startup.version = Some(version);
@@ -845,6 +910,35 @@ impl App {
                 } else {
                     error
                 };
+                if self.deploy_state.project.is_some() {
+                    self.ensure_suggestion_sets();
+                }
+            }
+            AppEvent::Suggestions { root, all, tests } => {
+                self.suggestions_building = false;
+                if root != self.suggestion_root() {
+                    self.ensure_suggestion_sets();
+                    return;
+                }
+                self.suggestion_cache = Some((root.clone(), all));
+                self.test_suggestion_cache = Some((root, tests));
+                let pending = match self.tab {
+                    Tab::Retrieve | Tab::Deploy => {
+                        !self.transfer_search.query.trim().is_empty()
+                            && self.transfer_search.needs_search()
+                    }
+                    Tab::Tests => {
+                        !self.test_search.query.trim().is_empty() && self.test_search.needs_search()
+                    }
+                    _ => false,
+                };
+                if pending {
+                    self.start_search(if self.tab == Tab::Tests {
+                        SearchKind::Tests
+                    } else {
+                        SearchKind::Transfer
+                    });
+                }
             }
             AppEvent::TransferResults {
                 kind,
@@ -870,9 +964,15 @@ impl App {
                 // user has typed since pressing Enter.
                 state.searching = false;
                 if state.retrieve == retrieve && state.query.trim() == query {
+                    let count = results.len();
                     state.results = results;
                     state.cursor = 0;
                     state.searched_query = Some(query);
+                    self.notice(if count == 0 {
+                        "No matches — refine the query and press Enter".to_owned()
+                    } else {
+                        format!("{count} matches — Space select · Enter confirm")
+                    });
                 }
             }
             AppEvent::Notice { text, error } => {
@@ -905,7 +1005,9 @@ impl App {
             if let Some(record) = self.output_state.find_mut(job_id) {
                 record.exit_code = outcome.exit_code;
                 record.finished = true;
+                record.queued = false;
             }
+            self.start_pending_jobs();
             return;
         };
         if let Some(entry) = self.jobs.get_mut(&job_id) {
@@ -916,6 +1018,7 @@ impl App {
         if let Some(record) = self.output_state.find_mut(job_id) {
             record.exit_code = outcome.exit_code;
             record.finished = true;
+            record.queued = false;
             record.json = if outcome.stdout.len() <= MAX_JSON_BYTES {
                 parsed.clone()
             } else {
@@ -952,32 +1055,26 @@ impl App {
                 | JobPurpose::OrgAction { .. }
                 | JobPurpose::Installer { .. }
         ) && !secret_output;
-        let history_command = match &purpose {
-            JobPurpose::Command { command, .. } if !is_secret_command(command) => {
-                Some(command.clone())
-            }
-            JobPurpose::Transfer { options } => Some(format!("sf {}", options.argv().join(" "))),
-            JobPurpose::ApexTests { command } => Some(command.clone()),
-            _ => None,
-        };
-        if let Some(command) = history_command {
-            self.config.record_run(command, outcome.exit_code);
-        }
         let purpose_title = purpose.label().to_owned();
-        let is_report = matches!(&purpose, JobPurpose::Report { .. });
-        if is_report {
+        if let JobPurpose::Report { transfer_job, .. } = &purpose {
             let parsed_status = parsed
                 .as_ref()
                 .map(sf::deploy::parse_report)
                 .is_some_and(|report| !report.status.is_empty());
             if succeeded && parsed_status {
-                self.deploy_state.report_failures = 0;
+                if let Some(report) = self.deploy_reports.get_mut(transfer_job) {
+                    report.failures = 0;
+                }
             } else {
-                self.deploy_state.report_failures += 1;
-                if self.deploy_state.report_failures >= 5 {
-                    self.deploy_state.job_id = None;
-                    self.deploy_state.poll_after = None;
-                    self.deploy_state.report_failures = 0;
+                let failed = self
+                    .deploy_reports
+                    .get_mut(transfer_job)
+                    .is_some_and(|report| {
+                        report.failures = report.failures.saturating_add(1);
+                        report.failures >= 5
+                    });
+                if failed {
+                    self.deploy_reports.remove(transfer_job);
                     self.error("Deploy report failed repeatedly; stopped polling");
                 }
             }
@@ -1034,19 +1131,26 @@ impl App {
                             "Failed".to_owned()
                         };
                     }
-                    result_view = Some(transfer_result(true, &report, None));
-                    self.deploy_state.job_id = None;
-                    self.deploy_state.poll_after = None;
-                    self.deploy_state.report_failures = 0;
-                    self.deploy_state.report_attempts = 0;
+                    result_view = Some(transfer_result(
+                        true,
+                        &report,
+                        None,
+                        &options.metadata_names,
+                    ));
                     if succeeded {
-                        self.notice("Retrieve finished");
+                        self.notice("Retrieve finished — F2 opens the result");
                     }
                 } else if let Some(id) = sf::deploy::parse_started_job_id(&value) {
-                    self.deploy_state.job_id = Some(id.clone());
-                    self.deploy_state.poll_after = Some(Instant::now() + Duration::from_secs(3));
-                    self.deploy_state.report_failures = 0;
-                    self.deploy_state.report_attempts = 0;
+                    self.deploy_reports.insert(
+                        job_id,
+                        DeployReport {
+                            server_job_id: id.clone(),
+                            options: options.clone(),
+                            poll_after: Instant::now() + Duration::from_secs(3),
+                            attempts: 0,
+                            failures: 0,
+                        },
+                    );
                     result_view = Some(ResultView {
                         kind: ResultKind::Deploy,
                         title: "Deploy".to_owned(),
@@ -1063,39 +1167,29 @@ impl App {
                         sections: Vec::new(),
                     });
                     if succeeded {
-                        self.notice(format!("Started deploy job {id}"));
+                        self.notice(format!("Deploy {id} started — F2 shows progress"));
                     }
-                } else {
-                    self.deploy_state.job_id = None;
-                    self.deploy_state.poll_after = None;
-                    self.deploy_state.report_failures = 0;
                 }
             }
-            (JobPurpose::Transfer { .. }, None) => {
-                self.deploy_state.job_id = None;
-                self.deploy_state.poll_after = None;
-                self.deploy_state.report_failures = 0;
-            }
-            (JobPurpose::Report { .. }, Some(value)) => {
+            (JobPurpose::Transfer { .. }, None) => {}
+            (
+                JobPurpose::Report {
+                    options,
+                    transfer_job,
+                },
+                Some(value),
+            ) => {
                 let report = sf::deploy::parse_report(&value);
                 let complete = report.is_complete();
-                let view = transfer_result(false, &report, Some(&report.id));
-                if let Some(record) = self
-                    .output_state
-                    .records
-                    .iter_mut()
-                    .rev()
-                    .find(|record| record.purpose == "transfer")
-                {
+                let view =
+                    transfer_result(false, &report, Some(&report.id), &options.metadata_names);
+                if let Some(record) = self.output_state.find_mut(transfer_job) {
                     record.result = Some(view);
                 }
                 if complete {
-                    self.deploy_state.job_id = None;
-                    self.deploy_state.poll_after = None;
-                    self.deploy_state.report_failures = 0;
-                    self.deploy_state.report_attempts = 0;
+                    self.deploy_reports.remove(&transfer_job);
                     if succeeded {
-                        self.notice("Deploy finished — Esc back");
+                        self.notice("Deploy finished — F2 opens the result");
                     }
                 }
             }
@@ -1124,15 +1218,15 @@ impl App {
             && let Some(record) = self.output_state.find_mut(job_id)
         {
             record.result = Some(view);
-            self.output_state.scroll = 0;
         }
         let user_command = matches!(
             purpose,
             JobPurpose::Command { .. } | JobPurpose::Installer { .. }
         );
         if succeeded && user_command {
-            self.notice("Done — h home · Esc back");
+            self.notice("Done — F2 history · Esc back");
         }
+        self.start_pending_jobs();
     }
 
     pub async fn tick(&mut self) {
@@ -1171,32 +1265,41 @@ impl App {
                 let _ = entry.job.join().await;
             }
         }
-        let report_in_flight = self
+        self.start_pending_jobs();
+        let in_flight: Vec<u64> = self
             .jobs
             .values()
-            .any(|entry| matches!(entry.purpose, JobPurpose::Report { .. }));
-        if self.deploy_state.job_id.is_none() {
-            self.deploy_state.poll_after = None;
-        }
-        let ready = self
-            .deploy_state
-            .poll_after
-            .is_some_and(|when| Instant::now() >= when);
-        if ready
-            && !report_in_flight
-            && let Some(job_id) = self.deploy_state.job_id.clone()
-        {
-            if self.deploy_state.report_attempts >= 150 {
-                self.deploy_state.job_id = None;
-                self.deploy_state.poll_after = None;
-                self.error("Deploy report timed out; press F5 on Orgs to refresh");
-                return;
+            .filter_map(|entry| match entry.purpose {
+                JobPurpose::Report { transfer_job, .. } => Some(transfer_job),
+                _ => None,
+            })
+            .collect();
+        let now = Instant::now();
+        let due: Vec<(u64, String, TransferOptions)> = self
+            .deploy_reports
+            .iter()
+            .filter(|(id, report)| now >= report.poll_after && !in_flight.contains(id))
+            .map(|(id, report)| (*id, report.server_job_id.clone(), report.options.clone()))
+            .collect();
+        for (record_id, server_job_id, options) in due {
+            let Some(report) = self.deploy_reports.get_mut(&record_id) else {
+                continue;
+            };
+            if report.attempts >= 150 {
+                self.deploy_reports.remove(&record_id);
+                self.error("Deploy report timed out; F2 keeps the last result");
+                continue;
             }
-            self.deploy_state.report_attempts = self.deploy_state.report_attempts.saturating_add(1);
-            let options = self.deploy_state.options.clone();
-            self.deploy_state.poll_after = Some(Instant::now() + Duration::from_secs(4));
-            if let Some(argv) = options.report_argv(&job_id) {
-                self.spawn(argv, JobPurpose::Report { options });
+            report.attempts = report.attempts.saturating_add(1);
+            report.poll_after = Instant::now() + Duration::from_secs(4);
+            if let Some(argv) = options.report_argv(&server_job_id) {
+                self.spawn(
+                    argv,
+                    JobPurpose::Report {
+                        options,
+                        transfer_job: record_id,
+                    },
+                );
             }
         }
     }
@@ -1237,21 +1340,45 @@ impl App {
         let id = self.next_job_id;
         self.next_job_id += 1;
         let command = redact_command(&format!("{} {}", executable.display(), argv.join(" ")));
-        let show_output = matches!(
-            purpose,
-            JobPurpose::Command { .. } | JobPurpose::Transfer { .. } | JobPurpose::Installer { .. }
-        );
-        let record_output = show_output || matches!(purpose, JobPurpose::ApexTests { .. });
-        if record_output {
-            let focus = show_output || matches!(purpose, JobPurpose::ApexTests { .. });
+        let task = task_for_purpose(&purpose);
+        if let Some(task) = task
+            && matches!(
+                task,
+                TaskKind::Retrieve
+                    | TaskKind::Deploy
+                    | TaskKind::Tests
+                    | TaskKind::Catalog
+                    | TaskKind::Setup
+            )
+        {
             self.output_state.begin(
                 id,
                 command.clone(),
                 purpose.label(),
+                task,
                 executable.clone(),
                 argv.clone(),
-                focus,
             );
+        }
+
+        if is_user_purpose(&purpose) && self.running_user_jobs() >= MAX_PARALLEL_JOBS {
+            self.pending_jobs.push_back(PendingJob {
+                id,
+                executable,
+                argv,
+                purpose,
+            });
+            self.notice(format!(
+                "Queued job #{id} — {MAX_PARALLEL_JOBS} jobs already running"
+            ));
+            return;
+        }
+        self.start_job(id, executable, argv, purpose);
+    }
+
+    fn start_job(&mut self, id: u64, executable: PathBuf, argv: Vec<String>, purpose: JobPurpose) {
+        if let Some(record) = self.output_state.find_mut(id) {
+            record.queued = false;
         }
         match sf::runner::spawn_with_env(
             &executable,
@@ -1270,51 +1397,93 @@ impl App {
                         finished_seen: false,
                     },
                 );
-                if show_output {
-                    self.tab = Tab::Output;
-                }
             }
             Err(error) => {
                 if let Some(record) = self.output_state.find_mut(id) {
                     record.exit_code = None;
                     record.finished = true;
+                    record.queued = false;
                 }
                 if matches!(purpose, JobPurpose::OrgList) {
                     self.org_state.loading = false;
                 }
-                if matches!(purpose, JobPurpose::Report { .. }) {
-                    self.deploy_state.job_id = None;
-                    self.deploy_state.poll_after = None;
-                    self.deploy_state.report_failures = 0;
+                if let JobPurpose::Report { transfer_job, .. } = purpose {
+                    self.deploy_reports.remove(&transfer_job);
                 }
                 self.error(error.to_string());
             }
         }
     }
 
+    fn running_user_jobs(&self) -> usize {
+        self.jobs
+            .values()
+            .filter(|entry| is_user_purpose(&entry.purpose))
+            .count()
+    }
+
+    fn start_pending_jobs(&mut self) {
+        while self.running_user_jobs() < MAX_PARALLEL_JOBS {
+            let Some(pending) = self.pending_jobs.pop_front() else {
+                break;
+            };
+            self.start_job(
+                pending.id,
+                pending.executable,
+                pending.argv,
+                pending.purpose,
+            );
+        }
+    }
+
     fn cancel_active_job(&mut self) -> bool {
-        let Some(id) = self.jobs.keys().max().copied() else {
+        let id = self
+            .jobs
+            .keys()
+            .copied()
+            .chain(self.pending_jobs.iter().map(|pending| pending.id))
+            .max();
+        id.is_some_and(|id| self.cancel_job(id))
+    }
+
+    fn cancel_job(&mut self, id: u64) -> bool {
+        let queued = self
+            .pending_jobs
+            .iter()
+            .position(|pending| pending.id == id)
+            .and_then(|index| self.pending_jobs.remove(index));
+        if let Some(pending) = queued {
+            if let Some(record) = self.output_state.find_mut(pending.id) {
+                record.finished = true;
+                record.queued = false;
+            }
+            self.notice(format!("Cancelled queued job #{id}"));
+            return true;
+        }
+        let Some(entry) = self.jobs.remove(&id) else {
             return false;
         };
-        let purpose = self.jobs.get(&id).map(|entry| entry.purpose.clone());
-        if let Some(entry) = self.jobs.remove(&id) {
-            let cancelled = entry.job.cancel();
-            if cancelled {
-                if matches!(purpose, Some(JobPurpose::Report { .. })) {
-                    self.deploy_state.job_id = None;
-                    self.deploy_state.poll_after = None;
-                    self.deploy_state.report_failures = 0;
-                }
-                self.notice(format!("Cancelled job #{id}"));
+        let purpose = entry.purpose.clone();
+        let cancelled = entry.job.cancel();
+        if cancelled {
+            if let JobPurpose::Report { transfer_job, .. } = purpose {
+                self.deploy_reports.remove(&transfer_job);
             }
-            cancelled
-        } else {
-            false
+            self.deploy_reports.remove(&id);
+            if let Some(record) = self.output_state.find_mut(id) {
+                record.finished = true;
+                record.exit_code = None;
+                record.queued = false;
+            }
+            self.notice(format!("Cancelled job #{id}"));
+            self.start_pending_jobs();
         }
+        cancelled
     }
 
     /// Cancel every tracked job. Used during shutdown and by the quit confirmation.
     pub async fn shutdown(&mut self) {
+        self.pending_jobs.clear();
         let jobs = std::mem::take(&mut self.jobs);
         for (_, entry) in jobs {
             let _ = entry.job.cancel_and_join().await;
@@ -1322,10 +1491,17 @@ impl App {
     }
 
     pub fn busy(&self) -> bool {
-        !self.jobs.is_empty()
+        !self.jobs.is_empty() || !self.pending_jobs.is_empty()
+    }
+
+    pub fn job_count(&self) -> usize {
+        self.jobs.len() + self.pending_jobs.len()
     }
 
     pub fn active_job_label(&self) -> Option<String> {
+        if self.jobs.is_empty() {
+            return self.pending_jobs.front().map(|_| "queued".to_owned());
+        }
         self.jobs
             .iter()
             .max_by_key(|(id, _)| **id)
@@ -1370,16 +1546,16 @@ impl App {
                     }
                     return;
                 }
-                KeyCode::Up | KeyCode::Down if self.tab == Tab::Favorites => {
-                    let delta = if key.code == KeyCode::Up { -1 } else { 1 };
-                    if let Some(id) = self.selected_favorite_id() {
-                        self.config.move_favorite(&id, delta);
-                        self.persist_config();
-                    }
-                    return;
-                }
                 _ => {}
             }
+        }
+        if key.code == KeyCode::F(2) {
+            if let Some(kind) = Self::task_for_tab(self.tab) {
+                self.open_task_history(kind);
+            } else {
+                self.notice("F2 opens the history of the screen you are working in");
+            }
+            return;
         }
         if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
             self.transfer_key(key);
@@ -1407,14 +1583,6 @@ impl App {
                     self.should_quit = true;
                 }
             }
-            KeyCode::Tab => self.switch_tab(1),
-            KeyCode::BackTab => self.switch_tab(-1),
-            KeyCode::Char(number @ '1'..='9') => {
-                let index = number as usize - '1' as usize;
-                if let Some(tab) = self.tabs().get(index).copied() {
-                    self.set_tab(tab);
-                }
-            }
             KeyCode::Char('?') => self.modal = Some(Modal::Help { scroll: 0 }),
             KeyCode::F(5) => self.refresh_current_tab(),
             KeyCode::Esc => self.go_back(),
@@ -1425,19 +1593,10 @@ impl App {
                 Tab::Retrieve | Tab::Deploy => self.transfer_key(key),
                 Tab::Tests => self.test_key(key),
                 Tab::Catalog => self.catalog_key(key),
-                Tab::Favorites => self.favorites_key(key),
                 Tab::Orgs => self.org_key(key),
-                Tab::Output => self.output_key(key),
                 Tab::Setup => self.setup_key(key),
             },
         }
-    }
-
-    fn switch_tab(&mut self, delta: isize) {
-        let tabs = self.tabs();
-        let current = tabs.iter().position(|tab| *tab == self.tab).unwrap_or(0) as isize;
-        let index = (current + delta).rem_euclid(tabs.len() as isize) as usize;
-        self.set_tab(tabs[index]);
     }
 
     fn set_tab(&mut self, tab: Tab) {
@@ -1483,16 +1642,12 @@ impl App {
 
     fn tab_action_hint(&self) -> &'static str {
         match self.tab {
-            Tab::Home => {
-                "r retrieve · d deploy · t tests · c create · o orgs · a login · g results"
-            }
+            Tab::Home => "↑↓ move · Enter open · F2 history",
             Tab::Retrieve => "type component · Enter search · Space select · Enter confirm",
             Tab::Deploy => "type component · Enter search · Space select · Enter confirm",
             Tab::Tests => "type test class · Enter search · Space select · Enter confirm",
             Tab::Catalog => "/ search · Enter help · r run",
-            Tab::Favorites => "Enter run · e preset · x remove",
             Tab::Orgs => "Enter details · o open · l login",
-            Tab::Output => "↑↓ records · j/k scroll · o details · z JSON · v history",
             Tab::Setup => "Enter installer · r re-probe",
         }
     }
@@ -1514,7 +1669,7 @@ impl App {
 
     fn copy_context(&mut self) {
         let text = match self.tab {
-            Tab::Home => Some(QUICK_ACTIONS[self.home_state.selected].command.to_owned()),
+            Tab::Home => None,
             Tab::Retrieve | Tab::Deploy => Some(
                 self.transfer_search
                     .checked()
@@ -1532,17 +1687,7 @@ impl App {
                     .join(", "),
             ),
             Tab::Catalog => self.selected_catalog_id().map(|id| format!("sf {id}")),
-            Tab::Favorites => self.selected_favorite_id().map(|id| {
-                format!("sf {id} {}", self.preset_flags(&id).join(" "))
-                    .trim()
-                    .to_owned()
-            }),
-            Tab::Orgs => self.selected_org().map(|org| org.label()),
-            Tab::Output => self
-                .output_state
-                .records
-                .get(self.output_state.selected)
-                .map(|record| record.command.clone()),
+            Tab::Orgs => self.selected_org().map(|org| org.username.clone()),
             Tab::Setup => sf::install_instructions()
                 .first()
                 .map(|(_, command)| (*command).to_owned()),
@@ -1577,19 +1722,57 @@ impl App {
         match key.code {
             KeyCode::Up => self.home_state.selected = self.home_state.selected.saturating_sub(1),
             KeyCode::Down => {
-                self.home_state.selected =
-                    (self.home_state.selected + 1).min(QUICK_ACTIONS.len() - 1)
+                self.home_state.selected = (self.home_state.selected + 1).min(MENU_ITEMS.len() - 1)
             }
-            KeyCode::Enter => self.run_quick_action(self.home_state.selected),
+            KeyCode::Enter => self.run_menu_action(self.home_state.selected),
             KeyCode::Char(character) => {
-                if let Some(index) = QUICK_ACTIONS
+                if let Some(index) = MENU_ITEMS
                     .iter()
-                    .position(|action| action.key == character.to_ascii_lowercase())
+                    .position(|item| item.key == character.to_ascii_lowercase())
                 {
-                    self.run_quick_action(index);
+                    self.run_menu_action(index);
                 }
             }
             _ => {}
+        }
+    }
+
+    fn run_menu_action(&mut self, index: usize) {
+        let Some(item) = MENU_ITEMS.get(index) else {
+            return;
+        };
+        match item.action {
+            MenuAction::Retrieve | MenuAction::Deploy => {
+                let retrieve = item.action == MenuAction::Retrieve;
+                self.ensure_suggestion_sets();
+                // Keep the previous query and selection so more components can be added while
+                // an earlier retrieve or deploy is still running.
+                if self.transfer_search.retrieve != retrieve {
+                    self.transfer_search = TransferSearchState::new(retrieve);
+                }
+                self.set_tab(if retrieve { Tab::Retrieve } else { Tab::Deploy });
+                self.notice("Type a component name to search");
+            }
+            MenuAction::Create => {
+                let target = self.org_target_hint();
+                self.open_prompt(
+                    "Create metadata",
+                    PromptKind::CreateMetadata,
+                    vec![
+                        PromptField::new("Template", "")
+                            .with_suggestions(Arc::new(crate::sf::metadata::create_suggestions())),
+                        PromptField::new("Name", ""),
+                        PromptField::new("Org", target),
+                    ],
+                );
+            }
+            MenuAction::Tests => {
+                self.ensure_suggestion_sets();
+                self.set_tab(Tab::Tests);
+                self.notice("Type a test class name to search");
+            }
+            MenuAction::Organizations => self.set_tab(Tab::Orgs),
+            MenuAction::Catalog => self.set_tab(Tab::Catalog),
         }
     }
 
@@ -1606,13 +1789,16 @@ impl App {
         }
         let query = state.query.trim().to_owned();
         let retrieve = kind == SearchKind::Transfer && self.transfer_search.retrieve;
+        let root = self.suggestion_root();
         let set = if kind == SearchKind::Tests {
             self.test_suggestion_cache
                 .as_ref()
+                .filter(|(cached, _)| cached == &root)
                 .map(|(_, set)| Arc::clone(set))
         } else {
             self.suggestion_cache
                 .as_ref()
+                .filter(|(cached, _)| cached == &root)
                 .map(|(_, set)| Arc::clone(set))
         };
         let Some(set) = set else {
@@ -1725,28 +1911,59 @@ impl App {
         });
     }
 
-    fn ensure_suggestion_sets(&mut self) {
-        let root = self
-            .deploy_state
+    /// Start building the completion index without blocking the interface.
+    ///
+    /// Reading every manifest in a large project takes long enough to be felt as input lag, so
+    /// the index is built on a blocking pool task and installed when it arrives.
+    fn suggestion_root(&self) -> PathBuf {
+        self.deploy_state
             .project
             .as_ref()
             .map(|project| project.root.clone())
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    fn ensure_suggestion_sets(&mut self) {
+        let root = self.suggestion_root();
         if self
             .suggestion_cache
             .as_ref()
-            .is_none_or(|(cached_root, _)| cached_root != &root)
+            .is_some_and(|(cached_root, _)| cached_root == &root)
         {
-            let all = Arc::new(crate::sf::metadata::transfer_suggestions(
-                self.deploy_state.project.as_ref(),
-            ));
-            let tests = Arc::new(crate::sf::metadata::test_suggestions(
-                &all,
-                self.deploy_state.project.as_ref(),
-            ));
+            return;
+        }
+        if self.suggestions_building {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            // Without a runtime (unit tests) build inline so behaviour stays deterministic.
+            let (all, tests) = build_suggestion_sets(self.deploy_state.project.clone());
             self.suggestion_cache = Some((root.clone(), all));
             self.test_suggestion_cache = Some((root, tests));
-        }
+            return;
+        };
+        self.suggestions_building = true;
+        let project = self.deploy_state.project.clone();
+        let cache_root = root.clone();
+        let tx = self.event_tx.clone();
+        handle.spawn(async move {
+            let built = tokio::task::spawn_blocking(move || build_suggestion_sets(project)).await;
+            match built {
+                Ok((all, tests)) => {
+                    let _ = tx.send(AppEvent::Suggestions {
+                        root: cache_root,
+                        all,
+                        tests,
+                    });
+                }
+                Err(_) => {
+                    let _ = tx.send(AppEvent::Notice {
+                        text: "Could not build the component index".to_owned(),
+                        error: true,
+                    });
+                }
+            }
+        });
     }
 
     fn test_key(&mut self, key: KeyEvent) {
@@ -1814,64 +2031,14 @@ impl App {
         });
     }
 
-    fn run_quick_action(&mut self, index: usize) {
-        let Some(action) = QUICK_ACTIONS.get(index) else {
-            return;
-        };
-        let target = self.org_target_hint();
-        match action.command {
-            "sf org login web" => {
-                self.open_prompt(
-                    "Log in",
-                    PromptKind::LoginWeb,
-                    vec![PromptField::new("Alias", "")],
-                );
-            }
-            "sf project retrieve start" | "sf project deploy start" => {
-                let retrieve = action.command == "sf project retrieve start";
-                self.ensure_suggestion_sets();
-                self.transfer_search = TransferSearchState::new(retrieve);
-                self.set_tab(if retrieve { Tab::Retrieve } else { Tab::Deploy });
-                self.notice("Type a component name to search");
-            }
-            "sf apex run test" => {
-                self.ensure_suggestion_sets();
-                self.test_search = TransferSearchState::new(false);
-                self.set_tab(Tab::Tests);
-                self.notice("Type a test class name to search");
-            }
-            "sf template generate" => {
-                self.open_prompt(
-                    "Create metadata",
-                    PromptKind::CreateMetadata,
-                    vec![
-                        PromptField::new("Template", "")
-                            .with_suggestions(Arc::new(crate::sf::metadata::create_suggestions())),
-                        PromptField::new("Name", ""),
-                        PromptField::new("Org", target),
-                    ],
-                );
-            }
-            "sf org" => {
-                self.modal = Some(Modal::OrgMenu { selected: 0 });
-            }
-            "sf apex get test" => {
-                if self.output_state.records.is_empty() {
-                    self.notice("No results yet — run a deploy, retrieve or test first");
-                } else {
-                    self.set_tab(Tab::Output);
-                }
-            }
-            _ => {}
-        }
-    }
-
     pub fn org_display(&self) -> String {
         let org = self.org_target_hint();
-        if org.is_empty() {
-            "default org".to_owned()
-        } else {
+        if !org.is_empty() {
             org
+        } else if self.org_state.loading {
+            "loading org…".to_owned()
+        } else {
+            "no default org".to_owned()
         }
     }
 
@@ -1968,6 +2135,54 @@ impl App {
     pub fn selected_command(&self) -> Option<&CommandSpec> {
         self.selected_catalog_id()
             .and_then(|id| self.startup.catalog.command(&id))
+    }
+
+    /// The newest finished result for a task, used to show check marks on its own screen.
+    pub fn latest_result(&self, kind: TaskKind) -> Option<&ResultView> {
+        self.output_state
+            .records
+            .iter()
+            .rev()
+            .find(|record| record.task == kind && record.finished)
+            .and_then(|record| record.result.as_ref())
+    }
+
+    pub fn task_records(&self, kind: TaskKind) -> Vec<&OutputRecord> {
+        self.output_state
+            .records
+            .iter()
+            .rev()
+            .filter(|record| record.task == kind)
+            .collect()
+    }
+
+    fn task_history_len(&self, kind: TaskKind) -> usize {
+        self.task_records(kind).len()
+            + if kind == TaskKind::Tests {
+                self.test_runs.len()
+            } else {
+                0
+            }
+    }
+
+    fn open_task_history(&mut self, kind: TaskKind) {
+        if self.task_history_len(kind) == 0 {
+            self.notice(format!("No {} history yet", kind.label()));
+            return;
+        }
+        self.modal = Some(Modal::TaskHistory { kind, selected: 0 });
+    }
+
+    fn task_for_tab(tab: Tab) -> Option<TaskKind> {
+        match tab {
+            Tab::Retrieve => Some(TaskKind::Retrieve),
+            Tab::Deploy => Some(TaskKind::Deploy),
+            Tab::Tests => Some(TaskKind::Tests),
+            Tab::Catalog => Some(TaskKind::Catalog),
+            Tab::Orgs => Some(TaskKind::Organization),
+            Tab::Setup => Some(TaskKind::Setup),
+            Tab::Home => None,
+        }
     }
 
     fn catalog_key(&mut self, key: KeyEvent) {
@@ -2094,56 +2309,6 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub fn selected_favorite_id(&self) -> Option<String> {
-        self.config
-            .favorites
-            .get(self.favorites_state.selected)
-            .map(|favorite| favorite.id.clone())
-    }
-
-    fn favorites_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => {
-                self.favorites_state.selected = self.favorites_state.selected.saturating_sub(1)
-            }
-            KeyCode::Down => {
-                if !self.config.favorites.is_empty() {
-                    self.favorites_state.selected =
-                        (self.favorites_state.selected + 1).min(self.config.favorites.len() - 1);
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(id) = self.selected_favorite_id() {
-                    let flags = self.preset_flags(&id).join(" ");
-                    self.run_command(&id, &flags);
-                }
-            }
-            KeyCode::Char('e') => {
-                if let Some(id) = self.selected_favorite_id() {
-                    let preset = self.preset_flags(&id).join(" ");
-                    self.open_prompt(
-                        "Edit preset flags",
-                        PromptKind::EditPreset { id: id.clone() },
-                        vec![PromptField::new("Preset flags", preset)],
-                    );
-                }
-            }
-            KeyCode::Char('x') | KeyCode::Delete => {
-                if let Some(id) = self.selected_favorite_id() {
-                    self.config.remove_favorite(&id);
-                    self.catalog_revision = self.catalog_revision.wrapping_add(1);
-                    self.persist_config();
-                    self.favorites_state.selected = self
-                        .favorites_state
-                        .selected
-                        .min(self.config.favorites.len().saturating_sub(1));
-                    self.notice("Removed from favorites");
-                }
-            }
-            _ => {}
-        }
-    }
-
     // ----- Orgs ---------------------------------------------------------------------
 
     pub fn selected_org(&self) -> Option<&OrgSummary> {
@@ -2249,84 +2414,9 @@ impl App {
 
     // ----- Deploy / Retrieve --------------------------------------------------------
 
-    fn output_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => {
-                self.output_state.selected = self.output_state.selected.saturating_sub(1);
-                self.output_state.scroll = 0;
-            }
-            KeyCode::Down => {
-                if !self.output_state.records.is_empty() {
-                    self.output_state.selected =
-                        (self.output_state.selected + 1).min(self.output_state.records.len() - 1);
-                }
-                self.output_state.scroll = 0;
-            }
-            KeyCode::Char('k') => {
-                self.output_state.scroll = self.output_state.scroll.saturating_sub(1)
-            }
-            KeyCode::Char('j') => {
-                self.output_state.scroll = self.output_state.scroll.saturating_add(1)
-            }
-            KeyCode::PageUp => {
-                self.output_state.scroll = self.output_state.scroll.saturating_sub(10)
-            }
-            KeyCode::PageDown => {
-                self.output_state.scroll = self.output_state.scroll.saturating_add(10)
-            }
-            KeyCode::Home => self.output_state.scroll = 0,
-            KeyCode::End => self.output_state.scroll = u16::MAX as usize,
-            KeyCode::Char('o') => {
-                self.output_state.show_details = !self.output_state.show_details;
-                self.output_state.scroll = 0;
-            }
-            KeyCode::Char('v') => {
-                if self.test_runs.is_empty() {
-                    self.notice("No saved Apex test runs yet");
-                } else {
-                    self.modal = Some(Modal::TestHistory {
-                        runs: self.test_runs.clone(),
-                        selected: 0,
-                    });
-                }
-            }
-            KeyCode::Char('z') => {
-                self.output_state.show_details = true;
-                self.output_state.show_json = !self.output_state.show_json;
-                self.output_state.scroll = 0;
-            }
-            KeyCode::Char('r') => {
-                let rerun = self
-                    .output_state
-                    .records
-                    .get(self.output_state.selected)
-                    .map(|record| {
-                        (
-                            record.executable.clone(),
-                            record.argv.clone(),
-                            record.command.clone(),
-                        )
-                    });
-                if let Some((executable, argv, command)) = rerun {
-                    let purpose = JobPurpose::Command {
-                        id: argv.iter().take(3).cloned().collect::<Vec<_>>().join(" "),
-                        command,
-                    };
-                    self.spawn_external(executable, argv, purpose);
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn run_transfer(&mut self) {
         let options = self.deploy_state.options.clone();
         let argv = options.argv();
-        self.deploy_state.job_id = None;
-        self.deploy_state.poll_after = None;
-        self.deploy_state.report_failures = 0;
-        self.deploy_state.report_attempts = 0;
-        self.set_tab(Tab::Output);
         self.spawn(argv, JobPurpose::Transfer { options });
     }
 
@@ -2384,63 +2474,161 @@ impl App {
                     });
                 }
             },
-            Modal::OrgMenu { mut selected } => match key.code {
-                KeyCode::Up => {
-                    selected = selected.saturating_sub(1);
-                    self.modal = Some(Modal::OrgMenu { selected });
+            Modal::TaskHistory { kind, mut selected } => {
+                let len = self.task_history_len(kind);
+                if len == 0 {
+                    self.modal = None;
+                    return;
                 }
-                KeyCode::Down => {
-                    selected = (selected + 1).min(ORG_MENU.len() - 1);
-                    self.modal = Some(Modal::OrgMenu { selected });
-                }
-                KeyCode::Esc => self.notice("Closed org menu"),
-                KeyCode::Enter => {
-                    let current = self.org_target_hint();
-                    match selected {
-                        0 => {
-                            let argv = crate::sf::commands::org_display(None);
-                            let display = "sf org display --json".to_owned();
-                            self.spawn(
-                                argv,
-                                JobPurpose::Command {
-                                    id: "org display".to_owned(),
-                                    command: display,
-                                },
-                            );
-                            self.set_tab(Tab::Output);
-                        }
-                        1 => self.open_prompt(
-                            "Switch org",
-                            PromptKind::SwitchOrg,
-                            vec![PromptField::new("Org alias", current)],
-                        ),
-                        2 => self.open_prompt(
-                            "Login org",
-                            PromptKind::LoginWeb,
-                            vec![PromptField::new("Alias", String::new())],
-                        ),
-                        3 => {
-                            if current.is_empty() {
-                                self.error("No current org to delete");
+                selected = selected.min(len - 1);
+                match key.code {
+                    KeyCode::Up => {
+                        selected = selected.saturating_sub(1);
+                        self.modal = Some(Modal::TaskHistory { kind, selected });
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1).min(len - 1);
+                        self.modal = Some(Modal::TaskHistory { kind, selected });
+                    }
+                    KeyCode::PageUp => {
+                        selected = selected.saturating_sub(5);
+                        self.modal = Some(Modal::TaskHistory { kind, selected });
+                    }
+                    KeyCode::PageDown => {
+                        selected = (selected + 5).min(len - 1);
+                        self.modal = Some(Modal::TaskHistory { kind, selected });
+                    }
+                    KeyCode::Esc => self.modal = None,
+                    KeyCode::Char('x') => {
+                        let records = self.task_records(kind);
+                        if let Some(record) = records.get(selected) {
+                            let id = record.id;
+                            let open = !record.finished || record.queued;
+                            drop(records);
+                            if open {
+                                self.cancel_job(id);
                             } else {
-                                self.modal = Some(Modal::Confirm {
-                                    title: "Delete org?".to_owned(),
-                                    message: format!(
-                                        "Log out and remove local auth for {current}?"
-                                    ),
-                                    action: PendingAction::Logout { username: current },
+                                self.notice("That job already finished");
+                            }
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let records = self.task_records(kind);
+                        if let Some(record) = records.get(selected) {
+                            let record_id = record.id;
+                            drop(records);
+                            self.modal = Some(Modal::JobResult {
+                                kind,
+                                record_id,
+                                scroll: 0,
+                            });
+                        } else if kind == TaskKind::Tests {
+                            let index = selected.saturating_sub(records.len());
+                            drop(records);
+                            if let Some(run) = self.test_runs.get(index) {
+                                self.modal = Some(Modal::TestRun {
+                                    run: run.clone(),
+                                    scroll: 0,
                                 });
                             }
                         }
-                        4 => self.open_prompt(
-                            "Reauth org",
-                            PromptKind::LoginWeb,
-                            vec![PromptField::new("Alias", current)],
-                        ),
-                        _ => {}
+                    }
+                    _ => self.modal = Some(Modal::TaskHistory { kind, selected }),
+                }
+            }
+            Modal::JobResult {
+                kind,
+                record_id,
+                mut scroll,
+            } => match key.code {
+                KeyCode::Esc => {
+                    self.modal = Some(Modal::TaskHistory { kind, selected: 0 });
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll,
+                    });
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = scroll.saturating_add(1);
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll,
+                    });
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(10);
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll,
+                    });
+                }
+                KeyCode::PageDown => {
+                    scroll = scroll.saturating_add(10);
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll,
+                    });
+                }
+                KeyCode::Home => {
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll: 0,
+                    });
+                }
+                KeyCode::End => {
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll: u16::MAX as usize,
+                    });
+                }
+                KeyCode::Char('o') => {
+                    self.output_state.show_details = !self.output_state.show_details;
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll: 0,
+                    });
+                }
+                KeyCode::Char('z') => {
+                    self.output_state.show_details = true;
+                    self.output_state.show_json = !self.output_state.show_json;
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll: 0,
+                    });
+                }
+                KeyCode::Char('v') => {
+                    if self.test_runs.is_empty() {
+                        self.notice("No saved test runs yet");
+                    } else {
+                        self.modal = Some(Modal::TestHistory {
+                            runs: self.test_runs.clone(),
+                            selected: 0,
+                        });
                     }
                 }
-                _ => self.modal = Some(Modal::OrgMenu { selected }),
+                KeyCode::Char('x') => {
+                    if self.cancel_job(record_id) {
+                        self.modal = Some(Modal::TaskHistory { kind, selected: 0 });
+                    }
+                }
+                _ => {
+                    self.modal = Some(Modal::JobResult {
+                        kind,
+                        record_id,
+                        scroll,
+                    });
+                }
             },
             Modal::TestHistory { runs, mut selected } => {
                 selected = selected.min(runs.len().saturating_sub(1));
@@ -2569,7 +2757,6 @@ impl App {
                     }
                     let argv = crate::sf::commands::apex_test_argv(&classes, org.as_deref());
                     let display = crate::sf::commands::apex_test_display(&classes, org.as_deref());
-                    self.set_tab(Tab::Output);
                     self.spawn(argv, JobPurpose::ApexTests { command: display });
                 }
                 KeyCode::Esc => {
@@ -3312,6 +3499,41 @@ fn redact_command(command: &str) -> String {
     parts.join(" ")
 }
 
+/// Build the component and test-class completion indexes for a project.
+fn build_suggestion_sets(project: Option<SfProject>) -> (Arc<SuggestionSet>, Arc<SuggestionSet>) {
+    let all = Arc::new(crate::sf::metadata::transfer_suggestions(project.as_ref()));
+    let tests = Arc::new(crate::sf::metadata::test_suggestions(
+        &all,
+        project.as_ref(),
+    ));
+    (all, tests)
+}
+
+fn task_for_purpose(purpose: &JobPurpose) -> Option<TaskKind> {
+    match purpose {
+        JobPurpose::Transfer { options } if options.retrieve => Some(TaskKind::Retrieve),
+        JobPurpose::Transfer { .. } => Some(TaskKind::Deploy),
+        JobPurpose::ApexTests { .. } => Some(TaskKind::Tests),
+        JobPurpose::Command { .. } => Some(TaskKind::Catalog),
+        JobPurpose::Installer { .. } => Some(TaskKind::Setup),
+        JobPurpose::OrgList | JobPurpose::OrgDetail { .. } | JobPurpose::OrgAction { .. } => {
+            Some(TaskKind::Organization)
+        }
+        JobPurpose::CatalogRefresh | JobPurpose::Help { .. } | JobPurpose::Report { .. } => None,
+    }
+}
+
+fn is_user_purpose(purpose: &JobPurpose) -> bool {
+    matches!(
+        purpose,
+        JobPurpose::Command { .. }
+            | JobPurpose::Transfer { .. }
+            | JobPurpose::ApexTests { .. }
+            | JobPurpose::Installer { .. }
+            | JobPurpose::OrgAction { .. }
+    )
+}
+
 /// Commands that change org, project or package state need an explicit confirmation.
 fn is_destructive_command(id: &str) -> bool {
     let id = id.to_ascii_lowercase();
@@ -3352,6 +3574,31 @@ fn is_secret_command(command: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
+/// Input delivered by the blocking reader thread.
+enum InputEvent {
+    Key(KeyEvent),
+    Resize,
+}
+
+/// Read terminal input on its own thread so a key press wakes the event loop immediately,
+/// instead of waiting for the next animation tick. Only this thread reads input events.
+fn spawn_input_reader() -> tokio::sync::mpsc::UnboundedReceiver<InputEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        while let Ok(event) = crossterm::event::read() {
+            let forward = match event {
+                crossterm::event::Event::Key(key) => InputEvent::Key(key),
+                crossterm::event::Event::Resize(_, _) => InputEvent::Resize,
+                _ => continue,
+            };
+            if tx.send(forward).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 /// Run the main event loop using an already initialized terminal.
 pub async fn run(
     terminal: &mut DefaultTerminal,
@@ -3364,7 +3611,8 @@ pub async fn run(
     if let Some(notice) = config_notice {
         app.error(format!("Configuration reset: {notice}"));
     }
-    let mut ticker = tokio::time::interval(Duration::from_millis(250));
+    let mut input_rx = spawn_input_reader();
+    let mut ticker = tokio::time::interval(Duration::from_millis(50));
     let mut dirty = true;
     while !app.should_quit {
         tokio::select! {
@@ -3383,19 +3631,23 @@ pub async fn run(
             }
             Some(event) = app.recv_event() => {
                 app.on_event(event);
+                app.drain_events();
                 dirty = true;
             }
-        }
-        app.drain_events();
-        while crossterm::event::poll(Duration::ZERO)? {
-            let event = crossterm::event::read()?;
-            match event {
-                crossterm::event::Event::Key(key) => {
-                    app.handle_key(key);
-                    dirty = true;
+            Some(input) = input_rx.recv() => {
+                match input {
+                    InputEvent::Key(key) => app.handle_key(key),
+                    InputEvent::Resize => {}
                 }
-                crossterm::event::Event::Resize(_, _) => dirty = true,
-                _ => {}
+                // Coalesce buffered keys into one frame: typing feels instant and a fast
+                // key repeat never queues a redraw per character.
+                while let Ok(input) = input_rx.try_recv() {
+                    match input {
+                        InputEvent::Key(key) => app.handle_key(key),
+                        InputEvent::Resize => {}
+                    }
+                }
+                dirty = true;
             }
         }
         if dirty {
@@ -3458,14 +3710,23 @@ mod tests {
     }
 
     #[test]
-    fn switching_tabs_covers_home_and_number_shortcuts() {
+    fn menu_keys_open_screens_and_escape_returns_to_previous() {
         let mut app = test_app();
         assert_eq!(app.tab, Tab::Home);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.tab, Tab::Output);
-        app.handle_key(key(KeyCode::Char('7')));
+        app.handle_key(key(KeyCode::Char('o')));
         assert_eq!(app.tab, Tab::Orgs);
-        app.handle_key(key(KeyCode::Char('1')));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.tab, Tab::Home);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.tab, Tab::Deploy);
+    }
+
+    #[test]
+    fn number_and_tab_keys_no_longer_switch_screens() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::Char('4')));
+        app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.tab, Tab::Home);
     }
 
@@ -3508,32 +3769,80 @@ mod tests {
         );
     }
 
-    #[test]
-    fn output_selection_moves_between_records() {
-        let mut app = test_app();
-        app.tab = Tab::Output;
-        for id in 1..=2 {
-            app.output_state.records.push(OutputRecord {
-                id,
-                command: format!("sf org list --json {id}"),
-                purpose: "command".to_owned(),
-                executable: "sf".into(),
-                argv: vec!["org".to_owned(), "list".to_owned()],
-                lines: Vec::new(),
-                line_bytes: 0,
-                exit_code: Some(0),
-                finished: true,
-                json: None,
-                result: None,
-            });
+    fn record(id: u64, task: TaskKind, exit_code: Option<i32>) -> OutputRecord {
+        OutputRecord {
+            id,
+            command: format!("sf project transfer --job {id}"),
+            purpose: task.label().to_owned(),
+            task,
+            executable: "sf".into(),
+            argv: vec!["project".to_owned()],
+            lines: Vec::new(),
+            line_bytes: 0,
+            exit_code,
+            finished: exit_code.is_some(),
+            queued: false,
+            json: None,
+            result: None,
         }
-        app.output_state.selected = 0;
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.output_state.selected, 1);
-        app.handle_key(key(KeyCode::Up));
-        assert_eq!(app.output_state.selected, 0);
-        app.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(app.output_state.scroll, 1);
+    }
+
+    #[test]
+    fn latest_result_belongs_to_its_own_task() {
+        let mut app = test_app();
+        let mut retrieve = record(1, TaskKind::Retrieve, Some(0));
+        retrieve.result = Some(ResultView {
+            kind: ResultKind::Retrieve,
+            title: "Retrieve".to_owned(),
+            status: "Succeeded".to_owned(),
+            ok: true,
+            summary: "2 total · 2 succeeded · 0 failed".to_owned(),
+            items: Vec::new(),
+            coverage: Vec::new(),
+            sections: Vec::new(),
+        });
+        app.output_state.records.push(retrieve);
+        app.output_state
+            .records
+            .push(record(2, TaskKind::Deploy, None));
+        let result = app.latest_result(TaskKind::Retrieve).expect("retrieve");
+        assert_eq!(result.summary, "2 total · 2 succeeded · 0 failed");
+        assert!(app.latest_result(TaskKind::Deploy).is_none());
+        assert!(app.latest_result(TaskKind::Tests).is_none());
+    }
+
+    #[test]
+    fn task_history_lists_only_that_tasks_records() {
+        let mut app = test_app();
+        for (id, task, exit_code) in [
+            (1, TaskKind::Retrieve, Some(0)),
+            (2, TaskKind::Deploy, Some(1)),
+            (3, TaskKind::Retrieve, None),
+        ] {
+            app.output_state.records.push(record(id, task, exit_code));
+        }
+        let retrieves = app.task_records(TaskKind::Retrieve);
+        assert_eq!(retrieves.len(), 2);
+        assert_eq!(retrieves[0].id, 3);
+        assert!(!retrieves[0].queued);
+        assert_eq!(app.task_records(TaskKind::Deploy).len(), 1);
+        app.open_task_history(TaskKind::Deploy);
+        assert!(matches!(
+            app.modal.as_ref(),
+            Some(Modal::TaskHistory {
+                kind: TaskKind::Deploy,
+                ..
+            })
+        ));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(matches!(
+            app.modal.as_ref(),
+            Some(Modal::JobResult {
+                kind: TaskKind::Deploy,
+                record_id: 2,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3641,24 +3950,29 @@ mod tests {
     }
 
     #[test]
-    fn home_shortcuts_put_retrieve_deploy_first_and_offer_suggestions() {
-        assert_eq!(QUICK_ACTIONS[0].key, 'r');
-        assert_eq!(QUICK_ACTIONS[1].key, 'd');
-        assert_eq!(QUICK_ACTIONS[3].key, 'c');
-        assert_eq!(QUICK_ACTIONS[4].key, 'o');
-        assert_eq!(QUICK_ACTIONS[6].key, 'g');
-        assert_eq!(QUICK_ACTIONS.len(), 7);
+    fn menu_lists_task_screens_in_order() {
+        let labels: Vec<&str> = MENU_ITEMS.iter().map(|item| item.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Retrieve Metadata",
+                "Deploy Metadata",
+                "Create Metadata",
+                "Apex Tests",
+                "Organization",
+                "Command Catalog",
+            ]
+        );
         let mut app = test_app();
-        app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('r')));
         assert_eq!(app.tab, Tab::Retrieve);
         assert!(app.transfer_search.retrieve);
-        app.tab = Tab::Home;
+        app.go_home();
         app.handle_key(key(KeyCode::Char('d')));
         assert_eq!(app.tab, Tab::Deploy);
-        app.tab = Tab::Home;
+        app.go_home();
         app.handle_key(key(KeyCode::Char('o')));
-        assert!(matches!(app.modal.as_ref(), Some(Modal::OrgMenu { .. })));
+        assert_eq!(app.tab, Tab::Orgs);
     }
 
     #[test]
@@ -3720,11 +4034,12 @@ mod tests {
 
     #[test]
     fn component_search_waits_for_enter() {
-        let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
-        let _guard = _runtime.enter();
         let mut app = test_app();
         app.tab = Tab::Retrieve;
+        // No runtime yet, so the index is built inline instead of on a background task.
         app.ensure_suggestion_sets();
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let _guard = runtime.enter();
         app.handle_key(key(KeyCode::Char('A')));
         assert!(app.transfer_search.needs_search());
         assert!(app.transfer_search.results.is_empty());
@@ -3846,7 +4161,6 @@ mod tests {
         let mut app = test_app();
         app.startup.installation = Some(crate::sf::detect::SfInstallation {
             executable: std::path::PathBuf::from("sf"),
-            flavor: crate::sf::detect::SfFlavor::Sf,
             source: "test".to_owned(),
         });
         app.submit_prompt(
