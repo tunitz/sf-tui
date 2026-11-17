@@ -1,6 +1,5 @@
 //! The SF CLI integration layer: detection, process execution and response parsing.
 
-pub mod catalog;
 pub mod commands;
 pub mod deploy;
 pub mod detect;
@@ -12,19 +11,19 @@ pub mod test_results;
 
 use std::time::Duration;
 
-use catalog::Catalog;
+use serde_json::Value;
+
 use detect::SfInstallation;
 
 use self::runner::parse_json_document;
 
-/// Result of probing the CLI. The TUI now starts with a pending snapshot and fills this in
+/// Result of probing the CLI. The TUI starts with a pending snapshot and fills this in
 /// through [`StartupEvent`]s, so a slow CLI never blocks the first frame.
 #[derive(Debug)]
 pub struct Startup {
     pub installation: Option<SfInstallation>,
     pub version: Option<String>,
     pub current_org: Option<String>,
-    pub catalog: Catalog,
     pub notices: Vec<String>,
 }
 
@@ -34,7 +33,6 @@ impl Startup {
             installation: None,
             version: None,
             current_org: None,
-            catalog: catalog::snapshot(),
             notices: Vec::new(),
         }
     }
@@ -51,16 +49,16 @@ pub enum StartupEvent {
     Detected(SfInstallation),
     Version(String),
     CurrentOrg(String),
-    Catalog(Catalog),
     Notice(String),
     Finished,
 }
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
-const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Stage the startup work so the UI can render immediately and show real progress.
-/// Version and catalog probes run concurrently with short, independent timeouts.
+///
+/// Only the version and the configured target org are probed. This is deliberate: the first
+/// user command must not queue behind a catalog refresh or an org list.
 pub async fn probe(
     config_dir: std::path::PathBuf,
     events: tokio::sync::mpsc::UnboundedSender<StartupEvent>,
@@ -70,7 +68,7 @@ pub async fn probe(
 
 /// Same probe with a caller-supplied installation, used by tests and custom launchers.
 pub async fn probe_with(
-    config_dir: std::path::PathBuf,
+    _config_dir: std::path::PathBuf,
     events: tokio::sync::mpsc::UnboundedSender<StartupEvent>,
     supplied: Option<SfInstallation>,
 ) -> Startup {
@@ -110,7 +108,7 @@ pub async fn probe_with(
                 Some(version) => Some(version),
                 None => {
                     send(StartupEvent::Notice(
-                        "Version unavailable; continuing with the snapshot catalog".to_owned(),
+                        "Version unavailable; run sftui update if sf is broken".to_owned(),
                     ));
                     None
                 }
@@ -122,19 +120,6 @@ pub async fn probe_with(
                 None
             }
         }
-    };
-
-    let catalog_probe = async {
-        let cache_path = catalog::cache_path(&config_dir);
-        if let Some(commands) = catalog::read_cache(&cache_path, CACHE_MAX_AGE) {
-            send(StartupEvent::Catalog(Catalog {
-                commands,
-                source: catalog::CatalogSource::Cached,
-            }));
-        }
-        // No automatic network/CLI catalog refresh: the bundled snapshot is always ready and
-        // F5 on the Catalog tab performs an explicit refresh when requested.
-        None::<Catalog>
     };
 
     let org_probe = async {
@@ -157,35 +142,16 @@ pub async fn probe_with(
             send(StartupEvent::CurrentOrg(org.clone()));
             return Some(org);
         }
-        let argv =
-            installation.argv(&["org".to_owned(), "display".to_owned(), "--json".to_owned()]);
-        if let Ok(outcome) = runner::capture_with_env(
-            &installation.executable,
-            &argv,
-            Duration::from_secs(6),
-            runner::sf_env(),
-        )
-        .await
-            && let Some(value) = parse_json_document(&outcome.stdout)
-            && let Some(org) = org::parse_current_org(&value)
-        {
-            send(StartupEvent::CurrentOrg(org.clone()));
-            return Some(org);
-        }
         None
     };
 
-    let (version, catalog, current_org) = tokio::join!(version_probe, catalog_probe, org_probe);
+    let (version, current_org) = tokio::join!(version_probe, org_probe);
     if let Some(version) = version {
         result.version = Some(version.clone());
         send(StartupEvent::Version(version));
     }
     if let Some(org) = current_org {
         result.current_org = Some(org);
-    }
-    if let Some(catalog) = catalog {
-        result.catalog = catalog.clone();
-        send(StartupEvent::Catalog(catalog));
     }
     send(StartupEvent::Finished);
     result
@@ -197,6 +163,15 @@ pub async fn startup(config_dir: std::path::PathBuf) -> Startup {
     let task = tokio::spawn(probe(config_dir, tx));
     while rx.recv().await.is_some() {}
     task.await.unwrap_or_else(|_| Startup::pending())
+}
+
+/// A non-empty string field shared by the JSON parsers.
+pub(crate) fn string_field(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 fn parse_version(text: &str) -> Option<String> {

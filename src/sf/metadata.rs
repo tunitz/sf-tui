@@ -85,7 +85,7 @@ impl SuggestionSet {
         let mut scored: Vec<(usize, i64)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for (index, item) in self.items.iter().enumerate() {
-            let score = if item.name_lower == query_lower {
+            let mut score = if item.name_lower == query_lower {
                 100_000
             } else if item.name_lower.contains(&query_lower) {
                 50_000
@@ -96,6 +96,12 @@ impl SuggestionSet {
             } else {
                 continue;
             };
+            // A bare metadata type means "everything of this kind", which is far slower and
+            // broader than the concrete component the user is usually after. Keep exact type
+            // names at the top, but rank partial type matches below real components.
+            if item.path == "type" && item.name_lower != query_lower {
+                score -= 45_000;
+            }
             if seen.insert(item.value.as_str()) {
                 scored.push((index, score));
             }
@@ -389,6 +395,22 @@ mod tests {
         assert_eq!(hits[0].value, "ApexClass:Demo");
         assert!(hits[0].path.ends_with("Demo.cls"));
         assert!(set.filter("zzzz", 5).is_empty());
+    }
+
+    #[test]
+    fn partial_type_matches_rank_below_concrete_components() {
+        let set = SuggestionSet {
+            kind: SuggestionKind::Transfer,
+            items: vec![
+                SuggestionItem::new("ApexClass", "type"),
+                SuggestionItem::new("ApexClass:Demo", "force-app/main/default/classes/Demo.cls"),
+            ],
+        };
+        let hits = set.filter("apex", 5);
+        assert_eq!(hits[0].value, "ApexClass:Demo");
+        // Typing the complete type name still offers the whole type first.
+        let hits = set.filter("ApexClass", 5);
+        assert_eq!(hits[0].value, "ApexClass");
     }
 
     #[test]

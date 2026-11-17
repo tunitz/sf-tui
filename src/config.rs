@@ -1,4 +1,4 @@
-//! User configuration: favorites, run history and theme settings.
+//! User configuration: theme settings.
 
 use std::path::{Path, PathBuf};
 
@@ -32,13 +32,6 @@ pub enum ConfigError {
 }
 
 const CONFIG_FILE: &str = "config.toml";
-/// A command marked as a favorite, with optional pre-filled flags.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Favorite {
-    pub id: String,
-    #[serde(default)]
-    pub preset_flags: Vec<String>,
-}
 
 /// Persisted appearance settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,8 +53,6 @@ impl Default for Theme {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    #[serde(default)]
-    pub favorites: Vec<Favorite>,
     #[serde(default)]
     pub theme: Theme,
 }
@@ -135,47 +126,6 @@ impl Config {
             .map(|dirs| dirs.config_dir().join(CONFIG_FILE))
             .ok_or(ConfigError::NoConfigDirectory)
     }
-
-    /// Add or remove a favorite by command id. Returns whether it is now a favorite.
-    pub fn toggle_favorite(&mut self, id: &str) -> bool {
-        if let Some(index) = self.favorites.iter().position(|favorite| favorite.id == id) {
-            self.favorites.remove(index);
-            false
-        } else {
-            self.favorites.push(Favorite {
-                id: id.to_owned(),
-                preset_flags: Vec::new(),
-            });
-            true
-        }
-    }
-
-    pub fn is_favorite(&self, id: &str) -> bool {
-        self.favorites.iter().any(|favorite| favorite.id == id)
-    }
-
-    pub fn set_preset_flags(&mut self, id: &str, flags: Vec<String>) {
-        if let Some(favorite) = self.favorites.iter_mut().find(|favorite| favorite.id == id) {
-            favorite.preset_flags = flags;
-        }
-    }
-
-    /// Move a favorite one position towards the start (-1) or end (+1).
-    pub fn move_favorite(&mut self, id: &str, delta: isize) {
-        let Some(from) = self.favorites.iter().position(|favorite| favorite.id == id) else {
-            return;
-        };
-        let target = from as isize + delta;
-        if target < 0 || target >= self.favorites.len() as isize {
-            return;
-        }
-        let item = self.favorites.remove(from);
-        self.favorites.insert(target as usize, item);
-    }
-
-    pub fn remove_favorite(&mut self, id: &str) {
-        self.favorites.retain(|favorite| favorite.id != id);
-    }
 }
 
 #[cfg(test)]
@@ -215,37 +165,23 @@ mod tests {
     }
 
     #[test]
-    fn favorites_round_trip_through_toml() {
+    fn config_with_removed_favorites_still_loads() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("nested").join("config.toml");
-        let mut config = Config::default();
-        assert!(config.toggle_favorite("org list"));
-        config.set_preset_flags("org list", vec!["--json".to_owned()]);
-        config.save_to(&path).expect("save");
-        let loaded = Config::load_from(&path).expect("load");
-        assert_eq!(loaded.favorites.len(), 1);
-        assert_eq!(loaded.favorites[0].id, "org list");
-        assert_eq!(loaded.favorites[0].preset_flags, vec!["--json"]);
-    }
-
-    #[test]
-    fn toggling_and_reordering_favorites_is_stable() {
-        let mut config = Config::default();
-        config.toggle_favorite("a");
-        config.toggle_favorite("b");
-        config.toggle_favorite("c");
-        config.move_favorite("c", -1);
+        let path = dir.path().join("old.toml");
+        std::fs::write(
+            &path,
+            "[[favorites]]\nid = \"org list\"\npreset_flags = [\"--json\"]\n\n[theme]\naccent = \"green\"\n",
+        )
+        .expect("write");
+        let config = Config::load_from(&path).expect("old config must still load");
+        assert_eq!(config.theme.accent, "green");
         assert_eq!(
-            config
-                .favorites
-                .iter()
-                .map(|f| f.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "c", "b"]
+            config,
+            Config {
+                theme: Theme {
+                    accent: "green".to_owned()
+                }
+            }
         );
-        config.move_favorite("a", -1);
-        assert_eq!(config.favorites[0].id, "a");
-        assert!(!config.toggle_favorite("c"));
-        assert_eq!(config.favorites.len(), 2);
     }
 }

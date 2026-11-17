@@ -30,7 +30,7 @@ description: How this repository structures its ratatui/crossterm event loop, ap
   built fresh from that state on every frame; there is no retained widget tree.
 - Screen state structs live in `src/app.rs`; rendering in `src/ui.rs` reads but never mutates them.
   Navigation helpers that need mutation belong on `App`.
-- Represent mutually exclusive states as enums (`Modal`, `JobPurpose`, `CatalogRow`) rather than
+- Represent mutually exclusive states as enums (`Modal`, `JobPurpose`, `JobRow`) rather than
   loose booleans and options.
 - Pure input parsing (shell-like flag splitting, JSON extraction, report parsing) lives in domain
   modules and is unit tested there.

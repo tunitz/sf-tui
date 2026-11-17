@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::catalog::string_field;
+use super::string_field;
 
 /// What the user selected as the deployment payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

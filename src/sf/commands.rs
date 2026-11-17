@@ -2,8 +2,6 @@
 //!
 //! Keeping these in one place means the command preview and the executed argv cannot drift.
 
-pub const APEX_WAIT_MINUTES: &str = "10";
-
 /// The exact `sf apex run test` argv used by the Tests screen.
 pub fn apex_test_argv(class_names: &[String], org: Option<&str>) -> Vec<String> {
     let mut argv = vec![
@@ -13,13 +11,31 @@ pub fn apex_test_argv(class_names: &[String], org: Option<&str>) -> Vec<String> 
         "--result-format".to_owned(),
         "json".to_owned(),
         "--code-coverage".to_owned(),
-        "--wait".to_owned(),
-        APEX_WAIT_MINUTES.to_owned(),
     ];
     for class_name in class_names {
         argv.push("--class-names".to_owned());
         argv.push(class_name.clone());
     }
+    if let Some(org) = org.filter(|org| !org.is_empty()) {
+        argv.push("--target-org".to_owned());
+        argv.push(org.to_owned());
+    }
+    argv.push("--json".to_owned());
+    argv
+}
+
+/// `sf apex get test` for the run id returned by `apex run test`.
+pub fn apex_test_result_argv(run_id: &str, org: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "apex".to_owned(),
+        "get".to_owned(),
+        "test".to_owned(),
+        "--test-run-id".to_owned(),
+        run_id.to_owned(),
+        "--result-format".to_owned(),
+        "json".to_owned(),
+        "--code-coverage".to_owned(),
+    ];
     if let Some(org) = org.filter(|org| !org.is_empty()) {
         argv.push("--target-org".to_owned());
         argv.push(org.to_owned());
@@ -109,10 +125,36 @@ mod tests {
         assert!(argv.contains(&"json".to_owned()));
         assert!(argv.contains(&"--code-coverage".to_owned()));
         assert!(argv.contains(&"--target-org".to_owned()));
+        assert!(!argv.contains(&"--wait".to_owned()));
         assert_eq!(
             apex_test_display(&classes, Some("dev")),
             format!("sf {}", argv.join(" "))
         );
+    }
+
+    #[test]
+    fn apex_get_test_argv_requests_the_run_and_coverage() {
+        let argv = apex_test_result_argv("08N000000000001", Some("dev"));
+        assert_eq!(
+            argv,
+            vec![
+                "apex",
+                "get",
+                "test",
+                "--test-run-id",
+                "08N000000000001",
+                "--result-format",
+                "json",
+                "--code-coverage",
+                "--target-org",
+                "dev",
+                "--json",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+        assert!(!apex_test_result_argv("id", None).contains(&"--target-org".to_owned()));
     }
 
     #[test]

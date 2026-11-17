@@ -1,13 +1,12 @@
 //! Integration coverage using a synthetic `sf` stub, plus a render smoke test for every screen.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use sftui::app::{App, OutputRecord};
 use sftui::config::Config;
-use sftui::sf::catalog::{Catalog, CatalogSource, CommandSpec};
 use sftui::sf::detect::SfInstallation;
 use sftui::sf::runner::{self, OutputStream, SfEvent};
 use sftui::sf::{Startup, StartupEvent};
@@ -43,20 +42,6 @@ fn stub_installation() -> SfInstallation {
             "stub_sf.sh"
         }),
         source: "test fixture".to_owned(),
-    }
-}
-
-fn test_catalog() -> Catalog {
-    Catalog {
-        commands: vec![CommandSpec {
-            id: "org list".to_owned(),
-            summary: "List orgs".to_owned(),
-            description: "List all orgs".to_owned(),
-            category: "Orgs".to_owned(),
-            flags: Vec::new(),
-            examples: Vec::new(),
-        }],
-        source: CatalogSource::Snapshot,
     }
 }
 
@@ -121,7 +106,6 @@ async fn staged_startup_reports_progress_without_catalog_probe() {
     let mut saw_stage = false;
     let mut saw_detected = false;
     let mut saw_version = false;
-    let mut saw_catalog = false;
     let mut saw_org = false;
     tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(event) = rx.recv().await {
@@ -129,7 +113,6 @@ async fn staged_startup_reports_progress_without_catalog_probe() {
                 StartupEvent::Stage(_) => saw_stage = true,
                 StartupEvent::Detected(_) => saw_detected = true,
                 StartupEvent::Version(version) => saw_version = version == "99.0.0",
-                StartupEvent::Catalog(catalog) => saw_catalog = catalog.commands.len() == 1,
                 StartupEvent::CurrentOrg(org) => saw_org = org == "test-scratch",
                 StartupEvent::Finished => break,
                 StartupEvent::Notice(_) => {}
@@ -140,10 +123,6 @@ async fn staged_startup_reports_progress_without_catalog_probe() {
     .expect("startup probe finished");
     let startup = task.await.expect("probe task");
     assert!(saw_stage && saw_detected && saw_version && saw_org);
-    assert!(
-        !saw_catalog,
-        "catalog should come from the bundled snapshot by default"
-    );
     assert_eq!(startup.version.as_deref(), Some("99.0.0"));
 }
 
@@ -200,7 +179,6 @@ fn every_screen_renders_without_panicking() {
             installation: None,
             version: Some("99.0.0".to_owned()),
             current_org: Some("test-scratch".to_owned()),
-            catalog: test_catalog(),
             notices: vec!["synthetic notice".to_owned()],
         },
         Config::default(),
@@ -218,8 +196,45 @@ fn every_screen_renders_without_panicking() {
         exit_code: None,
         finished: false,
         queued: false,
+        started_at: Some(Instant::now()),
+        ended_at: None,
         json: Some(serde_json::json!({"result":{"status":"ok"}})),
         result: None,
+        pending_report: false,
+    });
+    app.output_state.records.push(OutputRecord {
+        id: 2,
+        command: "sf apex run test --json".to_owned(),
+        purpose: "apex tests".to_owned(),
+        task: sftui::app::TaskKind::Tests,
+        executable: "sf".into(),
+        argv: vec!["apex".to_owned(), "run".to_owned(), "test".to_owned()],
+        lines: Vec::new(),
+        line_bytes: 0,
+        exit_code: Some(0),
+        finished: true,
+        queued: false,
+        started_at: Some(Instant::now()),
+        ended_at: Some(Instant::now()),
+        json: None,
+        result: Some(sftui::app::ResultView {
+            kind: sftui::app::ResultKind::ApexTests,
+            title: "Apex tests".to_owned(),
+            status: "Passed".to_owned(),
+            ok: true,
+            summary: "2 run · 2 passed · 0 failed · 0 skipped · coverage 81%".to_owned(),
+            items: Vec::new(),
+            coverage: (0..8usize)
+                .map(|index| sftui::app::ResultItem {
+                    ok: true,
+                    label: format!("Demo{index}"),
+                    detail: format!("{}% · {}/10 lines", 40 + index * 5, 4 + index),
+                    progress: Some((4 + index, 10)),
+                })
+                .collect(),
+            sections: Vec::new(),
+        }),
+        pending_report: false,
     });
     for (width, height) in [(120, 40), (80, 24), (60, 16), (48, 12)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -236,9 +251,15 @@ fn every_screen_renders_without_panicking() {
                 assert!(rendered.contains("[r] Retrieve"), "menu missing");
                 assert!(rendered.contains("MENU"), "menu heading missing");
             }
+            if (width, height) == (60, 16) && tab == sftui::app::Tab::Tests {
+                assert!(
+                    rendered.to_lowercase().contains("coverage"),
+                    "coverage pane missing"
+                );
+            }
             if (width, height) == (120, 40) && tab == sftui::app::Tab::Home {
                 assert!(!rendered.contains("[1]"), "tab bar must be gone");
-                assert!(rendered.contains("F2 history"), "key hints missing");
+                assert!(rendered.contains("F2 jobs"), "key hints missing");
             }
         }
         for modal in [
@@ -262,9 +283,11 @@ fn every_screen_renders_without_panicking() {
                 ],
                 focus: 0,
             },
-            sftui::app::Modal::TestHistory {
-                runs: Vec::new(),
+            sftui::app::Modal::Jobs {
                 selected: 0,
+                focus: sftui::app::JobsFocus::List,
+                scroll: 0,
+                follow: true,
             },
             sftui::app::Modal::TestConfirm {
                 entries: Vec::new(),
@@ -299,7 +322,6 @@ fn prompt_overlay_renders_with_a_cursor() {
             installation: None,
             version: None,
             current_org: None,
-            catalog: test_catalog(),
             notices: Vec::new(),
         },
         Config::default(),

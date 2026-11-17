@@ -1,15 +1,11 @@
-//! Parsing and local persistence of Apex test runs.
+//! Parsing of Apex test runs.
 
-use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::catalog::string_field;
-
-pub const TEST_RESULTS_FILE: &str = "test-runs.json";
-const MAX_RUNS: usize = 50;
+use super::string_field;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestResultRow {
@@ -47,31 +43,6 @@ pub struct TestRun {
     pub tests: Vec<TestResultRow>,
     pub failures: Vec<TestFailure>,
     pub coverages: Vec<Coverage>,
-}
-
-pub fn path(config_dir: &Path) -> PathBuf {
-    config_dir.join(TEST_RESULTS_FILE)
-}
-
-pub fn load(config_dir: &Path) -> Vec<TestRun> {
-    let Ok(bytes) = std::fs::read(path(config_dir)) else {
-        return Vec::new();
-    };
-    serde_json::from_slice(&bytes).unwrap_or_default()
-}
-
-pub fn save(config_dir: &Path, runs: &[TestRun]) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(runs).unwrap_or_default();
-    crate::fsutil::write_private(&path(config_dir), &bytes)
-}
-
-pub fn record(config_dir: &Path, run: TestRun) -> Vec<TestRun> {
-    let mut runs = load(config_dir);
-    runs.retain(|existing| existing.id != run.id || existing.at != run.at);
-    runs.insert(0, run);
-    runs.truncate(MAX_RUNS);
-    let _ = save(config_dir, &runs);
-    runs
 }
 
 pub fn parse(value: &Value, command: &str) -> TestRun {
@@ -210,9 +181,30 @@ fn count(value: Option<&Value>) -> usize {
     }
 }
 
+/// Outcomes that mean the org has finished the run and `apex get test` has the final result.
+pub fn is_terminal_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome.to_ascii_lowercase().as_str(),
+        "passed" | "failed" | "completed" | "aborted" | "compilefail"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_outcomes_are_recognized() {
+        for outcome in ["Passed", "Failed", "Completed", "Aborted", "CompileFail"] {
+            assert!(is_terminal_outcome(outcome), "{outcome} must be terminal");
+        }
+        for outcome in ["Processing", "Queued", "", "Unknown"] {
+            assert!(
+                !is_terminal_outcome(outcome),
+                "{outcome} must not be terminal"
+            );
+        }
+    }
 
     #[test]
     fn parses_summary_failures_and_coverages() {
@@ -272,28 +264,5 @@ mod tests {
         let run = parse(&value, "sf apex run test");
         assert_eq!(run.coverages[0].covered, 3);
         assert_eq!(run.coverages[0].total, 4);
-    }
-
-    #[test]
-    fn results_round_trip_and_are_bounded() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        for index in 0..60 {
-            let run = TestRun {
-                id: format!("run-{index}"),
-                at: index,
-                command: "sf apex run test".to_owned(),
-                outcome: "Passed".to_owned(),
-                tests_run: 1,
-                passing: 1,
-                failing: 0,
-                skipped: 0,
-                coverage: "100%".to_owned(),
-                tests: Vec::new(),
-                failures: Vec::new(),
-                coverages: Vec::new(),
-            };
-            record(dir.path(), run);
-        }
-        assert_eq!(load(dir.path()).len(), MAX_RUNS);
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: sf-cli-contracts
-description: JSON shapes the TUI relies on from the Salesforce CLI, how to refresh the bundled catalog snapshot, and how to regenerate synthetic test fixtures. Use when changing parsing in src/sf or fixtures in tests.
+description: JSON shapes the TUI relies on from the Salesforce CLI and how to regenerate synthetic test fixtures. Use when changing parsing in src/sf or fixtures in tests.
 ---
 
 # Salesforce CLI contracts
@@ -13,34 +13,18 @@ Fields absent in one CLI version must degrade to empty values rather than fail.
 | Command | Consumed shape | Notes |
 | --- | --- | --- |
 | `version --json` | `result.version` or a plain version token | Probe runs with a 5 s timeout |
-| `commands --json` | `result[]` with `id`, `summary`, `description`, `flags`, `examples`, optional `category` | Missing list falls back to the snapshot |
-| `<command> --help` | plain text | Flag lines such as `-o, --target-org <value> ... (required)` are parsed for the detail pane |
+| `apex run test --json` | `result.testRunId`, optional `summary`/`tests`/`codecoverage` | Runs without `--wait` and returns at once; the summary outcome is `Processing`/`Queued` until the org finishes |
+| `apex get test --test-run-id <id> --code-coverage --json` | `result.summary`, `result.tests[]`, `result.codecoverage[]` | Polled every 3 s until the outcome is terminal; `codecoverage` carries per-class `percentage`, `numLinesCovered`, `numLinesUncovered` |
 | `org list --json` | `result.scratchOrgs[]`, `result.nonScratchOrgs[]` | `aliases` may be a string or array; flags `isDefaultUsername`, `isDefaultDevHubUsername` |
 | `org display --json` | `result{}` | Filter `accessToken`, `refreshToken`, `sfdxAuthUrl`, `password`, `clientSecret`, `privateKey` |
-| `config get target-org --json` | `result.target-org`, a string, or an array of `{name,value}` entries | Probed at startup to show the current org; falls back to `org display --json` |
+| `config get target-org --json` | `result.target-org`, a string, or an array of `{name,value}` entries | Probed at startup to show the current org without running `org list` |
 | `project deploy start --json` | `result.id` | Job id drives `project deploy report --json --job-id <id>`; flags: `--source-dir`, `--dry-run`, `--metadata`, `--test-level` |
-| component completion | all project files (cap 50k), package.xml `<types>`, common metadata types | `src/sf/metadata.rs` detects Apex by extension, ranks `Type:Name` candidates with a fast substring pass, shows source paths; `PromptField` debounces re-ranking by 90 ms and supports multi-select with Space |
+| component completion | all project files (cap 50k), package.xml `<types>`, common metadata types | `src/sf/metadata.rs` detects Apex by extension, ranks concrete `Type:Name` candidates above bare metadata types with a fast substring pass, shows source paths; `PromptField` debounces re-ranking by 90 ms and supports multi-select with Space |
 | `project deploy report --json` | `result.status`, `result.components` | `components` may be counters (`total`, `successes`, `failed`) or an array of per-component objects |
-| `project retrieve start --json` | final result directly | There is no `project retrieve report`; run it with `--wait` and read the returned components |
+| `project retrieve start --json` | final result directly | There is no `project retrieve report`; the command waits for the retrieve and returns the components |
 
 Never assume an org alias is a username. Keep the original username for all CLI invocations and
 use aliases only as labels.
-
-## Catalog snapshot refresh
-
-`data/commands.json` is a compact array of
-`{id, summary, description, category, flags: [[name, description]], examples: [[command, description]]}`.
-It is generated from the public sfcli command reference:
-
-1. Read the public command reference JSON (`id`, `summary`, `description`, `flags`, `examples`).
-2. Normalize ids from `org:list` to `org list`; derive a readable `category` from the id prefix.
-3. Keep only the fields above; write compact JSON to `data/commands.json`.
-4. Run `cargo test sf::catalog` and check that the catalog has more than 250 commands.
-
-The bundled snapshot is always used at startup. A cached `sf commands --json` response is read
-when it is younger than seven days, and F5 on the Catalog screen performs an explicit live refresh
-that replaces the catalog and updates the cache. JSON extraction tolerates bracketed warning
-lines before the document.
 
 ## Synthetic stub fixtures
 

@@ -5,10 +5,6 @@ case "$*" in
   "version --json")
     printf '%s\n' '{"status":0,"result":{"version":"99.0.0"}}'
     ;;
-  "commands --json")
-    printf '%s\n' 'warning: synthetic plugin notice'
-    printf '%s\n' '{"status":0,"result":[{"id":"org list","summary":"List orgs","category":"Orgs","flags":[{"name":"json","description":"JSON output","type":"boolean","required":false}],"examples":[["sf org list","List orgs"]]}]}'
-    ;;
   "config get target-org --json" | "org display --json")
     printf '%s\n' '{"status":0,"result":{"target-org":"test-scratch"}}'
     ;;
@@ -24,11 +20,11 @@ case "$*" in
   "project retrieve start --metadata ApexClass --json" | "project retrieve start --metadata CustomLabel --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000002","status":"Succeeded"}}'
     ;;
-  "apex run test --result-format json --code-coverage --wait 10 --json" | "apex run test --result-format json --code-coverage --wait 10 --class-names DemoTest --target-org test-scratch --json")
-    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"81%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"codecoverage":[{"name":"Demo","percentage":"81%","numLinesCovered":17,"numLinesUncovered":4}]}}'
+  "apex run test --result-format json --code-coverage --class-names DemoTest --target-org test-scratch --json")
+    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Processing","testsRan":0,"passing":0,"failing":0,"skipped":0}}}'
     ;;
-  "apex run test --result-format human --wait 10 --class-names DemoTest --target-org test-scratch --json")
-    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}'
+  "apex get test --test-run-id 08N000000000001 --result-format json --code-coverage --target-org test-scratch --json")
+    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"81%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"codecoverage":[{"name":"Demo","percentage":"81%","numLinesCovered":17,"numLinesUncovered":4},{"name":"DemoHelper","percentage":"44%","numLinesCovered":4,"numLinesUncovered":5}]}}'
     ;;
   "project deploy report --job-id 0Af000000000001 --json" | "project deploy report --job-id 0Af000000000001 --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}'

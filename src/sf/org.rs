@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use super::catalog::string_field;
+use super::string_field;
 
 /// One org from either the scratch or non-scratch section of `org list`.
 #[derive(Debug, Clone, PartialEq, Eq)]

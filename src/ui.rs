@@ -8,7 +8,7 @@ use ratatui::widgets::{
     Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
 };
 
-use crate::app::{App, CatalogRow, Modal, Tab};
+use crate::app::{App, JobSection, JobsFocus, Modal, ResultItem, Tab, TestsFocus};
 use crate::json_view;
 
 fn accent(app: &App) -> Color {
@@ -39,7 +39,6 @@ fn short_tab(tab: Tab) -> &'static str {
         Tab::Retrieve => "Retrieve",
         Tab::Deploy => "Deploy",
         Tab::Tests => "Tests",
-        Tab::Catalog => "Cat",
         Tab::Orgs => "Orgs",
         Tab::Setup => "Setup",
     }
@@ -65,6 +64,44 @@ fn strong(text: impl Into<String>, color: Color) -> Span<'static> {
         text.into(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
+}
+
+/// Wrap text on word boundaries, hard-splitting a token longer than the available width.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if word_len > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let mut chunk = String::new();
+            for character in word.chars() {
+                chunk.push(character);
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+            }
+            current = chunk;
+            continue;
+        }
+        let extra = usize::from(!current.is_empty());
+        if current.chars().count() + extra + word_len > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn truncated(text: &str, max: usize) -> String {
@@ -93,7 +130,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Tab::Home => draw_home(frame, layout[1], app),
         Tab::Retrieve | Tab::Deploy => draw_transfer(frame, layout[1], app),
         Tab::Tests => draw_tests(frame, layout[1], app),
-        Tab::Catalog => draw_catalog(frame, layout[1], app),
         Tab::Orgs => draw_orgs(frame, layout[1], app),
         Tab::Setup => draw_setup(frame, layout[1], app),
     }
@@ -152,15 +188,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
         Style::default().fg(Color::Green)
     };
     if density == Density::Tiny {
-        let text = if app.status.is_empty() {
-            key_hints(app)
+        let line = if app.status.is_empty() {
+            keycap_line(app, usize::from(area.width))
         } else {
-            truncated(&app.status, area.width.saturating_sub(1) as usize)
+            Line::from(Span::styled(
+                truncated(&app.status, area.width.saturating_sub(1) as usize),
+                status_style,
+            ))
         };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(text, status_style))),
-            area,
-        );
+        frame.render_widget(Paragraph::new(line), area);
         return;
     }
     let status = if app.status.is_empty() {
@@ -168,34 +204,109 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
     } else {
         truncated(&app.status, area.width.saturating_sub(2) as usize)
     };
-    let hints = truncated(&key_hints(app), area.width.saturating_sub(2) as usize);
     let sections = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(status, status_style))),
         sections[0],
     );
-    frame.render_widget(Paragraph::new(Line::from(faint(hints))), sections[1]);
+    frame.render_widget(
+        Paragraph::new(keycap_line(
+            app,
+            usize::from(sections[1].width.saturating_sub(1)),
+        )),
+        sections[1],
+    );
 }
 
-fn key_hints(app: &App) -> String {
-    let typing = matches!(app.tab, Tab::Retrieve | Tab::Deploy | Tab::Tests)
-        || (app.tab == Tab::Catalog && app.catalog_state.search_focused);
-    let common = if typing {
-        "F2 history · Esc back · Ctrl+Y copy · Ctrl+X cancel"
-    } else {
-        "? help · q quit · y copy · F2 history · Ctrl+X cancel · Esc back"
-    };
-    let specific = match app.tab {
-        Tab::Home => "↑↓ move · Enter open · F2 history",
-        Tab::Retrieve | Tab::Deploy | Tab::Tests => {
-            "type · Enter search · Space select · Enter confirm"
+/// At most five keycaps for the current screen; trailing pairs are dropped, never wrapped.
+fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    match app.tab {
+        Tab::Home => vec![
+            ("↑↓", "move"),
+            ("Enter", "open"),
+            ("F2", "jobs"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
+        Tab::Retrieve | Tab::Deploy => vec![
+            ("Enter", "search"),
+            ("Space", "select"),
+            ("Enter", "confirm"),
+            ("F2", "jobs"),
+            ("Esc", "back"),
+        ],
+        Tab::Tests => {
+            let has_coverage = app
+                .latest_result(crate::app::TaskKind::Tests)
+                .is_some_and(|result| !result.coverage.is_empty());
+            if has_coverage && app.tests_focus == TestsFocus::Coverage {
+                vec![
+                    ("↑↓", "scroll"),
+                    ("PgUp/PgDn", "page"),
+                    ("Tab", "search"),
+                    ("F2", "jobs"),
+                    ("Esc", "back"),
+                ]
+            } else if has_coverage {
+                vec![
+                    ("Enter", "search"),
+                    ("Space", "select"),
+                    ("Tab", "coverage"),
+                    ("F2", "jobs"),
+                    ("Esc", "back"),
+                ]
+            } else {
+                vec![
+                    ("Enter", "search"),
+                    ("Space", "select"),
+                    ("F2", "jobs"),
+                    ("Esc", "back"),
+                ]
+            }
         }
-        Tab::Catalog => "/ search · Enter help · r run · f favorite",
-        Tab::Orgs => "Enter details · o open · d default · l login · x logout · F5 refresh",
-        Tab::Setup => "Enter run installer · r re-probe",
-    };
-    // Screen-specific keys come first so a narrow terminal truncates the generic hints instead.
-    format!("{specific}   |   {common}")
+        Tab::Orgs => vec![
+            ("Enter", "details"),
+            ("o", "open"),
+            ("F2", "jobs"),
+            ("F5", "refresh"),
+            ("Esc", "back"),
+        ],
+        Tab::Setup => vec![
+            ("Enter", "run"),
+            ("r", "re-probe"),
+            ("F2", "jobs"),
+            ("?", "help"),
+            ("Esc", "back"),
+        ],
+    }
+}
+
+fn keycap_line(app: &App, width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for (key, label) in key_hints(app) {
+        let piece = key.chars().count() + label.chars().count() + 3;
+        let separator = if spans.is_empty() { 0 } else { 2 };
+        if used + separator + piece > width {
+            break;
+        }
+        if separator > 0 {
+            spans.push(Span::raw("  "));
+            used += separator;
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            Style::default()
+                .fg(accent(app))
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+        used += piece;
+    }
+    Line::from(spans)
 }
 
 fn keycap(key: &str, label: &str, color: Color) -> Span<'static> {
@@ -283,19 +394,19 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(" "));
     lines.push(Line::from(faint(
-        "↑↓ move · Enter open · F2 history · ? help · q quit",
+        "↑↓ move · Enter open · F2 jobs · ? help · q quit",
     )));
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
     let state = &app.test_search;
-    let latest = latest_result_lines(app, crate::app::TaskKind::Tests);
+    let latest = app.latest_result(crate::app::TaskKind::Tests);
+    let has_coverage = latest.is_some_and(|result| !result.coverage.is_empty());
     let sections = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(2),
-        Constraint::Length(latest.len() as u16),
         Constraint::Length(1),
     ])
     .split(area);
@@ -331,6 +442,58 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
         ]),
         sections[1],
     );
+
+    if has_coverage && let Some(result) = latest {
+        let body = sections[2];
+        let bottom = ((u32::from(body.height) * 40 / 100) as u16)
+            .clamp(6, 14)
+            .min(body.height);
+        let rows = Layout::vertical([
+            Constraint::Length(body.height.saturating_sub(bottom)),
+            Constraint::Length(bottom),
+        ])
+        .split(body);
+        render_test_list(frame, rows[0], app, state);
+        draw_test_coverage(frame, rows[1], app, result);
+    } else {
+        let latest_lines = latest_result_lines(app, crate::app::TaskKind::Tests);
+        let rows = Layout::vertical([
+            Constraint::Min(2),
+            Constraint::Length(latest_lines.len() as u16),
+        ])
+        .split(sections[2]);
+        render_test_list(frame, rows[0], app, state);
+        if !latest_lines.is_empty() {
+            frame.render_widget(Paragraph::new(Text::from(latest_lines)), rows[1]);
+        }
+    }
+
+    let footer = if has_coverage && app.tests_focus == TestsFocus::Coverage {
+        let classes = latest.map_or(0, |result| result.coverage.len());
+        format!("coverage focused — {classes} classes · ↑↓ scroll · Tab search · Esc back")
+    } else {
+        let mut text = format!("{} selected", state.checked().len());
+        if state.searching {
+            text.push_str("                        searching…");
+        } else if state.needs_search() {
+            text.push_str("                        [Enter] search");
+        } else {
+            text.push_str("              [Space] select   [Enter] confirm");
+        }
+        if has_coverage {
+            text.push_str("   [Tab] coverage");
+        }
+        text
+    };
+    frame.render_widget(Paragraph::new(Line::from(faint(footer))), sections[3]);
+}
+
+fn render_test_list(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    state: &crate::app::TransferSearchState,
+) {
     let items: Vec<ListItem> = state
         .results
         .iter()
@@ -369,296 +532,146 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
     }
     frame.render_stateful_widget(
         List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
-        sections[2],
+        area,
         &mut list_state,
     );
-    if !latest.is_empty() {
-        frame.render_widget(Paragraph::new(Text::from(latest)), sections[3]);
-    }
-    frame.render_widget(
-        Line::from(vec![
-            faint(format!("{} selected", state.checked().len())),
-            faint(if state.searching {
-                "                        searching…"
-            } else if state.needs_search() {
-                "                        [Enter] search"
-            } else {
-                "              [Space] select   [Enter] confirm"
-            }),
-        ]),
-        sections[4],
-    );
 }
 
-fn draw_catalog(frame: &mut Frame, area: Rect, app: &App) {
-    let density = density(area);
-    let rows = app.catalog_rows();
-    if density != Density::Roomy {
-        let sections = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(2),
-            Constraint::Length(1),
-        ])
-        .split(area);
-        let query = if app.catalog_state.query.is_empty() {
-            "/ fuzzy search".to_owned()
-        } else {
-            format!("/ {}", app.catalog_state.query)
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(strong(
-                truncated(&query, area.width.saturating_sub(1) as usize),
-                if app.catalog_state.search_focused {
-                    Color::Yellow
-                } else {
-                    accent(app)
-                },
-            ))),
-            sections[0],
-        );
-        let items: Vec<ListItem> = rows
-            .iter()
-            .map(|row| match row {
-                CatalogRow::Header(name) => {
-                    ListItem::new(Line::from(strong(truncated(name, 60), accent(app))))
-                }
-                CatalogRow::Command {
-                    id,
-                    summary,
-                    favorite,
-                    ..
-                } => ListItem::new(Line::from(vec![
-                    Span::styled(
-                        if *favorite { "*" } else { " " },
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(id.clone(), Style::default().fg(Color::Reset)),
-                    faint(truncated(
-                        &format!("  {summary}"),
-                        usize::from(area.width).saturating_sub(id.len() + 5),
-                    )),
-                ])),
-            })
-            .collect();
-        let selected = app.catalog_state.selected_id.as_ref().and_then(|id| {
-            rows.iter().position(
-                |row| matches!(row, CatalogRow::Command { id: row_id, .. } if row_id == id),
-            )
-        });
-        let mut state = ListState::default();
-        state.select(selected);
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(block("commands", app))
-                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-                .highlight_symbol("›"),
-            sections[1],
-            &mut state,
-        );
-        if let Some(command) = app.selected_command() {
-            frame.render_widget(
-                Paragraph::new(Line::from(faint(truncated(
-                    &format!("sf {} — Enter help | r run | ? keys", command.id),
-                    area.width.saturating_sub(1) as usize,
-                )))),
-                sections[2],
-            );
-        }
-        return;
+fn draw_test_coverage(frame: &mut Frame, area: Rect, app: &App, result: &crate::app::ResultView) {
+    let focused = app.tests_focus == TestsFocus::Coverage;
+    let title = if focused {
+        "COVERAGE — focused · Tab search · ↑↓ scroll"
+    } else {
+        "coverage — Tab to focus"
+    };
+    let mut cover_block = block(title, app);
+    if focused {
+        cover_block = cover_block.border_style(Style::default().fg(accent(app)));
     }
-    let columns =
-        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).split(area);
-    let title = if app.catalog_state.search_focused {
-        format!("commands — search: {}|", app.catalog_state.query)
-    } else if app.catalog_state.query.is_empty() {
-        format!(
-            "commands — {} · {} total ( / to search )",
-            app.startup.catalog.source.label(),
-            app.startup.catalog.commands.len()
-        )
-    } else {
-        format!(
-            "commands — '{}' ({} rows)",
-            app.catalog_state.query,
-            rows.len()
-        )
-    };
-    let left = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(columns[0]);
-    let search_style = if app.catalog_state.search_focused {
-        Style::default()
-            .fg(accent(app))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
+    frame.render_widget(cover_block.clone(), area);
+    let inner = cover_block.inner(area);
+    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
+    let color = if result.ok { Color::Green } else { Color::Red };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            strong("Search  ", accent(app)),
             Span::styled(
-                if app.catalog_state.query.is_empty() {
-                    "fuzzy command id or summary…".to_owned()
-                } else if app.catalog_state.search_focused {
-                    format!("{}|", app.catalog_state.query)
-                } else {
-                    app.catalog_state.query.clone()
-                },
-                search_style,
+                format!("[{}] ", if result.ok { "✓" } else { "✗" }),
+                Style::default().fg(color),
             ),
-        ]))
-        .block(block("catalog filter", app)),
-        left[0],
+            strong("LATEST RESULT ", accent(app)),
+            Span::styled(
+                format!("{} · {}", result.status, result.summary),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        sections[0],
     );
-    let items: Vec<ListItem> = rows
-        .iter()
-        .map(|row| match row {
-            CatalogRow::Header(name) => {
-                ListItem::new(Line::from(strong(format!("  {name}"), accent(app))))
-            }
-            CatalogRow::Command {
-                id,
-                summary,
-                matched,
-                favorite,
-            } => {
-                let mut spans = vec![Span::styled(
-                    if *favorite { "★ " } else { "  " },
-                    Style::default().fg(if *favorite {
-                        Color::Yellow
-                    } else {
-                        Color::DarkGray
-                    }),
-                )];
-                for (byte_index, character) in id.char_indices() {
-                    let highlighted = matched
-                        .as_ref()
-                        .is_some_and(|indices| indices.contains(&byte_index));
-                    spans.push(Span::styled(
-                        character.to_string(),
-                        if highlighted {
-                            Style::default()
-                                .fg(accent(app))
-                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-                        } else {
-                            Style::default().fg(Color::Reset)
-                        },
-                    ));
-                }
-                spans.push(Span::styled(
-                    format!("  — {summary}"),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                ListItem::new(Line::from(spans))
-            }
-        })
-        .collect();
-    let selected = app.catalog_state.selected_id.as_ref().and_then(|id| {
-        rows.iter()
-            .position(|row| matches!(row, CatalogRow::Command { id: row_id, .. } if row_id == id))
-    });
-    let mut state = ListState::default();
-    state.select(selected);
-    let list = List::new(items)
-        .block(block(title, app))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("› ");
-    frame.render_stateful_widget(list, left[1], &mut state);
-    draw_command_detail(frame, columns[1], app);
+    let visible = usize::from(sections[1].height).saturating_sub(3).max(1);
+    app.tests_coverage_rows.set(visible);
+    let (lines, _) = coverage_table_lines(
+        &result.coverage,
+        usize::from(sections[1].width),
+        app.coverage_scroll,
+        visible,
+    );
+    frame.render_widget(Paragraph::new(Text::from(lines)), sections[1]);
 }
 
-fn draw_command_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(command) = app.selected_command() else {
-        frame.render_widget(
-            Paragraph::new("No command selected").block(block("detail", app)),
-            area,
-        );
-        return;
-    };
-    let mut lines: Vec<Line<'static>> = vec![
-        strong("sf ", accent(app)) + strong(command.id.clone(), Color::Reset),
-        Line::from(Span::styled(
-            command.summary.clone(),
-            Style::default().fg(Color::Gray),
-        )),
-        Line::from(faint(format!("category: {}", command.category))),
-        Line::from(" "),
-    ];
-    for paragraph in command
-        .description
-        .split('\n')
-        .filter(|line| !line.trim().is_empty())
-        .take(14)
+/// Percentage points parsed from the stored coverage string, falling back to covered/total.
+fn coverage_percent(item: &ResultItem) -> f64 {
+    if let Some(percent) = item
+        .detail
+        .split_whitespace()
+        .next()
+        .and_then(|token| token.trim_end_matches('%').parse::<f64>().ok())
     {
+        return percent;
+    }
+    if let Some((covered, total)) = item.progress
+        && total > 0
+    {
+        return covered as f64 * 100.0 / total as f64;
+    }
+    0.0
+}
+
+/// Shared per-class coverage table: worst percentage first, then class name.
+/// Returns the rendered lines and the maximum scroll offset for `max_rows`.
+pub(crate) fn coverage_table_lines(
+    coverages: &[ResultItem],
+    width: usize,
+    scroll: usize,
+    max_rows: usize,
+) -> (Vec<Line<'static>>, usize) {
+    if coverages.is_empty() {
+        return (
+            vec![Line::from(faint(
+                "No per-class coverage returned by the CLI.",
+            ))],
+            0,
+        );
+    }
+    let mut sorted: Vec<(&ResultItem, f64)> = coverages
+        .iter()
+        .map(|item| (item, coverage_percent(item)))
+        .collect();
+    sorted.sort_by(|left, right| {
+        left.1
+            .partial_cmp(&right.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.label.cmp(&right.0.label))
+    });
+    let total = sorted.len();
+    let max_rows = max_rows.max(1);
+    let max_scroll = total.saturating_sub(max_rows);
+    let scroll = scroll.min(max_scroll);
+    // The bar is the first thing to drop when the pane is narrow, so the numbers stay readable.
+    let show_bar = width >= 56;
+    let name_width = if show_bar {
+        width.saturating_sub(38).clamp(10, 40)
+    } else {
+        width.saturating_sub(20).clamp(8, 40)
+    };
+    let header = if show_bar {
+        format!(
+            "{:<name_width$}  {:>7}  {:>8}  {}",
+            "CLASS", "COVERAGE", "LINES", " "
+        )
+    } else {
+        format!(
+            "{:<name_width$}  {:>7}  {:>8}",
+            "CLASS", "COVERAGE", "LINES"
+        )
+    };
+    let mut lines = vec![
+        Line::from(faint(format!("{total} classes · worst first"))),
+        Line::from(" "),
+        Line::from(Span::styled(
+            truncated(&header, width),
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+    for (item, percent) in sorted.iter().skip(scroll).take(max_rows) {
+        let name = truncated(&item.label, name_width);
+        let counts = item
+            .progress
+            .map(|(covered, total)| format!("{covered}/{total}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let mut text = format!("{name:<name_width$}  {percent:>7.1}%  {counts:>8}");
+        if show_bar
+            && let Some((covered, total)) = item.progress
+            && total > 0
+        {
+            text.push_str(&format!("  {}", coverage_bar(covered, total)));
+        }
         lines.push(Line::from(Span::styled(
-            truncated(paragraph, area.width.saturating_sub(4) as usize),
-            Style::default().fg(Color::Gray),
+            truncated(&text, width),
+            Style::default().fg(Color::Reset),
         )));
     }
-    lines.push(Line::from(" "));
-    let show_help = app.catalog_state.help_for.as_deref() == Some(command.id.as_str())
-        && !app.catalog_state.help_flags.is_empty();
-    let flags: Vec<&crate::sf::catalog::Flag> = if show_help {
-        app.catalog_state.help_flags.iter().take(16).collect()
-    } else {
-        command.flags.iter().take(16).collect()
-    };
-    lines.push(strong_line("FLAGS", accent(app)));
-    for flag in flags {
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  --{}", flag.name),
-                Style::default().fg(accent(app)),
-            ),
-            Span::styled(
-                format!(
-                    "  {}",
-                    truncated(&flag.description, area.width.saturating_sub(30) as usize)
-                ),
-                Style::default().fg(Color::Gray),
-            ),
-        ]));
-    }
-    if !command.examples.is_empty() {
-        lines.push(Line::from(" "));
-        lines.push(strong_line("EXAMPLES", accent(app)));
-        for example in command.examples.iter().take(4) {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {}",
-                    truncated(&example.command, area.width.saturating_sub(4) as usize)
-                ),
-                Style::default().fg(Color::Reset),
-            )));
-            if !example.description.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "      {}",
-                        truncated(&example.description, area.width.saturating_sub(4) as usize)
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-        }
-    }
-    lines.push(Line::from(faint(if show_help {
-        "Flags from live --help"
-    } else {
-        "Enter loads live --help"
-    })));
-    lines.push(Line::from(" "));
-    lines.push(action_bar(
-        vec![
-            ("/", "search"),
-            ("Enter", "help"),
-            ("r", "run"),
-            ("f", "favorite"),
-            ("y", "copy"),
-        ],
-        app,
-    ));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(block("command detail", app)),
-        area,
-    );
+    (lines, max_scroll)
 }
 
 fn strong_line(text: &str, color: Color) -> Line<'static> {
@@ -844,14 +857,14 @@ fn latest_result_lines(app: &App, kind: crate::app::TaskKind) -> Vec<Line<'stati
             format!("{} · {}", result.status, result.summary),
             Style::default().fg(Color::DarkGray),
         ),
-        Span::styled("   F2 history", Style::default().fg(Color::DarkGray)),
+        Span::styled("   F2 jobs", Style::default().fg(Color::DarkGray)),
     ])];
     for item in result.items.iter().take(4) {
         lines.push(result_item_line(item));
     }
     if result.items.len() > 4 {
         lines.push(Line::from(faint(format!(
-            "   … {} more · F2 opens the full result",
+            "   … {} more · F2 opens the jobs window",
             result.items.len() - 4
         ))));
     }
@@ -971,66 +984,6 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn test_run_lines(
-    app: &App,
-    run: &crate::sf::test_results::TestRun,
-    expanded: bool,
-) -> Vec<Line<'static>> {
-    let passed =
-        run.outcome.eq_ignore_ascii_case("Passed") || run.outcome.eq_ignore_ascii_case("Pass");
-    let mut lines = vec![
-        strong("APEX TESTS", accent(app))
-            + Span::styled(" — ", Style::default().fg(Color::DarkGray))
-            + strong(
-                if passed { "PASS" } else { "FAILED" },
-                if passed { Color::Green } else { Color::Red },
-            ),
-        Line::from(faint(&run.command)),
-        Line::from(faint(format!(
-            "{} · {} run · {} passed · {} failed · {} skipped · coverage {}",
-            run.outcome, run.tests_run, run.passing, run.failing, run.skipped, run.coverage
-        ))),
-        Line::from(" "),
-        Line::from(faint("[Esc] close   [↑↓] scroll")),
-    ];
-    if expanded {
-        lines.push(Line::from(" "));
-        lines.push(strong_line("HIGHLIGHTS", accent(app)));
-        lines.push(Line::from(faint(format!("Outcome: {}", run.outcome))));
-        lines.push(Line::from(faint(format!(
-            "Failures: {}",
-            run.failures.len()
-        ))));
-        lines.push(Line::from(faint(format!("Coverage: {}", run.coverage))));
-        if !run.failures.is_empty() {
-            lines.push(Line::from(" "));
-            lines.push(strong_line("ERRORS", Color::Red));
-            for failure in run.failures.iter().take(200) {
-                lines.push(Line::from(Span::styled(
-                    truncated(&format!("{}: {}", failure.name, failure.message), 100),
-                    Style::default().fg(Color::Red),
-                )));
-            }
-        }
-        lines.push(Line::from(" "));
-        lines.push(strong_line("APEX CLASS COVERAGE", accent(app)));
-        if run.coverages.is_empty() {
-            lines.push(Line::from(faint("No coverage data returned.")));
-        }
-        for coverage in run.coverages.iter().take(200) {
-            lines.push(Line::from(faint(format!(
-                "{:<32} {:>6}  ({}/{})",
-                truncated(&coverage.name, 32),
-                coverage.percent,
-                coverage.covered,
-                coverage.total
-            ))));
-        }
-        lines.push(Line::from(" "));
-    }
-    lines
-}
-
 fn summary_chips(summary: &str) -> Line<'static> {
     let mut spans = Vec::new();
     for (index, part) in summary
@@ -1105,38 +1058,19 @@ fn result_item_line(item: &crate::app::ResultItem) -> Line<'static> {
     Line::from(spans)
 }
 
-fn pinned_lines(
-    frame: &mut Frame,
-    area: Rect,
-    lines: Vec<Line<'static>>,
-    hints: String,
-    scroll: usize,
-) {
-    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-    let max_scroll = lines.len().saturating_sub(usize::from(sections[0].height));
-    let scroll = scroll.min(max_scroll).min(u16::MAX as usize) as u16;
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll, 0)),
-        sections[0],
-    );
-    frame.render_widget(Paragraph::new(Line::from(faint(hints))), sections[1]);
-}
-
-fn draw_result_view(
-    frame: &mut Frame,
-    area: Rect,
+fn result_lines(
     app: &App,
     record: &crate::app::OutputRecord,
     result: &crate::app::ResultView,
-    scroll: usize,
-) {
+    width: usize,
+) -> Vec<Line<'static>> {
     let color = if result.ok { Color::Green } else { Color::Red };
     let mut lines = vec![
         strong(&result.title, accent(app))
             + Span::styled("  ", Style::default().fg(Color::DarkGray))
             + strong(&result.status, color),
         Line::from(Span::styled(
-            "─".repeat(area.width.saturating_sub(2) as usize),
+            "─".repeat(width.saturating_sub(2)),
             Style::default().fg(Color::DarkGray),
         )),
         summary_chips(&result.summary),
@@ -1153,16 +1087,8 @@ fn draw_result_view(
     }
     if !result.coverage.is_empty() {
         lines.push(Line::from(" "));
-        lines.push(strong_line("COVERAGE", accent(app)));
-        for item in result.coverage.iter().take(200) {
-            lines.push(result_item_line(item));
-        }
-        if result.coverage.len() > 200 {
-            lines.push(Line::from(faint(format!(
-                "… {} more classes",
-                result.coverage.len() - 200
-            ))));
-        }
+        let (table, _) = coverage_table_lines(&result.coverage, width, 0, usize::MAX);
+        lines.extend(table);
     }
     for section in &result.sections {
         lines.push(Line::from(" "));
@@ -1205,78 +1131,98 @@ fn draw_result_view(
             }
         }
     }
-    let mut hints = "[j/k/PgDn] scroll   [o] raw output   [z] JSON".to_owned();
-    if result.kind == crate::app::ResultKind::ApexTests {
-        hints.push_str("   [v] saved runs");
-    }
-    hints.push_str("   [Esc] back");
-    pinned_lines(frame, area, lines, hints, scroll);
+    lines
 }
 
-fn draw_output_detail(
-    frame: &mut Frame,
-    area: Rect,
+fn job_state_label(record: &crate::app::OutputRecord) -> &'static str {
+    if record.queued {
+        "queued"
+    } else if record.pending_report || !record.finished {
+        "running"
+    } else {
+        match record.exit_code {
+            Some(0) => "ok",
+            Some(_) => "failed",
+            None => "stopped",
+        }
+    }
+}
+
+fn job_detail_lines(
     app: &App,
     record: &crate::app::OutputRecord,
-    scroll: usize,
-) {
-    if let Some(result) = &record.result {
-        draw_result_view(frame, area, app, record, result, scroll);
-        return;
-    }
-    let label = match (record.finished, record.exit_code) {
-        (false, _) => "RUNNING",
-        (true, Some(0)) => "SUCCESS",
-        (true, Some(_)) => "FAILED",
-        (true, None) => "STOPPED",
-    };
-    let color = match (record.finished, record.exit_code) {
-        (false, _) => Color::Yellow,
-        (true, Some(0)) => Color::Green,
-        (true, Some(_)) => Color::Red,
-        (true, None) => Color::Yellow,
-    };
+    queued_position: Option<usize>,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let (glyph, color) = record_status(record);
+    let elapsed = record.elapsed_label(std::time::Instant::now());
     let mut lines = vec![
-        strong(record.purpose.to_uppercase(), accent(app))
-            + Span::styled(" — ", Style::default().fg(Color::DarkGray))
-            + strong(label, color),
-        Line::from(faint(record.display_command())),
-        Line::from(" "),
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            strong(format!("#{} ", record.id), accent(app)),
+            strong(record.task.label(), accent(app)),
+            Span::styled(
+                format!("  {} · {}", job_state_label(record), elapsed),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(Span::styled(
+            truncated(&record.display_command(), width),
+            Style::default().fg(Color::Reset),
+        )),
     ];
-    if app.output_state.show_details || !record.finished {
-        lines.push(strong_line("DETAILS", accent(app)));
-        if app.output_state.show_json
-            && let Some(value) = &record.json
-        {
+    if let Some(position) = queued_position {
+        lines.push(Line::from(faint(format!(
+            "queue position {position} — waits for a free job slot"
+        ))));
+    }
+    lines.push(Line::from(" "));
+    if record.pending_report {
+        lines.push(Line::from(faint("running — waiting for org results")));
+        lines.push(Line::from(" "));
+    }
+    if let Some(result) = &record.result {
+        lines.extend(result_lines(app, record, result, width));
+    } else if app.output_state.show_json && record.finished {
+        lines.push(strong_line("JSON", accent(app)));
+        if let Some(value) = &record.json {
             let view = json_view::table(value);
-            for header in &view.headers {
-                lines.push(strong_line(header, accent(app)));
-            }
             for row in view.rows.iter().take(500) {
                 lines.push(Line::from(faint(row.join(" | "))));
             }
         } else {
-            for line in &record.lines {
-                lines.push(Line::from(Span::styled(
-                    line.text.clone(),
-                    Style::default().fg(
-                        if line.stream == crate::sf::runner::OutputStream::Stderr {
-                            Color::Red
-                        } else {
-                            Color::Gray
-                        },
-                    ),
-                )));
-            }
-            if record.lines.is_empty() {
-                lines.push(Line::from(faint("No output.")));
-            }
+            lines.push(Line::from(faint("No JSON captured.")));
         }
     } else {
-        lines.push(Line::from(faint("[o] details   [z] JSON   [Esc] back")));
+        lines.push(strong_line("OUTPUT", accent(app)));
+        if record.lines.is_empty() {
+            lines.push(Line::from(faint(if record.finished {
+                "No streamed output retained."
+            } else {
+                "Waiting for output…"
+            })));
+        }
+        for line in &record.lines {
+            lines.push(Line::from(Span::styled(
+                line.text.clone(),
+                Style::default().fg(if line.stream == crate::sf::runner::OutputStream::Stderr {
+                    Color::Red
+                } else {
+                    Color::Gray
+                }),
+            )));
+        }
     }
-    let hints = "[j/k] scroll   [o] details   [z] JSON   [Esc] back";
-    pinned_lines(frame, area, lines, hints.to_owned(), scroll);
+    lines
+}
+
+/// Scrollable length of the detail pane; the key handler clamps against it.
+pub(crate) fn job_detail_len(
+    app: &App,
+    record: &crate::app::OutputRecord,
+    queued_position: Option<usize>,
+) -> usize {
+    job_detail_lines(app, record, queued_position, 80).len()
 }
 
 fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
@@ -1361,7 +1307,7 @@ fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.push(Line::from(" "));
     lines.push(Line::from(faint(
-        "Enter runs the selected installer in the Output tab.",
+        "Enter runs the selected installer; output appears in the Jobs window (F2).",
     )));
     frame.render_widget(
         Paragraph::new(Text::from(lines)).block(block("next steps", app)),
@@ -1389,7 +1335,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn record_status(record: &crate::app::OutputRecord) -> (&'static str, Color) {
     if record.queued {
         ("…", Color::Yellow)
-    } else if !record.finished {
+    } else if record.pending_report || !record.finished {
         ("▶", Color::Yellow)
     } else {
         match record.exit_code {
@@ -1400,94 +1346,187 @@ fn record_status(record: &crate::app::OutputRecord) -> (&'static str, Color) {
     }
 }
 
-fn draw_task_history(frame: &mut Frame, app: &App, kind: crate::app::TaskKind, selected: usize) {
-    let records = app.task_records(kind);
-    let saved = if kind == crate::app::TaskKind::Tests {
-        app.test_runs.len()
-    } else {
-        0
-    };
-    let total = records.len() + saved;
-    let area = centered(
-        frame.area(),
-        110,
-        (total as u16 + 4).min(frame.area().height.saturating_sub(2)),
-    );
+#[derive(Debug, Clone, Copy)]
+struct JobsView {
+    selected: usize,
+    focus: JobsFocus,
+    scroll: usize,
+    follow: bool,
+}
+
+fn draw_jobs(
+    frame: &mut Frame,
+    app: &App,
+    selected: usize,
+    focus: JobsFocus,
+    scroll: usize,
+    follow: bool,
+) {
+    let area = frame.area();
     frame.render_widget(Clear, area);
-    let width = area.width.saturating_sub(4) as usize;
-    let mut items: Vec<ListItem> = Vec::with_capacity(total);
-    for record in &records {
-        let (icon, color) = record_status(record);
+    let outer = block("Jobs", app);
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+    let rows = app.job_rows();
+    if rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(faint(
+                "No jobs yet — start a retrieve, deploy or test run.",
+            ))),
+            inner,
+        );
+        return;
+    }
+    let view = JobsView {
+        selected: selected.min(rows.len().saturating_sub(1)),
+        focus,
+        scroll,
+        follow,
+    };
+    if area.width >= 100 {
+        let columns = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+            .split(inner);
+        draw_job_list(frame, columns[0], app, &rows, view);
+        draw_job_detail(frame, columns[1], app, &rows, view);
+    } else {
+        let sections =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
+        draw_job_list(frame, sections[0], app, &rows, view);
+        draw_job_detail(frame, sections[1], app, &rows, view);
+    }
+}
+
+fn draw_job_list(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    rows: &[crate::app::JobRow<'_>],
+    view: JobsView,
+) {
+    let width = usize::from(area.width).saturating_sub(4);
+    let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 3);
+    let mut selected_item = None;
+    let mut section = None;
+    for (index, row) in rows.iter().enumerate() {
+        if section != Some(row.section) {
+            section = Some(row.section);
+            items.push(ListItem::new(Line::from(strong(
+                format!(" {}", row.section.title()),
+                accent(app),
+            ))));
+        }
+        if index == view.selected {
+            selected_item = Some(items.len());
+        }
+        let (glyph, color) = record_status(row.record);
         items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("[{icon}] "), Style::default().fg(color)),
+            Span::styled(format!("{glyph} "), Style::default().fg(color)),
             Span::styled(
-                truncated(&record.label(), width.saturating_sub(4)),
-                Style::default(),
+                job_row_text(row.record, width.saturating_sub(2)),
+                Style::default().fg(Color::Reset),
             ),
         ])));
     }
-    if kind == crate::app::TaskKind::Tests {
-        for run in &app.test_runs {
-            let passed = run.outcome.eq_ignore_ascii_case("Passed")
-                || run.outcome.eq_ignore_ascii_case("Pass");
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    if passed { "[✓] " } else { "[✗] " },
-                    Style::default().fg(if passed { Color::Green } else { Color::Red }),
-                ),
-                Span::styled(
-                    format!(
-                        "saved  {}",
-                        truncated(&run.command, width.saturating_sub(10))
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])));
-        }
-    }
     let mut state = ListState::default();
-    if !items.is_empty() {
-        state.select(Some(selected.min(items.len() - 1)));
-    }
+    state.select(selected_item);
+    let title = if view.focus == JobsFocus::List {
+        "jobs — ↑↓ select · Tab detail"
+    } else {
+        "jobs"
+    };
     frame.render_stateful_widget(
         List::new(items)
-            .block(block(
-                format!(
-                    "{} history — Enter open · x cancel · Esc close",
-                    kind.label()
-                ),
-                app,
-            ))
+            .block(block(title, app))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("› "),
+            .highlight_symbol("›"),
         area,
         &mut state,
     );
 }
 
-fn draw_job_result(
+fn job_row_text(record: &crate::app::OutputRecord, width: usize) -> String {
+    let elapsed = record.elapsed_label(std::time::Instant::now());
+    let summary = record.outcome_summary();
+    let head = format!("#{:<3} {:<11} ", record.id, record.task.label());
+    let tail = if summary.is_empty() {
+        elapsed
+    } else {
+        format!("{elapsed}  {summary}")
+    };
+    let budget = width.saturating_sub(head.chars().count() + tail.chars().count() + 2);
+    let command = truncated(&record.display_command(), budget.max(1));
+    truncated(&format!("{head}{command}  {tail}"), width)
+}
+
+fn draw_job_detail(
     frame: &mut Frame,
+    area: Rect,
     app: &App,
-    kind: crate::app::TaskKind,
-    record_id: u64,
-    scroll: usize,
+    rows: &[crate::app::JobRow<'_>],
+    view: JobsView,
 ) {
-    let Some(record) = app
-        .output_state
-        .records
-        .iter()
-        .find(|record| record.id == record_id)
-    else {
+    let Some(row) = rows.get(view.selected) else {
+        frame.render_widget(
+            Paragraph::new(Line::from(faint("No job selected"))).block(block("detail", app)),
+            area,
+        );
         return;
     };
-    let area = centered(frame.area(), 110, frame.area().height.saturating_sub(2));
-    frame.render_widget(Clear, area);
+    let record = row.record;
+    let live = row.section != JobSection::Finished;
+    let queued_position = rows
+        .iter()
+        .filter(|row| row.section == JobSection::Queued)
+        .position(|row| row.record.id == record.id)
+        .map(|index| index + 1);
+    let outer = block("detail", app);
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    app.jobs_detail_height.set(sections[0].height);
+    let lines = job_detail_lines(app, record, queued_position, usize::from(sections[0].width));
+    let max_scroll = lines.len().saturating_sub(usize::from(sections[0].height));
+    let top = if live && view.follow {
+        max_scroll
+    } else {
+        view.scroll.min(max_scroll)
+    };
     frame.render_widget(
-        block(format!("{} — job #{record_id}", kind.label()), app),
-        area,
+        Paragraph::new(Text::from(lines)).scroll((top.min(u16::MAX as usize) as u16, 0)),
+        sections[0],
     );
-    let inner = block(format!("{} — job #{record_id}", kind.label()), app).inner(area);
-    draw_output_detail(frame, inner, app, record, scroll);
+    frame.render_widget(
+        Paragraph::new(Line::from(faint(job_hints(
+            record,
+            view.focus,
+            live,
+            view.follow,
+        )))),
+        sections[1],
+    );
+}
+
+fn job_hints(
+    record: &crate::app::OutputRecord,
+    focus: JobsFocus,
+    live: bool,
+    follow: bool,
+) -> String {
+    if focus == JobsFocus::List {
+        return "↑↓ select · Tab detail · x cancel · c clear · Esc close".to_owned();
+    }
+    if live {
+        return if follow {
+            "● live — following · PgUp/PgDn scroll · Tab list · Esc back".to_owned()
+        } else {
+            "paused — End to follow · PgUp/PgDn scroll · Tab list · Esc back".to_owned()
+        };
+    }
+    if record.finished {
+        "j/k/PgUp/PgDn scroll · End · o raw · z JSON · Tab list · Esc back".to_owned()
+    } else {
+        "Tab list · Esc back".to_owned()
+    }
 }
 
 fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
@@ -1523,110 +1562,39 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             );
         }
         Modal::Confirm { title, message, .. } => {
-            let area = centered(frame.area(), 68, 9);
+            let width = 76u16.min(frame.area().width);
+            let inner_width = usize::from(width).saturating_sub(4).max(10);
+            let mut lines: Vec<Line> = Vec::new();
+            for paragraph in message.split('\n') {
+                if paragraph.is_empty() {
+                    lines.push(Line::from(" "));
+                    continue;
+                }
+                for chunk in wrap_text(paragraph, inner_width) {
+                    lines.push(Line::from(Span::styled(
+                        chunk,
+                        Style::default().fg(Color::Reset),
+                    )));
+                }
+            }
+            lines.push(Line::from(" "));
+            lines.push(Line::from(faint(
+                "Enter / y — confirm       Esc / n — cancel",
+            )));
+            let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+            let area = centered(frame.area(), width, height);
             frame.render_widget(Clear, area);
-            let lines = vec![
-                Line::from(Span::styled(
-                    message.clone(),
-                    Style::default().fg(Color::Reset),
-                )),
-                Line::from(" "),
-                Line::from(faint("Enter / y — confirm       Esc / n — cancel")),
-            ];
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block(title.clone(), app)),
                 area,
             );
         }
-        Modal::TaskHistory { kind, selected } => {
-            draw_task_history(frame, app, *kind, *selected);
-        }
-        Modal::JobResult {
-            kind,
-            record_id,
+        Modal::Jobs {
+            selected,
+            focus,
             scroll,
-        } => {
-            draw_job_result(frame, app, *kind, *record_id, *scroll);
-        }
-        Modal::TestHistory { runs, selected } => {
-            let mut lines = vec![
-                strong_line("SAVED APEX TEST RUNS", accent(app)),
-                Line::from(faint("↑↓ move   Enter open   Esc close")),
-            ];
-            let window = 4usize;
-            let selected = (*selected).min(runs.len().saturating_sub(1));
-            let start = selected
-                .saturating_sub(window.saturating_sub(1))
-                .min(runs.len().saturating_sub(window));
-            for (index, run) in runs.iter().enumerate().skip(start).take(window) {
-                let passed = run.outcome.eq_ignore_ascii_case("Passed")
-                    || run.outcome.eq_ignore_ascii_case("Pass");
-                let marker = if index == selected { "›" } else { " " };
-                let color = if index == selected {
-                    accent(app)
-                } else {
-                    Color::Gray
-                };
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "{} {}  run {}  {}",
-                        marker,
-                        if passed { "PASS" } else { "FAIL" },
-                        run.at,
-                        run.outcome
-                    ),
-                    Style::default().fg(color),
-                )));
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "    {} run · {} passed · {} failed · {} skipped · coverage {}",
-                        run.tests_run, run.passing, run.failing, run.skipped, run.coverage
-                    ),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                lines.push(Line::from(Span::styled(
-                    format!("    {}", truncated(&run.command, 68)),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                lines.push(Line::from(" "));
-            }
-            let position = if runs.is_empty() {
-                "0/0".to_owned()
-            } else {
-                format!("{}/{}", selected + 1, runs.len())
-            };
-            lines.push(Line::from(faint(position)));
-            let area = centered(
-                frame.area(),
-                82,
-                (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2)),
-            );
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                Paragraph::new(Text::from(lines)).block(block("History", app)),
-                area,
-            );
-        }
-        Modal::TestRun { run, scroll } => {
-            let lines = test_run_lines(app, run, true);
-            let height = (lines.len() as u16 + 4).min(frame.area().height.saturating_sub(2));
-            let area = centered(frame.area(), 100, height);
-            frame.render_widget(Clear, area);
-            frame.render_widget(block("saved test run", app), area);
-            let inner = block("saved test run", app).inner(area);
-            let sections =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-            let max_scroll = lines.len().saturating_sub(usize::from(sections[0].height));
-            frame.render_widget(
-                Paragraph::new(Text::from(lines))
-                    .scroll(((*scroll).min(max_scroll).min(u16::MAX as usize) as u16, 0)),
-                sections[0],
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(faint("↑↓ scroll · Esc close"))),
-                sections[1],
-            );
-        }
+            follow,
+        } => draw_jobs(frame, app, *selected, *focus, *scroll, *follow),
         Modal::TestConfirm {
             entries,
             focus,
@@ -1894,8 +1862,8 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
 
 const HELP_ROWS: &[(&str, &str)] = &[
     (
-        "Menu r/d/c/t/o/l",
-        "retrieve · deploy · create · tests · organization · catalog",
+        "Menu r/d/c/t/o/e",
+        "retrieve · deploy · create · tests · organization · run command",
     ),
     ("Enter", "the highlighted menu entry"),
     ("?", "show this help; any key closes it"),
@@ -1908,15 +1876,18 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ),
     ("y", "copy the current command/selection"),
     ("Ctrl+Y", "copy while typing in a search field"),
-    ("F5", "refresh orgs, catalog or component search"),
-    ("F2", "open the current task's job history"),
-    ("/ (Catalog)", "fuzzy search the full CLI catalog"),
-    ("Enter (Catalog)", "load live --help for the selection"),
-    ("f / e (Catalog)", "favorite / edit preset flags"),
+    ("F5", "refresh orgs or component search"),
+    ("F2", "open the jobs window from any screen"),
+    (
+        "F2 (jobs)",
+        "↑↓ select · Tab detail · x cancel · c clear finished",
+    ),
+    ("o / z (jobs)", "raw output · JSON for a finished job"),
     (
         "Space (search/confirm)",
         "select a component, test class or row",
     ),
+    ("Tab (Tests)", "focus the per-class coverage table"),
     ("c (confirm)", "show the exact command that will run"),
     ("g (confirm)", "cycle the target org"),
     (
@@ -1924,7 +1895,6 @@ const HELP_ROWS: &[(&str, &str)] = &[
         "validate / test level / ignore warnings",
     ),
     ("↑↓ PgUp/PgDn", "move or scroll lists and results"),
-    ("z / v (result)", "raw JSON · saved test runs"),
 ];
 
 #[cfg(test)]
@@ -1941,8 +1911,99 @@ mod tests {
     }
 
     #[test]
+    fn wrap_text_keeps_words_and_splits_long_tokens() {
+        assert_eq!(
+            wrap_text("one two three", 7),
+            vec!["one two".to_owned(), "three".to_owned()]
+        );
+        assert_eq!(
+            wrap_text("abcdefgh", 4),
+            vec!["abcd".to_owned(), "efgh".to_owned()]
+        );
+        assert!(wrap_text("", 10).is_empty());
+    }
+
+    #[test]
     fn tracer_never_exceeds_budget() {
         assert_eq!(truncated("abcdef", 3), "ab…");
         assert_eq!(truncated("abc", 10), "abc");
+    }
+
+    fn coverage_item(label: &str, percent: &str, covered: usize, total: usize) -> ResultItem {
+        ResultItem {
+            ok: true,
+            label: label.to_owned(),
+            detail: format!("{percent} · {covered}/{total} lines"),
+            progress: (total > 0).then_some((covered, total)),
+        }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn coverage_table_sorts_worst_first() {
+        let items = vec![
+            coverage_item("Best", "90%", 9, 10),
+            coverage_item("Worst", "50%", 5, 10),
+            coverage_item("Middle", "70%", 7, 10),
+        ];
+        let (lines, max_scroll) = coverage_table_lines(&items, 80, 0, 10);
+        assert_eq!(max_scroll, 0);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        let worst = text
+            .iter()
+            .position(|line| line.contains("Worst"))
+            .expect("worst");
+        let middle = text
+            .iter()
+            .position(|line| line.contains("Middle"))
+            .expect("middle");
+        let best = text
+            .iter()
+            .position(|line| line.contains("Best"))
+            .expect("best");
+        assert!(worst < middle && middle < best);
+        assert!(
+            text.iter()
+                .any(|line| line.contains("3 classes · worst first"))
+        );
+        assert!(text.iter().any(|line| line.contains("CLASS")));
+    }
+
+    #[test]
+    fn coverage_table_empty_and_scroll_are_bounded() {
+        let (empty, max) = coverage_table_lines(&[], 80, 0, 10);
+        assert_eq!(max, 0);
+        assert!(line_text(&empty[0]).contains("No per-class coverage returned"));
+        let items: Vec<ResultItem> = (0..10)
+            .map(|index| coverage_item(&format!("C{index:02}"), "50%", 5, 10))
+            .collect();
+        let (lines, max) = coverage_table_lines(&items, 80, 99, 4);
+        assert_eq!(max, 6);
+        assert_eq!(lines.len(), 3 + 4);
+        assert!(line_text(&lines[3]).contains("C06"));
+    }
+
+    #[test]
+    fn coverage_percent_prefers_the_stored_string_then_covered_total() {
+        let stored = ResultItem {
+            ok: true,
+            label: "Demo".to_owned(),
+            detail: "42% · 1/2 lines".to_owned(),
+            progress: Some((1, 2)),
+        };
+        assert!((coverage_percent(&stored) - 42.0).abs() < f64::EPSILON);
+        let fallback = ResultItem {
+            ok: true,
+            label: "Demo".to_owned(),
+            detail: "unknown".to_owned(),
+            progress: Some((1, 4)),
+        };
+        assert!((coverage_percent(&fallback) - 25.0).abs() < f64::EPSILON);
     }
 }

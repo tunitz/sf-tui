@@ -7,18 +7,18 @@ installed on your machine: it does not store credentials, and all authentication
 in its own home directory.
 
 The interface opens on a **Menu**: Retrieve Metadata, Deploy Metadata, Create Metadata, Apex
-Tests, Organization and the command catalog. Each entry opens a focused screen, with project paths
-and the default org pre-filled so you do not retype them. `Esc` returns to the previous screen and
-`h` returns to the Menu; there is no tab bar.
+Tests, Organization and Run command. Each entry opens a focused screen, with project paths and the
+default org pre-filled so you do not retype them. `Esc` returns to the previous screen and `h`
+returns to the Menu; there is no tab bar.
 
-- **focused screens** for retrieve, deploy, Apex tests and org operations, each with its own job
-  history;
-- a **generic command catalog** covering the full `sf` CLI surface (fuzzy search, favorites,
-  preset flags, exact invocation and streamed output).
+- **focused screens** for retrieve, deploy, Apex tests and org operations;
+- one **Jobs window** (`F2`) for every running, queued and finished command, available from any
+  screen;
+- **Run command** for the occasional `sf` invocation that has no dedicated screen.
 
 Startup is non-blocking: the UI appears immediately with a visible progress line while `sf` is
-probed in the background. The bundled catalog is usable during the probe, and a successful command
-refresh is cached for seven days.
+probed in the background. Nothing else runs at launch, so your first retrieve or deploy does not
+queue behind a background refresh.
 
 ## Install
 
@@ -71,26 +71,32 @@ The menu is the whole navigation:
 
 ```text
 [r] Retrieve Metadata   [d] Deploy Metadata   [c] Create Metadata
-[t] Apex Tests          [o] Organization      [l] Command Catalog
+[t] Apex Tests          [o] Organization      [e] Run command
 ```
 
 Global: `h` Menu · `Esc` previous screen · `?` help · `y` copy · `F5` refresh ·
-`F2` this task's job history · `q` quit (asks while a job runs).
+`F2` Jobs · `q` quit (asks while a job runs).
 `Ctrl+X` cancels the newest job; `Ctrl+C` cancels it or quits when idle.
 `Ctrl+Y` copies the current selection while a search field has focus.
 
 Retrieve, deploy and test runs execute in the background. Up to four commands run in parallel and
 anything beyond that waits in a queue, starting automatically as slots free up. Leaving a screen
 never stops a job: start a retrieve, go back, start a deploy and a test run, and keep browsing.
-Finishing jobs are announced in the status line instead of stealing the screen; `F2` opens that
-screen's job history, where `Enter` shows the full result and `x` cancels a running or queued job.
+Finishing jobs are announced in the status line instead of stealing the screen.
+
+`F2` opens the **Jobs** window from any screen. It lists every job in three sections — running,
+queued and finished — with its task, command, elapsed time and outcome. The selected job's live
+output, or its full result when finished, is shown beside the list and follows new output until you
+scroll up (`End` resumes). `x` cancels a running job or removes a queued one, `c` clears the
+finished list, `Enter`/`Tab` moves focus to the detail and `Esc` steps back.
 
 Apex Tests follows the same pattern: type to find real test classes (`*Test.cls` or `@IsTest`),
-`Space` check/uncheck, `Enter` confirm. Runs use `--code-coverage`, so results show one row per
-test class with `[✓]`/`[✗]`, the method outcomes underneath and per-class coverage with percent,
-covered/total lines and uncovered counts. Results are saved locally (last 50 runs); `v` on a
-result opens the saved runs. The Organization screen handles login: check the current org, switch,
-login, delete/logout or reauth.
+`Space` check/uncheck, `Enter` confirm. A run returns a test run ID immediately and sftui polls the
+result, so a long org run never holds a job slot. Runs use `--code-coverage`, so results show one
+row per test class with `[✓]`/`[✗]`, the method outcomes underneath, and a coverage table with
+every class the CLI returned: percent, covered/total lines and a bar. The table is on the Tests
+screen (`Tab` focuses it and `↑↓` scrolls) and in the full result view. The Organization screen
+handles login: check the current org, switch, login, delete/logout or reauth.
 
 On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
 `Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`; typing keeps
@@ -104,7 +110,9 @@ Every command result is rendered human-readable immediately: status, counts, one
 per requested metadata item, color-coded metric chips, progress bars and section headers. The
 latest finished result also stays visible at the bottom of its own screen (`…` means still
 running, `✓` succeeded, `✗` failed). Long results scroll with `↑↓`/`PgUp`/`PgDn`; raw stdout/JSON
-is behind `o`/`z`.
+is behind `o`/`z`. Search results rank concrete components above bare metadata types, and the
+confirmation dialog always shows the exact `--metadata` targets, because a bare type retrieves
+every component of that kind.
 
 The interface uses terminal default colors for body text and reverse video for selection, and
 honors `NO_COLOR` by stripping color while keeping bold/reverse emphasis.
@@ -117,11 +125,9 @@ Configuration lives in a per-user directory chosen by the `directories` crate:
 - macOS: `~/Library/Application Support/sf-tui/config.toml`
 - Windows: `%APPDATA%\sf-tui\config\config.toml`
 
-Set `SFTUI_CONFIG_DIR` to use a different directory. The TOML file contains `favorites`
-(command id plus preset flags) and `theme.accent` (`cyan`, `green`, `yellow`,
-`blue`, `magenta`, `red`). It is written atomically with owner-only permissions on Unix, and is
-updated when favorites/presets change and on exit. A `catalog-cache.json` file beside it stores
-the last successful `sf commands --json` response for seven days.
+Set `SFTUI_CONFIG_DIR` to use a different directory. The TOML file contains `theme.accent`
+(`cyan`, `green`, `yellow`, `blue`, `magenta`, `red`) and is written atomically with owner-only
+permissions on Unix.
 
 ## Development
 

@@ -4,6 +4,41 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.16] - 2026-11-17
+
+### Added
+
+- A single **Jobs** window on `F2`, available from every screen: running, queued and finished jobs
+  in one list with task, command, elapsed time and outcome. The selected job's live output follows
+  new lines until you scroll up, finished jobs show their full result, `x` cancels a running job or
+  removes a queued one, and `c` clears the finished list.
+- **Run command** on the Menu for an `sf` invocation that has no dedicated screen, with the exact
+  argv shown before it runs and secrets redacted from history and output.
+- Per-class **coverage tables** on the Tests screen (`Tab` to focus and scroll) and in the full
+  result view: one row per class with percent, covered/total lines and a bar.
+- Jobs show how long they actually took, so a slow command can be compared with the same command
+  in a terminal.
+
+### Changed
+
+- Apex test runs now start immediately and poll `sf apex get test --test-run-id`, instead of
+  blocking on `--wait`. Besides freeing the job slot at once, this avoids the CLI behaviour where
+  `--code-coverage` with `--wait` can return partial or zero coverage.
+- Metadata search ranks concrete components above bare metadata types; typing the full type name
+  still offers the whole type first. The confirmation dialog always shows the exact `--metadata`
+  targets, because a bare type retrieves every component of that kind.
+- The footer shows a few colour-coded keycaps for the current screen; the full map stays on `?`.
+- Startup probes only the CLI version and the configured target org, so the first command no
+  longer waits behind a catalog refresh or an org list.
+
+### Removed
+
+- The Command Catalog screen and its startup `sf commands --json` refresh, plus the
+  `catalog-cache.json` file.
+- Favorites and preset flags, which existed only for the catalog.
+- The per-task history modals and the persisted `test-runs.json` history. Jobs are session-only
+  for running/queued/finished output, while Apex results remain readable in the result view.
+
 ## [0.1.15] - 2026-11-17
 
 ### Added

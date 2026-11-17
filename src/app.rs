@@ -1,9 +1,8 @@
 //! Application state, key dispatch and ownership of background SF jobs.
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,13 +14,12 @@ use tokio::task::JoinHandle;
 
 use crate::clipboard;
 use crate::config::Config;
-use crate::sf::catalog::{self, Catalog, CatalogSource, CommandSpec, Flag};
 use crate::sf::deploy::{PayloadMode, TransferOptions};
 use crate::sf::metadata::{SuggestionItem, SuggestionSet};
 use crate::sf::org::{OrgDetail, OrgSummary};
 use crate::sf::project::{self, SfProject};
 use crate::sf::runner::{JobLine, ProcessOutcome, RunningJob, SfEvent};
-use crate::sf::test_results::{self, TestRun};
+use crate::sf::test_results;
 use crate::sf::{self, Startup};
 use crate::view::{apex_result, generic_result, transfer_result};
 
@@ -32,7 +30,6 @@ pub enum Tab {
     Retrieve,
     Tests,
     Deploy,
-    Catalog,
     Orgs,
     Setup,
 }
@@ -44,7 +41,6 @@ impl Tab {
             Self::Retrieve => "Retrieve",
             Self::Tests => "Tests",
             Self::Deploy => "Deploy",
-            Self::Catalog => "Catalog",
             Self::Orgs => "Orgs",
             Self::Setup => "Setup",
         }
@@ -54,13 +50,9 @@ impl Tab {
 /// What a background job was started for; drives the follow-up once it finishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobPurpose {
-    CatalogRefresh,
     Command {
         id: String,
         command: String,
-    },
-    Help {
-        id: String,
     },
     OrgList,
     OrgDetail {
@@ -81,15 +73,17 @@ pub enum JobPurpose {
     },
     ApexTests {
         command: String,
+        org: Option<String>,
+    },
+    TestReport {
+        record_id: u64,
     },
 }
 
 impl JobPurpose {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::CatalogRefresh => "catalog",
             Self::Command { .. } => "command",
-            Self::Help { .. } => "help",
             Self::OrgList => "orgs",
             Self::OrgDetail { .. } => "org detail",
             Self::OrgAction { .. } => "org action",
@@ -97,6 +91,7 @@ impl JobPurpose {
             Self::Report { .. } => "report",
             Self::Installer { .. } => "installer",
             Self::ApexTests { .. } => "apex tests",
+            Self::TestReport { .. } => "apex report",
         }
     }
 }
@@ -133,26 +128,6 @@ pub enum AppEvent {
     },
 }
 
-/// One row of the fuzzy-searchable catalog tree.
-#[derive(Debug, Clone)]
-pub enum CatalogRow {
-    Header(String),
-    Command {
-        id: String,
-        summary: String,
-        matched: Option<Vec<usize>>,
-        favorite: bool,
-    },
-}
-
-const POPULAR_COMMAND_IDS: &[&str] = &[
-    "org login web",
-    "project retrieve start",
-    "project deploy start",
-    "apex run test",
-    "logic get test",
-];
-
 /// A destination or action on the main menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
@@ -161,7 +136,7 @@ pub enum MenuAction {
     Create,
     Tests,
     Organizations,
-    Catalog,
+    RunCommand,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,9 +173,9 @@ pub const MENU_ITEMS: &[MenuItem] = &[
         action: MenuAction::Organizations,
     },
     MenuItem {
-        key: 'l',
-        label: "Command Catalog",
-        action: MenuAction::Catalog,
+        key: 'e',
+        label: "Run command",
+        action: MenuAction::RunCommand,
     },
 ];
 
@@ -214,16 +189,6 @@ pub struct StartupStage {
     pub label: String,
     pub started: Instant,
     pub done: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct CatalogState {
-    pub query: String,
-    pub active_query: String,
-    pub search_focused: bool,
-    pub selected_id: Option<String>,
-    pub help_for: Option<String>,
-    pub help_flags: Vec<Flag>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -251,6 +216,23 @@ struct DeployReport {
     poll_after: Instant,
     attempts: u32,
     failures: u32,
+}
+
+/// An Apex test run accepted by the org whose results still have to be polled.
+#[derive(Debug, Clone)]
+struct TestReport {
+    run_id: String,
+    org: Option<String>,
+    poll_after: Instant,
+    attempts: u32,
+    failures: u32,
+}
+
+/// Which pane of the Tests screen receives navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestsFocus {
+    Search,
+    Coverage,
 }
 
 #[derive(Debug, Clone)]
@@ -356,13 +338,13 @@ pub struct ResultView {
     pub sections: Vec<ResultSection>,
 }
 
-/// The task a recorded job belongs to, used by per-screen history.
+/// The task a recorded job belongs to, used as the label in the Jobs window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskKind {
     Retrieve,
     Deploy,
     Tests,
-    Catalog,
+    Command,
     Organization,
     Setup,
 }
@@ -373,7 +355,7 @@ impl TaskKind {
             Self::Retrieve => "Retrieve",
             Self::Deploy => "Deploy",
             Self::Tests => "Apex tests",
-            Self::Catalog => "Command catalog",
+            Self::Command => "Command",
             Self::Organization => "Organization",
             Self::Setup => "Setup",
         }
@@ -394,8 +376,11 @@ pub struct OutputRecord {
     pub exit_code: Option<i32>,
     pub finished: bool,
     pub queued: bool,
+    pub started_at: Option<Instant>,
+    pub ended_at: Option<Instant>,
     pub json: Option<Value>,
     pub result: Option<ResultView>,
+    pub pending_report: bool,
 }
 
 impl OutputRecord {
@@ -414,7 +399,7 @@ impl OutputRecord {
         format!("#{} [{}] {}", self.id, state, self.display_command())
     }
 
-    /// The command with its executable path shortened, for history rows and result headers.
+    /// The command with its executable path shortened, for job rows and result headers.
     pub fn display_command(&self) -> String {
         let prefix = self.executable.display().to_string();
         self.command
@@ -422,14 +407,86 @@ impl OutputRecord {
             .map(|rest| format!("sf{rest}"))
             .unwrap_or_else(|| self.command.clone())
     }
+
+    pub fn is_running(&self) -> bool {
+        self.pending_report || (!self.finished && !self.queued)
+    }
+
+    /// `12s` for a short job, `1m 04s` once it passes a minute.
+    pub fn elapsed_label(&self, now: Instant) -> String {
+        let Some(started) = self.started_at else {
+            return "—".to_owned();
+        };
+        let elapsed = if self.pending_report {
+            now
+        } else {
+            self.ended_at.unwrap_or(now)
+        }
+        .saturating_duration_since(started);
+        let seconds = elapsed.as_secs();
+        if seconds < 60 {
+            format!("{seconds}s")
+        } else {
+            format!("{}m {:02}s", seconds / 60, seconds % 60)
+        }
+    }
+
+    /// A compact outcome for a job row: `3/3 ✓`, `exit 2`, `stopped`.
+    pub fn outcome_summary(&self) -> String {
+        if self.queued || self.pending_report || !self.finished {
+            return String::new();
+        }
+        if let Some(result) = &self.result {
+            if result.items.is_empty() {
+                return if result.ok { "✓" } else { "✗" }.to_owned();
+            }
+            let total = result.items.len();
+            let ok = result.items.iter().filter(|item| item.ok).count();
+            return format!("{ok}/{total} {}", if result.ok { "✓" } else { "✗" });
+        }
+        match self.exit_code {
+            Some(0) => "ok".to_owned(),
+            Some(code) => format!("exit {code}"),
+            None => "stopped".to_owned(),
+        }
+    }
+}
+
+/// One row of the global Jobs window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobSection {
+    Running,
+    Queued,
+    Finished,
+}
+
+impl JobSection {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Running => "RUNNING",
+            Self::Queued => "QUEUED",
+            Self::Finished => "FINISHED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct JobRow<'a> {
+    pub section: JobSection,
+    pub record: &'a OutputRecord,
+}
+
+/// Which pane of the Jobs window receives list navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobsFocus {
+    List,
+    Detail,
 }
 
 const MAX_RECORDS: usize = 40;
 const MAX_LINES_PER_RECORD: usize = 3_000;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 2 * 1024 * 1024;
-
-type CatalogRowsCache = RefCell<Option<(u64, String, Rc<Vec<CatalogRow>>)>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct OutputState {
@@ -460,8 +517,11 @@ impl OutputState {
             exit_code: None,
             finished: false,
             queued: true,
+            started_at: None,
+            ended_at: None,
             json: None,
             result: None,
+            pending_report: false,
         });
         if self.records.len() > MAX_RECORDS {
             self.records.remove(0);
@@ -563,11 +623,10 @@ impl PromptField {
 
 #[derive(Debug, Clone)]
 pub enum PromptKind {
-    RunFlags { id: String },
+    RunCommand,
     QuickRetrieve,
     QuickDeploy,
     CreateMetadata,
-    EditPreset { id: String },
     LoginWeb,
     CreateScratch,
     TargetOrg,
@@ -583,6 +642,7 @@ pub enum PendingAction {
     RunTransfer,
     RunInstaller { command: String },
     RunPrepared { argv: Vec<String> },
+    RunCommand { argv: Vec<String>, command: String },
     Quit,
 }
 
@@ -600,22 +660,11 @@ pub enum Modal {
         message: String,
         action: PendingAction,
     },
-    TestHistory {
-        runs: Vec<TestRun>,
+    Jobs {
         selected: usize,
-    },
-    TaskHistory {
-        kind: TaskKind,
-        selected: usize,
-    },
-    JobResult {
-        kind: TaskKind,
-        record_id: u64,
+        focus: JobsFocus,
         scroll: usize,
-    },
-    TestRun {
-        run: TestRun,
-        scroll: usize,
+        follow: bool,
     },
     TestConfirm {
         entries: Vec<TransferSelection>,
@@ -664,21 +713,19 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub status_error: bool,
-    pub catalog_state: CatalogState,
     pub org_state: OrgState,
     pub deploy_state: DeployState,
     pub transfer_search: TransferSearchState,
     pub test_search: TransferSearchState,
     pub output_state: OutputState,
-    pub test_runs: Vec<TestRun>,
     pub modal: Option<Modal>,
+    pub tests_focus: TestsFocus,
+    pub coverage_scroll: usize,
     pub setup_selected: usize,
     tab_history: Vec<Tab>,
     suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
     test_suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
     suggestions_building: bool,
-    catalog_revision: u64,
-    catalog_rows_cache: CatalogRowsCache,
     ticks: usize,
     probe_task: Option<JoinHandle<()>>,
     search_task: Option<JoinHandle<()>>,
@@ -689,17 +736,17 @@ pub struct App {
     jobs: HashMap<u64, JobEntry>,
     pending_jobs: VecDeque<PendingJob>,
     deploy_reports: HashMap<u64, DeployReport>,
+    test_reports: HashMap<u64, TestReport>,
     next_job_id: u64,
+    /// Rows available in the Jobs detail pane at the last draw, used to clamp scrolling.
+    pub(crate) jobs_detail_height: Cell<u16>,
+    /// Coverage rows visible at the last Tests draw, used to clamp table scrolling.
+    pub(crate) tests_coverage_rows: Cell<usize>,
 }
 
 impl App {
     pub fn new(startup: Startup, config: Config, config_dir: PathBuf) -> Self {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let selected_id = startup
-            .catalog
-            .commands
-            .first()
-            .map(|command| command.id.clone());
         let mut app = Self {
             startup,
             config,
@@ -714,24 +761,19 @@ impl App {
             should_quit: false,
             status: String::new(),
             status_error: false,
-            catalog_state: CatalogState {
-                selected_id,
-                ..CatalogState::default()
-            },
             org_state: OrgState::default(),
             deploy_state: DeployState::default(),
             transfer_search: TransferSearchState::new(false),
             test_search: TransferSearchState::new(false),
             output_state: OutputState::default(),
-            test_runs: Vec::new(),
             modal: None,
+            tests_focus: TestsFocus::Search,
+            coverage_scroll: 0,
             setup_selected: 0,
             tab_history: Vec::new(),
             suggestion_cache: None,
             test_suggestion_cache: None,
             suggestions_building: false,
-            catalog_revision: 0,
-            catalog_rows_cache: RefCell::new(None),
             ticks: 0,
             probe_task: None,
             search_task: None,
@@ -742,10 +784,12 @@ impl App {
             jobs: HashMap::new(),
             pending_jobs: VecDeque::new(),
             deploy_reports: HashMap::new(),
+            test_reports: HashMap::new(),
             next_job_id: 1,
+            jobs_detail_height: Cell::new(10),
+            tests_coverage_rows: Cell::new(6),
         };
         app.start_project_scan();
-        app.test_runs = test_results::load(&app.config_dir);
         app.status = "Starting sftui — the interface is ready while sf is probed".to_owned();
         app.start_probe();
         app
@@ -768,14 +812,7 @@ impl App {
 
     /// Screens rendered by headless smoke tests; navigation itself is menu-only.
     pub fn screens(&self) -> Vec<Tab> {
-        let mut screens = vec![
-            Tab::Home,
-            Tab::Retrieve,
-            Tab::Deploy,
-            Tab::Tests,
-            Tab::Catalog,
-            Tab::Orgs,
-        ];
+        let mut screens = vec![Tab::Home, Tab::Retrieve, Tab::Deploy, Tab::Tests, Tab::Orgs];
         if self.startup_stage.done && !self.startup.is_ready() {
             screens.push(Tab::Setup);
         }
@@ -861,10 +898,9 @@ impl App {
                 };
             }
             AppEvent::Startup(sf::StartupEvent::Detected(installation)) => {
+                // No automatic org list here: the first user command must not queue behind a
+                // startup refresh. The Orgs screen loads them when opened.
                 self.startup.installation = Some(installation);
-                if self.org_state.orgs.is_empty() && !self.org_state.loading {
-                    self.refresh_orgs();
-                }
             }
             AppEvent::Startup(sf::StartupEvent::Version(version)) => {
                 self.startup.version = Some(version);
@@ -873,20 +909,6 @@ impl App {
                 self.startup.current_org = Some(org);
                 if !self.status_error {
                     self.notice("Current org loaded");
-                }
-            }
-            AppEvent::Startup(sf::StartupEvent::Catalog(catalog)) => {
-                self.startup.catalog = catalog;
-                self.catalog_revision = self.catalog_revision.wrapping_add(1);
-                if let Some(id) = self.catalog_state.selected_id.clone()
-                    && self.startup.catalog.command(&id).is_none()
-                {
-                    self.catalog_state.selected_id = self
-                        .startup
-                        .catalog
-                        .commands
-                        .first()
-                        .map(|command| command.id.clone());
                 }
             }
             AppEvent::Startup(sf::StartupEvent::Notice(text)) => {
@@ -1000,12 +1022,15 @@ impl App {
 
     fn finish_job(&mut self, job_id: u64, outcome: ProcessOutcome) {
         let Some(purpose) = self.jobs.get(&job_id).map(|entry| entry.purpose.clone()) else {
-            // The job was cancelled and removed from the map. Record the outcome on its output
-            // row but do not invent an empty command or overwrite the cancellation notice.
-            if let Some(record) = self.output_state.find_mut(job_id) {
+            // The job was cancelled and removed from the map. Keep its cancellation status on
+            // the output row instead of letting a late completion reclassify it.
+            if let Some(record) = self.output_state.find_mut(job_id)
+                && !record.finished
+            {
                 record.exit_code = outcome.exit_code;
                 record.finished = true;
                 record.queued = false;
+                record.ended_at = Some(Instant::now());
             }
             self.start_pending_jobs();
             return;
@@ -1019,6 +1044,7 @@ impl App {
             record.exit_code = outcome.exit_code;
             record.finished = true;
             record.queued = false;
+            record.ended_at.get_or_insert_with(Instant::now);
             record.json = if outcome.stdout.len() <= MAX_JSON_BYTES {
                 parsed.clone()
             } else {
@@ -1027,7 +1053,7 @@ impl App {
         }
         let succeeded = outcome.succeeded();
         let secret_output = match &purpose {
-            JobPurpose::Command { command, .. } | JobPurpose::ApexTests { command } => {
+            JobPurpose::Command { command, .. } | JobPurpose::ApexTests { command, .. } => {
                 is_secret_command(command)
             }
             JobPurpose::OrgAction { .. } | JobPurpose::OrgDetail { .. } => true,
@@ -1102,25 +1128,6 @@ impl App {
                     self.notice("Org details loaded");
                 }
             }
-            (JobPurpose::Help { id }, _) => {
-                let text = format!("{}{}", outcome.stdout, outcome.stderr);
-                self.catalog_state.help_flags = catalog::parse_help_flags(&text);
-                self.catalog_state.help_for = Some(id);
-            }
-            (JobPurpose::CatalogRefresh, Some(value)) => {
-                match catalog::parse_commands_json(&value.to_string()) {
-                    Ok(commands) => {
-                        let _ = catalog::write_cache(&self.config_dir, &value.to_string());
-                        self.startup.catalog = Catalog {
-                            commands,
-                            source: CatalogSource::Live,
-                        };
-                        self.catalog_revision = self.catalog_revision.wrapping_add(1);
-                        self.notice("Command catalog refreshed");
-                    }
-                    Err(error) => self.error(format!("Catalog refresh failed: {error}")),
-                }
-            }
             (JobPurpose::Transfer { options }, Some(value)) => {
                 if options.retrieve {
                     let mut report = sf::deploy::parse_report(&value);
@@ -1138,7 +1145,7 @@ impl App {
                         &options.metadata_names,
                     ));
                     if succeeded {
-                        self.notice("Retrieve finished — F2 opens the result");
+                        self.notice("Retrieve finished — F2 jobs shows the result");
                     }
                 } else if let Some(id) = sf::deploy::parse_started_job_id(&value) {
                     self.deploy_reports.insert(
@@ -1167,7 +1174,7 @@ impl App {
                         sections: Vec::new(),
                     });
                     if succeeded {
-                        self.notice(format!("Deploy {id} started — F2 shows progress"));
+                        self.notice(format!("Deploy {id} started — F2 jobs shows progress"));
                     }
                 }
             }
@@ -1189,7 +1196,7 @@ impl App {
                 if complete {
                     self.deploy_reports.remove(&transfer_job);
                     if succeeded {
-                        self.notice("Deploy finished — F2 opens the result");
+                        self.notice("Deploy finished — F2 jobs shows the result");
                     }
                 }
             }
@@ -1200,14 +1207,46 @@ impl App {
                 }
                 self.refresh_orgs();
             }
-            (JobPurpose::ApexTests { command }, Some(value)) => {
+            (JobPurpose::ApexTests { command, org }, Some(value)) => {
                 let run = test_results::parse(&value, &command);
-                result_view = Some(apex_result(&run));
-                self.test_runs = test_results::record(&self.config_dir, run.clone());
-                self.output_state.show_details = false;
-                if succeeded {
-                    self.notice("Apex test results saved");
+                match apex_report_action(&run) {
+                    ApexReportAction::Final => {
+                        result_view = Some(apex_result(&run));
+                        self.output_state.show_details = false;
+                        self.tests_focus = TestsFocus::Search;
+                        self.coverage_scroll = 0;
+                        if succeeded {
+                            self.notice("Apex test results ready — F2 jobs shows the details");
+                        }
+                    }
+                    ApexReportAction::Poll { run_id } => {
+                        result_view = Some(started_test_view(&run_id));
+                        if let Some(record) = self.output_state.find_mut(job_id) {
+                            record.pending_report = true;
+                        }
+                        self.tests_focus = TestsFocus::Search;
+                        self.coverage_scroll = 0;
+                        self.test_reports.insert(
+                            job_id,
+                            TestReport {
+                                run_id: run_id.clone(),
+                                org,
+                                poll_after: Instant::now() + Duration::from_secs(3),
+                                attempts: 0,
+                                failures: 0,
+                            },
+                        );
+                        self.notice(format!(
+                            "Apex test run {run_id} started — polling for results"
+                        ));
+                    }
                 }
+            }
+            (JobPurpose::TestReport { record_id }, Some(value)) => {
+                self.apply_test_report(record_id, &value, succeeded);
+            }
+            (JobPurpose::TestReport { record_id }, None) => {
+                self.fail_test_report(record_id);
             }
             _ => {}
         }
@@ -1224,9 +1263,84 @@ impl App {
             JobPurpose::Command { .. } | JobPurpose::Installer { .. }
         );
         if succeeded && user_command {
-            self.notice("Done — F2 history · Esc back");
+            self.notice("Done — F2 jobs · Esc back");
         }
         self.start_pending_jobs();
+    }
+
+    /// Apply one polled `apex get test` response: finish the record or keep polling.
+    fn apply_test_report(&mut self, record_id: u64, value: &Value, succeeded: bool) {
+        let Some(report) = self.test_reports.get(&record_id) else {
+            return;
+        };
+        let run_id = report.run_id.clone();
+        if !succeeded {
+            self.fail_test_report(record_id);
+            return;
+        }
+        let run = test_results::parse(value, "");
+        if test_results::is_terminal_outcome(&run.outcome) {
+            let view = apex_result(&run);
+            if let Some(record) = self.output_state.find_mut(record_id) {
+                record.result = Some(view);
+                record.pending_report = false;
+            }
+            self.test_reports.remove(&record_id);
+            self.coverage_scroll = 0;
+            self.tests_focus = TestsFocus::Search;
+            self.notice("Apex tests finished — F2 jobs");
+            return;
+        }
+        if let Some(report) = self.test_reports.get_mut(&record_id) {
+            report.failures = 0;
+        }
+        // Show progress in the running job while the org keeps working.
+        if let Some(record) = self.output_state.find_mut(record_id)
+            && let Some(view) = record.result.as_mut()
+        {
+            view.summary = format!(
+                "test run {run_id} {}",
+                if run.outcome.is_empty() {
+                    "running"
+                } else {
+                    run.outcome.as_str()
+                }
+            );
+        }
+    }
+
+    /// Count a failed poll and stop after five consecutive failures.
+    fn fail_test_report(&mut self, record_id: u64) {
+        let Some(report) = self.test_reports.get_mut(&record_id) else {
+            return;
+        };
+        report.failures = report.failures.saturating_add(1);
+        if report.failures < 5 {
+            return;
+        }
+        self.abandon_test_report(record_id, "could not read the test result");
+    }
+
+    /// Stop polling a started test run and mark its row as failed rather than a false success.
+    fn abandon_test_report(&mut self, record_id: u64, reason: &str) {
+        self.test_reports.remove(&record_id);
+        if let Some(record) = self.output_state.find_mut(record_id) {
+            record.pending_report = false;
+            record.exit_code = Some(1);
+            record.ended_at = Some(Instant::now());
+            if let Some(view) = record.result.as_mut() {
+                view.ok = false;
+                view.status = "Report unavailable".to_owned();
+                view.summary = reason.to_owned();
+                view.items = vec![ResultItem {
+                    ok: false,
+                    label: "Test results unavailable".to_owned(),
+                    detail: reason.to_owned(),
+                    progress: None,
+                }];
+            }
+        }
+        self.error(format!("Apex test report stopped: {reason}"));
     }
 
     pub async fn tick(&mut self) {
@@ -1287,7 +1401,16 @@ impl App {
             };
             if report.attempts >= 150 {
                 self.deploy_reports.remove(&record_id);
-                self.error("Deploy report timed out; F2 keeps the last result");
+                if let Some(record) = self.output_state.find_mut(record_id) {
+                    record.exit_code = Some(1);
+                    record.ended_at = Some(Instant::now());
+                    if let Some(view) = record.result.as_mut() {
+                        view.ok = false;
+                        view.status = "Report unavailable".to_owned();
+                        view.summary = "deploy report timed out".to_owned();
+                    }
+                }
+                self.error("Deploy report timed out; F2 jobs shows the last state");
                 continue;
             }
             report.attempts = report.attempts.saturating_add(1);
@@ -1302,16 +1425,44 @@ impl App {
                 );
             }
         }
+
+        let test_in_flight: Vec<u64> = self
+            .jobs
+            .values()
+            .filter_map(|entry| match entry.purpose {
+                JobPurpose::TestReport { record_id } => Some(record_id),
+                _ => None,
+            })
+            .collect();
+        let due_tests: Vec<(u64, String, Option<String>)> = self
+            .test_reports
+            .iter()
+            .filter(|(id, report)| now >= report.poll_after && !test_in_flight.contains(id))
+            .map(|(id, report)| (*id, report.run_id.clone(), report.org.clone()))
+            .collect();
+        for (record_id, run_id, org) in due_tests {
+            let attempts = self
+                .test_reports
+                .get(&record_id)
+                .map(|report| report.attempts)
+                .unwrap_or(0);
+            if attempts >= 200 {
+                self.abandon_test_report(record_id, "timed out waiting for the org");
+                continue;
+            }
+            if let Some(report) = self.test_reports.get_mut(&record_id) {
+                report.attempts = report.attempts.saturating_add(1);
+                report.poll_after = now + Duration::from_secs(3);
+            }
+            self.spawn(
+                crate::sf::commands::apex_test_result_argv(&run_id, org.as_deref()),
+                JobPurpose::TestReport { record_id },
+            );
+        }
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
         self.config.save().map_err(anyhow::Error::from)
-    }
-
-    fn persist_config(&mut self) {
-        if let Err(error) = self.config.save() {
-            self.error(format!("Could not save configuration: {error}"));
-        }
     }
 
     pub fn spinner_tick(&self) -> usize {
@@ -1347,7 +1498,7 @@ impl App {
                 TaskKind::Retrieve
                     | TaskKind::Deploy
                     | TaskKind::Tests
-                    | TaskKind::Catalog
+                    | TaskKind::Command
                     | TaskKind::Setup
             )
         {
@@ -1379,6 +1530,7 @@ impl App {
     fn start_job(&mut self, id: u64, executable: PathBuf, argv: Vec<String>, purpose: JobPurpose) {
         if let Some(record) = self.output_state.find_mut(id) {
             record.queued = false;
+            record.started_at = Some(Instant::now());
         }
         match sf::runner::spawn_with_env(
             &executable,
@@ -1403,12 +1555,16 @@ impl App {
                     record.exit_code = None;
                     record.finished = true;
                     record.queued = false;
+                    record.ended_at.get_or_insert_with(Instant::now);
                 }
                 if matches!(purpose, JobPurpose::OrgList) {
                     self.org_state.loading = false;
                 }
                 if let JobPurpose::Report { transfer_job, .. } = purpose {
                     self.deploy_reports.remove(&transfer_job);
+                }
+                if let JobPurpose::TestReport { record_id } = purpose {
+                    self.fail_test_report(record_id);
                 }
                 self.error(error.to_string());
             }
@@ -1442,6 +1598,7 @@ impl App {
             .keys()
             .copied()
             .chain(self.pending_jobs.iter().map(|pending| pending.id))
+            .chain(self.test_reports.keys().copied())
             .max();
         id.is_some_and(|id| self.cancel_job(id))
     }
@@ -1456,8 +1613,33 @@ impl App {
             if let Some(record) = self.output_state.find_mut(pending.id) {
                 record.finished = true;
                 record.queued = false;
+                record.ended_at.get_or_insert_with(Instant::now);
             }
             self.notice(format!("Cancelled queued job #{id}"));
+            return true;
+        }
+        let poll_jobs: Vec<u64> = self
+            .jobs
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(entry.purpose, JobPurpose::TestReport { record_id } if record_id == id)
+            })
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        if self.test_reports.remove(&id).is_some() {
+            for job_id in poll_jobs {
+                if let Some(entry) = self.jobs.remove(&job_id) {
+                    let _ = entry.job.cancel();
+                }
+            }
+            if let Some(record) = self.output_state.find_mut(id) {
+                record.finished = true;
+                record.pending_report = false;
+                record.exit_code = None;
+                record.queued = false;
+                record.ended_at.get_or_insert_with(Instant::now);
+            }
+            self.notice(format!("Cancelled job #{id}"));
             return true;
         }
         let Some(entry) = self.jobs.remove(&id) else {
@@ -1474,6 +1656,7 @@ impl App {
                 record.finished = true;
                 record.exit_code = None;
                 record.queued = false;
+                record.ended_at.get_or_insert_with(Instant::now);
             }
             self.notice(format!("Cancelled job #{id}"));
             self.start_pending_jobs();
@@ -1491,11 +1674,17 @@ impl App {
     }
 
     pub fn busy(&self) -> bool {
-        !self.jobs.is_empty() || !self.pending_jobs.is_empty()
+        !self.jobs.is_empty() || !self.pending_jobs.is_empty() || !self.test_reports.is_empty()
     }
 
     pub fn job_count(&self) -> usize {
-        self.jobs.len() + self.pending_jobs.len()
+        // Apex poll jobs are internal; their pending run is counted once via `test_reports`.
+        self.jobs
+            .values()
+            .filter(|entry| !matches!(entry.purpose, JobPurpose::TestReport { .. }))
+            .count()
+            + self.pending_jobs.len()
+            + self.test_reports.len()
     }
 
     pub fn active_job_label(&self) -> Option<String> {
@@ -1534,10 +1723,7 @@ impl App {
                     return;
                 }
                 KeyCode::Char('u') => {
-                    if self.catalog_state.search_focused {
-                        self.catalog_state.query.clear();
-                        self.catalog_state.active_query.clear();
-                    } else if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
+                    if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
                         self.transfer_search.query.clear();
                         self.transfer_search.mark_edited();
                     } else if self.tab == Tab::Tests {
@@ -1550,11 +1736,7 @@ impl App {
             }
         }
         if key.code == KeyCode::F(2) {
-            if let Some(kind) = Self::task_for_tab(self.tab) {
-                self.open_task_history(kind);
-            } else {
-                self.notice("F2 opens the history of the screen you are working in");
-            }
+            self.open_jobs();
             return;
         }
         if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
@@ -1563,10 +1745,6 @@ impl App {
         }
         if self.tab == Tab::Tests {
             self.test_key(key);
-            return;
-        }
-        if self.catalog_state.search_focused {
-            self.catalog_key(key);
             return;
         }
         match key.code {
@@ -1586,13 +1764,12 @@ impl App {
             KeyCode::Char('?') => self.modal = Some(Modal::Help { scroll: 0 }),
             KeyCode::F(5) => self.refresh_current_tab(),
             KeyCode::Esc => self.go_back(),
-            KeyCode::Char('h') if !self.catalog_state.search_focused => self.go_home(),
+            KeyCode::Char('h') => self.go_home(),
             KeyCode::Char('y') => self.copy_context(),
             _ => match self.tab {
                 Tab::Home => self.home_key(key),
                 Tab::Retrieve | Tab::Deploy => self.transfer_key(key),
                 Tab::Tests => self.test_key(key),
-                Tab::Catalog => self.catalog_key(key),
                 Tab::Orgs => self.org_key(key),
                 Tab::Setup => self.setup_key(key),
             },
@@ -1642,11 +1819,10 @@ impl App {
 
     fn tab_action_hint(&self) -> &'static str {
         match self.tab {
-            Tab::Home => "↑↓ move · Enter open · F2 history",
+            Tab::Home => "↑↓ move · Enter open · F2 jobs",
             Tab::Retrieve => "type component · Enter search · Space select · Enter confirm",
             Tab::Deploy => "type component · Enter search · Space select · Enter confirm",
             Tab::Tests => "type test class · Enter search · Space select · Enter confirm",
-            Tab::Catalog => "/ search · Enter help · r run",
             Tab::Orgs => "Enter details · o open · l login",
             Tab::Setup => "Enter installer · r re-probe",
         }
@@ -1658,10 +1834,6 @@ impl App {
             Tab::Retrieve | Tab::Deploy => {
                 self.transfer_search.mark_edited();
                 self.notice("Component search refreshed");
-            }
-            Tab::Catalog => {
-                let argv = vec!["commands".to_owned(), "--json".to_owned()];
-                self.spawn(argv, JobPurpose::CatalogRefresh);
             }
             _ => self.notice("Nothing to refresh on this tab"),
         }
@@ -1686,7 +1858,6 @@ impl App {
                     .collect::<Vec<_>>()
                     .join(", "),
             ),
-            Tab::Catalog => self.selected_catalog_id().map(|id| format!("sf {id}")),
             Tab::Orgs => self.selected_org().map(|org| org.username.clone()),
             Tab::Setup => sf::install_instructions()
                 .first()
@@ -1772,7 +1943,11 @@ impl App {
                 self.notice("Type a test class name to search");
             }
             MenuAction::Organizations => self.set_tab(Tab::Orgs),
-            MenuAction::Catalog => self.set_tab(Tab::Catalog),
+            MenuAction::RunCommand => self.open_prompt(
+                "Run command",
+                PromptKind::RunCommand,
+                vec![PromptField::new("Command", "")],
+            ),
         }
     }
 
@@ -1967,6 +2142,47 @@ impl App {
     }
 
     fn test_key(&mut self, key: KeyEvent) {
+        let coverage = self
+            .latest_result(TaskKind::Tests)
+            .map(|result| result.coverage.len())
+            .unwrap_or(0);
+        if self.tests_focus == TestsFocus::Coverage && coverage == 0 {
+            self.tests_focus = TestsFocus::Search;
+        }
+        if self.tests_focus == TestsFocus::Coverage && coverage > 0 {
+            let visible = self.tests_coverage_rows.get().max(1);
+            let max_scroll = coverage.saturating_sub(visible);
+            match key.code {
+                KeyCode::Tab => {
+                    self.tests_focus = TestsFocus::Search;
+                    self.notice("Back to test search");
+                }
+                KeyCode::Esc => self.go_back(),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.coverage_scroll = self.coverage_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.coverage_scroll = (self.coverage_scroll + 1).min(max_scroll);
+                }
+                KeyCode::PageUp => {
+                    self.coverage_scroll = self.coverage_scroll.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    self.coverage_scroll = (self.coverage_scroll + 10).min(max_scroll);
+                }
+                KeyCode::Home => self.coverage_scroll = 0,
+                KeyCode::End => self.coverage_scroll = max_scroll,
+                _ => {}
+            }
+            return;
+        }
+        if key.code == KeyCode::Tab && coverage > 0 {
+            self.tests_focus = TestsFocus::Coverage;
+            let visible = self.tests_coverage_rows.get().max(1);
+            self.coverage_scroll = self.coverage_scroll.min(coverage.saturating_sub(visible));
+            self.notice("Coverage table — ↑↓ scroll · Tab back to search");
+            return;
+        }
         match key.code {
             KeyCode::Up => self.test_search.cursor = self.test_search.cursor.saturating_sub(1),
             KeyCode::Down => {
@@ -2052,91 +2268,6 @@ impl App {
             .unwrap_or_default()
     }
 
-    // ----- Catalog -----------------------------------------------------------------
-
-    pub fn catalog_rows(&self) -> Rc<Vec<CatalogRow>> {
-        let query = self.catalog_state.active_query.trim().to_owned();
-        if let Some((revision, cached_query, rows)) = self.catalog_rows_cache.borrow().as_ref()
-            && *revision == self.catalog_revision
-            && cached_query == &query
-        {
-            return Rc::clone(rows);
-        }
-        let rows = Rc::new(self.build_catalog_rows(&query));
-        *self.catalog_rows_cache.borrow_mut() =
-            Some((self.catalog_revision, query, Rc::clone(&rows)));
-        rows
-    }
-
-    fn build_catalog_rows(&self, query: &str) -> Vec<CatalogRow> {
-        let catalog = &self.startup.catalog;
-        if query.is_empty() {
-            let mut rows = vec![CatalogRow::Header("Popular commands".to_owned())];
-            for id in POPULAR_COMMAND_IDS {
-                if let Some(command) = catalog.command(id) {
-                    rows.push(command_row(
-                        command,
-                        None,
-                        self.config.is_favorite(&command.id),
-                    ));
-                }
-            }
-            let mut categories = catalog.categories();
-            categories.sort();
-            for category in categories {
-                rows.push(CatalogRow::Header(category.clone()));
-                for command in catalog
-                    .commands
-                    .iter()
-                    .filter(|command| command.category == category)
-                    .filter(|command| !POPULAR_COMMAND_IDS.contains(&command.id.as_str()))
-                {
-                    rows.push(command_row(
-                        command,
-                        None,
-                        self.config.is_favorite(&command.id),
-                    ));
-                }
-            }
-            rows
-        } else {
-            let mut rows = Vec::new();
-            let mut last_category = String::new();
-            for hit in catalog::search(&catalog.commands, query, 400) {
-                if hit.command.category != last_category {
-                    rows.push(CatalogRow::Header(hit.command.category.clone()));
-                    last_category = hit.command.category.clone();
-                }
-                rows.push(command_row(
-                    hit.command,
-                    hit.matched,
-                    self.config.is_favorite(&hit.command.id),
-                ));
-            }
-            rows
-        }
-    }
-
-    pub fn selected_catalog_id(&self) -> Option<String> {
-        let rows = self.catalog_rows();
-        if let Some(id) = &self.catalog_state.selected_id
-            && rows
-                .iter()
-                .any(|row| matches!(row, CatalogRow::Command { id: row_id, .. } if row_id == id))
-        {
-            return Some(id.clone());
-        }
-        rows.iter().find_map(|row| match row {
-            CatalogRow::Command { id, .. } => Some(id.clone()),
-            CatalogRow::Header(_) => None,
-        })
-    }
-
-    pub fn selected_command(&self) -> Option<&CommandSpec> {
-        self.selected_catalog_id()
-            .and_then(|id| self.startup.catalog.command(&id))
-    }
-
     /// The newest finished result for a task, used to show check marks on its own screen.
     pub fn latest_result(&self, kind: TaskKind) -> Option<&ResultView> {
         self.output_state
@@ -2147,166 +2278,89 @@ impl App {
             .and_then(|record| record.result.as_ref())
     }
 
-    pub fn task_records(&self, kind: TaskKind) -> Vec<&OutputRecord> {
-        self.output_state
+    /// Every visible job in Jobs-window order: running newest first, then queued in FIFO
+    /// order, then finished newest first.
+    pub fn job_rows(&self) -> Vec<JobRow<'_>> {
+        let mut running: Vec<&OutputRecord> = self
+            .output_state
             .records
             .iter()
-            .rev()
-            .filter(|record| record.task == kind)
-            .collect()
-    }
-
-    fn task_history_len(&self, kind: TaskKind) -> usize {
-        self.task_records(kind).len()
-            + if kind == TaskKind::Tests {
-                self.test_runs.len()
-            } else {
-                0
-            }
-    }
-
-    fn open_task_history(&mut self, kind: TaskKind) {
-        if self.task_history_len(kind) == 0 {
-            self.notice(format!("No {} history yet", kind.label()));
-            return;
-        }
-        self.modal = Some(Modal::TaskHistory { kind, selected: 0 });
-    }
-
-    fn task_for_tab(tab: Tab) -> Option<TaskKind> {
-        match tab {
-            Tab::Retrieve => Some(TaskKind::Retrieve),
-            Tab::Deploy => Some(TaskKind::Deploy),
-            Tab::Tests => Some(TaskKind::Tests),
-            Tab::Catalog => Some(TaskKind::Catalog),
-            Tab::Orgs => Some(TaskKind::Organization),
-            Tab::Setup => Some(TaskKind::Setup),
-            Tab::Home => None,
-        }
-    }
-
-    fn catalog_key(&mut self, key: KeyEvent) {
-        if self.catalog_state.search_focused {
-            match key.code {
-                KeyCode::Esc => {
-                    if self.catalog_state.query.is_empty() {
-                        self.catalog_state.search_focused = false;
-                    } else {
-                        self.catalog_state.query.clear();
-                        self.catalog_state.active_query.clear();
-                    }
-                }
-                KeyCode::Backspace => {
-                    self.catalog_state.query.pop();
-                }
-                KeyCode::Enter => {
-                    self.catalog_state.search_focused = false;
-                    self.catalog_state.active_query = self.catalog_state.query.clone();
-                }
-                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.catalog_state.query.push(character);
-                }
-                KeyCode::Up | KeyCode::Down => {
-                    self.move_catalog(if key.code == KeyCode::Up { -1 } else { 1 })
-                }
-                _ => {}
-            }
-            return;
-        }
-        match key.code {
-            KeyCode::Char('/') => self.catalog_state.search_focused = true,
-            KeyCode::Up => self.move_catalog(-1),
-            KeyCode::Down => self.move_catalog(1),
-            KeyCode::PageUp => self.move_catalog(-10),
-            KeyCode::PageDown => self.move_catalog(10),
-            KeyCode::Enter => self.fetch_help(),
-            KeyCode::Char('r') => {
-                if let Some(id) = self.selected_catalog_id() {
-                    let preset = self.preset_flags(&id).join(" ");
-                    self.open_prompt(
-                        "Run command",
-                        PromptKind::RunFlags { id: id.clone() },
-                        vec![PromptField::new(
-                            "Flags (e.g. --json --target-org dev)",
-                            preset,
-                        )],
-                    );
-                }
-            }
-            KeyCode::Char('f') => {
-                if let Some(id) = self.selected_catalog_id() {
-                    let added = self.config.toggle_favorite(&id);
-                    self.catalog_revision = self.catalog_revision.wrapping_add(1);
-                    self.persist_config();
-                    self.notice(if added {
-                        "Added to favorites"
-                    } else {
-                        "Removed from favorites"
-                    });
-                }
-            }
-            KeyCode::Char('e') => {
-                if let Some(id) = self.selected_catalog_id() {
-                    let preset = self.preset_flags(&id).join(" ");
-                    self.open_prompt(
-                        "Edit preset flags",
-                        PromptKind::EditPreset { id: id.clone() },
-                        vec![PromptField::new("Preset flags", preset)],
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn move_catalog(&mut self, delta: isize) {
-        let rows = self.catalog_rows();
-        let command_indexes: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| match row {
-                CatalogRow::Command { .. } => Some(index),
-                CatalogRow::Header(_) => None,
-            })
+            .filter(|record| record.is_running())
             .collect();
-        if command_indexes.is_empty() {
-            return;
-        }
-        let current = self.catalog_state.selected_id.as_ref().and_then(|id| {
-            rows.iter().position(
-                |row| matches!(row, CatalogRow::Command { id: row_id, .. } if row_id == id),
-            )
+        running.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then_with(|| right.id.cmp(&left.id))
         });
-        let position = current
-            .and_then(|current| command_indexes.iter().position(|index| *index == current))
-            .unwrap_or(0) as isize;
-        let next = (position + delta).clamp(0, command_indexes.len() as isize - 1) as usize;
-        if let CatalogRow::Command { id, .. } = &rows[command_indexes[next]] {
-            self.catalog_state.selected_id = Some(id.clone());
-        }
-    }
-
-    fn fetch_help(&mut self) {
-        let Some(id) = self.selected_catalog_id() else {
-            return;
-        };
-        if self.catalog_state.help_for.as_deref() == Some(id.as_str()) {
-            return;
-        }
-        let mut argv: Vec<String> = id.split_whitespace().map(str::to_owned).collect();
-        argv.push("--help".to_owned());
-        self.spawn(argv, JobPurpose::Help { id });
-    }
-
-    // ----- Favorites ----------------------------------------------------------------
-
-    fn preset_flags(&self, id: &str) -> Vec<String> {
-        self.config
-            .favorites
+        let mut queued: Vec<&OutputRecord> = self
+            .output_state
+            .records
             .iter()
-            .find(|favorite| favorite.id == id)
-            .map(|favorite| favorite.preset_flags.clone())
-            .unwrap_or_default()
+            .filter(|record| record.queued && !record.finished)
+            .collect();
+        queued.sort_by_key(|record| record.id);
+        let mut finished: Vec<&OutputRecord> = self
+            .output_state
+            .records
+            .iter()
+            .filter(|record| record.finished && !record.pending_report)
+            .collect();
+        finished.sort_by(|left, right| {
+            right
+                .ended_at
+                .cmp(&left.ended_at)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let mut rows = Vec::with_capacity(running.len() + queued.len() + finished.len());
+        rows.extend(running.into_iter().map(|record| JobRow {
+            section: JobSection::Running,
+            record,
+        }));
+        rows.extend(queued.into_iter().map(|record| JobRow {
+            section: JobSection::Queued,
+            record,
+        }));
+        rows.extend(finished.into_iter().map(|record| JobRow {
+            section: JobSection::Finished,
+            record,
+        }));
+        rows
+    }
+
+    /// Open the global Jobs window, selecting the newest running job or the newest result.
+    fn open_jobs(&mut self) {
+        let rows = self.job_rows();
+        let selected = rows
+            .iter()
+            .position(|row| row.section == JobSection::Running)
+            .or_else(|| {
+                rows.iter()
+                    .position(|row| row.section == JobSection::Finished)
+            })
+            .unwrap_or(0);
+        self.modal = Some(Modal::Jobs {
+            selected,
+            focus: JobsFocus::List,
+            scroll: 0,
+            follow: true,
+        });
+    }
+
+    /// Drop every finished job row; running, queued and pending-report rows are untouched.
+    fn clear_finished_jobs(&mut self) {
+        self.output_state
+            .records
+            .retain(|record| !record.finished || record.pending_report);
+        let kept: Vec<u64> = self
+            .output_state
+            .records
+            .iter()
+            .map(|record| record.id)
+            .collect();
+        // Cleared deploy-start and test-run rows must stop their report polling as well.
+        self.deploy_reports.retain(|id, _| kept.contains(id));
+        self.test_reports.retain(|id, _| kept.contains(id));
     }
 
     // ----- Orgs ---------------------------------------------------------------------
@@ -2474,228 +2528,12 @@ impl App {
                     });
                 }
             },
-            Modal::TaskHistory { kind, mut selected } => {
-                let len = self.task_history_len(kind);
-                if len == 0 {
-                    self.modal = None;
-                    return;
-                }
-                selected = selected.min(len - 1);
-                match key.code {
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
-                        self.modal = Some(Modal::TaskHistory { kind, selected });
-                    }
-                    KeyCode::Down => {
-                        selected = (selected + 1).min(len - 1);
-                        self.modal = Some(Modal::TaskHistory { kind, selected });
-                    }
-                    KeyCode::PageUp => {
-                        selected = selected.saturating_sub(5);
-                        self.modal = Some(Modal::TaskHistory { kind, selected });
-                    }
-                    KeyCode::PageDown => {
-                        selected = (selected + 5).min(len - 1);
-                        self.modal = Some(Modal::TaskHistory { kind, selected });
-                    }
-                    KeyCode::Esc => self.modal = None,
-                    KeyCode::Char('x') => {
-                        let records = self.task_records(kind);
-                        if let Some(record) = records.get(selected) {
-                            let id = record.id;
-                            let open = !record.finished || record.queued;
-                            drop(records);
-                            if open {
-                                self.cancel_job(id);
-                            } else {
-                                self.notice("That job already finished");
-                            }
-                        }
-                    }
-                    KeyCode::Enter => {
-                        let records = self.task_records(kind);
-                        if let Some(record) = records.get(selected) {
-                            let record_id = record.id;
-                            drop(records);
-                            self.modal = Some(Modal::JobResult {
-                                kind,
-                                record_id,
-                                scroll: 0,
-                            });
-                        } else if kind == TaskKind::Tests {
-                            let index = selected.saturating_sub(records.len());
-                            drop(records);
-                            if let Some(run) = self.test_runs.get(index) {
-                                self.modal = Some(Modal::TestRun {
-                                    run: run.clone(),
-                                    scroll: 0,
-                                });
-                            }
-                        }
-                    }
-                    _ => self.modal = Some(Modal::TaskHistory { kind, selected }),
-                }
-            }
-            Modal::JobResult {
-                kind,
-                record_id,
-                mut scroll,
-            } => match key.code {
-                KeyCode::Esc => {
-                    self.modal = Some(Modal::TaskHistory { kind, selected: 0 });
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll,
-                    });
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll = scroll.saturating_add(1);
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll,
-                    });
-                }
-                KeyCode::PageUp => {
-                    scroll = scroll.saturating_sub(10);
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll,
-                    });
-                }
-                KeyCode::PageDown => {
-                    scroll = scroll.saturating_add(10);
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll,
-                    });
-                }
-                KeyCode::Home => {
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll: 0,
-                    });
-                }
-                KeyCode::End => {
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll: u16::MAX as usize,
-                    });
-                }
-                KeyCode::Char('o') => {
-                    self.output_state.show_details = !self.output_state.show_details;
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll: 0,
-                    });
-                }
-                KeyCode::Char('z') => {
-                    self.output_state.show_details = true;
-                    self.output_state.show_json = !self.output_state.show_json;
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll: 0,
-                    });
-                }
-                KeyCode::Char('v') => {
-                    if self.test_runs.is_empty() {
-                        self.notice("No saved test runs yet");
-                    } else {
-                        self.modal = Some(Modal::TestHistory {
-                            runs: self.test_runs.clone(),
-                            selected: 0,
-                        });
-                    }
-                }
-                KeyCode::Char('x') => {
-                    if self.cancel_job(record_id) {
-                        self.modal = Some(Modal::TaskHistory { kind, selected: 0 });
-                    }
-                }
-                _ => {
-                    self.modal = Some(Modal::JobResult {
-                        kind,
-                        record_id,
-                        scroll,
-                    });
-                }
-            },
-            Modal::TestHistory { runs, mut selected } => {
-                selected = selected.min(runs.len().saturating_sub(1));
-                match key.code {
-                    KeyCode::Up => {
-                        selected = selected.saturating_sub(1);
-                        self.modal = Some(Modal::TestHistory { runs, selected });
-                    }
-                    KeyCode::Down => {
-                        if !runs.is_empty() {
-                            selected = (selected + 1).min(runs.len() - 1);
-                        }
-                        self.modal = Some(Modal::TestHistory { runs, selected });
-                    }
-                    KeyCode::PageUp => {
-                        selected = selected.saturating_sub(5);
-                        self.modal = Some(Modal::TestHistory { runs, selected });
-                    }
-                    KeyCode::PageDown => {
-                        if !runs.is_empty() {
-                            selected = (selected + 5).min(runs.len() - 1);
-                        }
-                        self.modal = Some(Modal::TestHistory { runs, selected });
-                    }
-                    KeyCode::Enter => {
-                        if let Some(run) = runs.get(selected) {
-                            self.modal = Some(Modal::TestRun {
-                                run: run.clone(),
-                                scroll: 0,
-                            });
-                        } else {
-                            self.modal = None;
-                        }
-                    }
-                    KeyCode::Esc => self.modal = None,
-                    _ => self.modal = Some(Modal::TestHistory { runs, selected }),
-                }
-            }
-            Modal::TestRun { run, mut scroll } => match key.code {
-                KeyCode::Esc | KeyCode::Enter => self.modal = None,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
-                    self.modal = Some(Modal::TestRun { run, scroll });
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll = scroll.saturating_add(1);
-                    self.modal = Some(Modal::TestRun { run, scroll });
-                }
-                KeyCode::PageUp => {
-                    scroll = scroll.saturating_sub(10);
-                    self.modal = Some(Modal::TestRun { run, scroll });
-                }
-                KeyCode::PageDown => {
-                    scroll = scroll.saturating_add(10);
-                    self.modal = Some(Modal::TestRun { run, scroll });
-                }
-                KeyCode::Home => {
-                    self.modal = Some(Modal::TestRun { run, scroll: 0 });
-                }
-                KeyCode::End => {
-                    self.modal = Some(Modal::TestRun {
-                        run,
-                        scroll: u16::MAX as usize,
-                    });
-                }
-                _ => self.modal = Some(Modal::TestRun { run, scroll }),
-            },
+            Modal::Jobs {
+                selected,
+                focus,
+                scroll,
+                follow,
+            } => self.handle_jobs_key(selected, focus, scroll, follow, key),
             Modal::TestConfirm {
                 mut entries,
                 mut focus,
@@ -2757,7 +2595,13 @@ impl App {
                     }
                     let argv = crate::sf::commands::apex_test_argv(&classes, org.as_deref());
                     let display = crate::sf::commands::apex_test_display(&classes, org.as_deref());
-                    self.spawn(argv, JobPurpose::ApexTests { command: display });
+                    self.spawn(
+                        argv,
+                        JobPurpose::ApexTests {
+                            command: display,
+                            org,
+                        },
+                    );
                 }
                 KeyCode::Esc => {
                     self.set_tab(Tab::Tests);
@@ -3068,24 +2912,205 @@ impl App {
         }
     }
 
+    fn handle_jobs_key(
+        &mut self,
+        mut selected: usize,
+        mut focus: JobsFocus,
+        mut scroll: usize,
+        mut follow: bool,
+        key: KeyEvent,
+    ) {
+        let mut close = false;
+        let mut reset_view = false;
+        let rows = self.job_rows();
+        if rows.is_empty() {
+            if key.code == KeyCode::Esc {
+                close = true;
+            }
+        } else {
+            let count = rows.len();
+            selected = selected.min(count - 1);
+            let row = rows[selected];
+            let record = row.record;
+            let live = row.section != JobSection::Finished;
+            let queued_position = rows
+                .iter()
+                .filter(|row| row.section == JobSection::Queued)
+                .position(|row| row.record.id == record.id)
+                .map(|index| index + 1);
+            let scroll_key = matches!(
+                key.code,
+                KeyCode::Char('j' | 'k' | 'g')
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
+            );
+            let content_len = if scroll_key {
+                crate::ui::job_detail_len(self, record, queued_position)
+            } else {
+                0
+            };
+            let height = usize::from(self.jobs_detail_height.get()).max(1);
+            let max_scroll = content_len.saturating_sub(height);
+            let record_id = record.id;
+            let record_finished = record.finished;
+            drop(rows);
+
+            match key.code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    reset_view = true;
+                }
+                KeyCode::Down => {
+                    selected = (selected + 1).min(count - 1);
+                    reset_view = true;
+                }
+                KeyCode::PageUp if focus == JobsFocus::List => {
+                    selected = selected.saturating_sub(5);
+                    reset_view = true;
+                }
+                KeyCode::PageDown if focus == JobsFocus::List => {
+                    selected = (selected + 5).min(count - 1);
+                    reset_view = true;
+                }
+                KeyCode::Home if focus == JobsFocus::List => {
+                    selected = 0;
+                    reset_view = true;
+                }
+                KeyCode::End if focus == JobsFocus::List => {
+                    selected = count - 1;
+                    reset_view = true;
+                }
+                KeyCode::Tab => {
+                    focus = match focus {
+                        JobsFocus::List => JobsFocus::Detail,
+                        JobsFocus::Detail => JobsFocus::List,
+                    };
+                }
+                KeyCode::Enter => focus = JobsFocus::Detail,
+                KeyCode::Esc => {
+                    if focus == JobsFocus::Detail {
+                        focus = JobsFocus::List;
+                    } else {
+                        close = true;
+                    }
+                }
+                KeyCode::Char('x') => {
+                    if self.cancel_job(record_id) {
+                        reset_view = true;
+                    } else if record_finished {
+                        self.notice("That job already finished");
+                    }
+                }
+                KeyCode::Char('c') => {
+                    self.clear_finished_jobs();
+                    reset_view = true;
+                }
+                KeyCode::Char('o') if record_finished => {
+                    self.output_state.show_details = !self.output_state.show_details;
+                    reset_view = true;
+                }
+                KeyCode::Char('z') if record_finished => {
+                    self.output_state.show_details = true;
+                    self.output_state.show_json = !self.output_state.show_json;
+                    reset_view = true;
+                }
+                KeyCode::Char('g') => {
+                    scroll = max_scroll;
+                    follow = live;
+                }
+                KeyCode::Char('j') if focus == JobsFocus::Detail => {
+                    let current = if live && follow {
+                        max_scroll
+                    } else {
+                        scroll.min(max_scroll)
+                    };
+                    scroll = (current + 1).min(max_scroll);
+                    follow = live && scroll >= max_scroll;
+                }
+                KeyCode::Char('k') if focus == JobsFocus::Detail => {
+                    let current = if live && follow {
+                        max_scroll
+                    } else {
+                        scroll.min(max_scroll)
+                    };
+                    scroll = current.saturating_sub(1);
+                    follow = false;
+                }
+                KeyCode::PageUp if focus == JobsFocus::Detail => {
+                    let current = if live && follow {
+                        max_scroll
+                    } else {
+                        scroll.min(max_scroll)
+                    };
+                    scroll = current.saturating_sub(10);
+                    follow = false;
+                }
+                KeyCode::PageDown if focus == JobsFocus::Detail => {
+                    let current = if live && follow {
+                        max_scroll
+                    } else {
+                        scroll.min(max_scroll)
+                    };
+                    scroll = (current + 10).min(max_scroll);
+                    follow = live && scroll >= max_scroll;
+                }
+                KeyCode::Home if focus == JobsFocus::Detail => {
+                    scroll = 0;
+                    follow = false;
+                }
+                KeyCode::End if focus == JobsFocus::Detail => {
+                    scroll = max_scroll;
+                    follow = live;
+                }
+                _ => {}
+            }
+        }
+        if close {
+            self.modal = None;
+            return;
+        }
+        let rows = self.job_rows();
+        let count = rows.len();
+        let selected = selected.min(count.saturating_sub(1));
+        if reset_view && count > 0 {
+            scroll = 0;
+            follow = rows[selected].section != JobSection::Finished;
+        }
+        drop(rows);
+        self.modal = Some(Modal::Jobs {
+            selected,
+            focus,
+            scroll,
+            follow,
+        });
+    }
+
     fn submit_prompt(&mut self, kind: &PromptKind, fields: &[PromptField]) -> bool {
         let values: Vec<String> = fields
             .iter()
             .map(|field| field.value.trim().to_owned())
             .collect();
         match kind {
-            PromptKind::RunFlags { id } => {
-                self.run_command(id, values.first().map(String::as_str).unwrap_or(""))
-            }
-            PromptKind::EditPreset { id } => {
-                let flags = split_args(values.first().map(String::as_str).unwrap_or(""));
-                if !self.config.is_favorite(id) {
-                    self.config.toggle_favorite(id);
-                }
-                self.config.set_preset_flags(id, flags);
-                self.catalog_revision = self.catalog_revision.wrapping_add(1);
-                self.persist_config();
-                self.notice("Preset flags saved");
+            PromptKind::RunCommand => {
+                let Some(argv) =
+                    parse_run_command(values.first().map(String::as_str).unwrap_or(""))
+                else {
+                    self.error("Enter an sf command, for example: sf org list --json");
+                    return false;
+                };
+                let command = redact_command(&format!("sf {}", argv.join(" ")));
+                let warning = if is_secret_command(&command) {
+                    "\n\nSecrets are shown as [redacted]; this command may expose credentials, so its output is not retained."
+                } else {
+                    ""
+                };
+                self.modal = Some(Modal::Confirm {
+                    title: "Run command?".to_owned(),
+                    message: format!("{command}{warning}\n\nEnter runs · Esc cancels"),
+                    action: PendingAction::RunCommand { argv, command },
+                });
             }
             PromptKind::QuickRetrieve | PromptKind::QuickDeploy => {
                 let retrieve = matches!(kind, PromptKind::QuickRetrieve);
@@ -3218,27 +3243,6 @@ impl App {
         true
     }
 
-    fn run_command(&mut self, id: &str, flags: &str) {
-        let mut argv: Vec<String> = id.split_whitespace().map(str::to_owned).collect();
-        argv.extend(split_args(flags));
-        let display = format!("sf {id} {flags}").trim().to_owned();
-        if is_destructive_command(id) {
-            self.modal = Some(Modal::Confirm {
-                title: "Run this command?".to_owned(),
-                message: format!("{display}\n\nEnter runs · Esc cancels"),
-                action: PendingAction::RunPrepared { argv },
-            });
-            return;
-        }
-        self.spawn(
-            argv,
-            JobPurpose::Command {
-                id: id.to_owned(),
-                command: display,
-            },
-        );
-    }
-
     fn execute(&mut self, action: PendingAction) {
         match action {
             PendingAction::None => {}
@@ -3276,6 +3280,13 @@ impl App {
                     },
                 );
             }
+            PendingAction::RunCommand { argv, command } => self.spawn(
+                argv,
+                JobPurpose::Command {
+                    id: "run".to_owned(),
+                    command,
+                },
+            ),
             PendingAction::Quit => self.should_quit = true,
         }
     }
@@ -3295,7 +3306,7 @@ impl App {
                         title: format!("Run {name} installer?"),
                         message: format!(
                             "This runs: {command}
-Output appears in the Output tab."
+Output appears in the Jobs window (F2)."
                         ),
                         action: PendingAction::RunInstaller { command },
                     });
@@ -3328,15 +3339,6 @@ Output appears in the Output tab."
         }
         self.start_probe();
         self.notice("Re-probing the Salesforce CLI…");
-    }
-}
-
-fn command_row(command: &CommandSpec, matched: Option<Vec<usize>>, favorite: bool) -> CatalogRow {
-    CatalogRow::Command {
-        id: command.id.clone(),
-        summary: command.summary.clone(),
-        matched,
-        favorite,
     }
 }
 
@@ -3395,6 +3397,29 @@ pub(crate) fn split_names(input: &str) -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+/// Parse the Run command prompt: strip a leading `sf`/`sfdx`, keep quoted arguments together.
+pub(crate) fn parse_run_command(input: &str) -> Option<Vec<String>> {
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("sf") || trimmed.eq_ignore_ascii_case("sfdx") {
+        return None;
+    }
+    let mut rest = trimmed;
+    if let Some((first, tail)) = trimmed.split_once(char::is_whitespace)
+        && (first.eq_ignore_ascii_case("sf") || first.eq_ignore_ascii_case("sfdx"))
+    {
+        rest = tail.trim_start();
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    let argv = split_args(rest);
+    if argv.is_empty() || argv.first().is_some_and(|arg| arg.starts_with('-')) {
+        None
+    } else {
+        Some(argv)
+    }
 }
 
 pub(crate) fn split_args(input: &str) -> Vec<String> {
@@ -3509,17 +3534,53 @@ fn build_suggestion_sets(project: Option<SfProject>) -> (Arc<SuggestionSet>, Arc
     (all, tests)
 }
 
+/// Whether a parsed `apex run test` response is final or needs polling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApexReportAction {
+    Final,
+    Poll { run_id: String },
+}
+
+fn apex_report_action(run: &test_results::TestRun) -> ApexReportAction {
+    if test_results::is_terminal_outcome(&run.outcome) || run.id.is_empty() {
+        ApexReportAction::Final
+    } else {
+        ApexReportAction::Poll {
+            run_id: run.id.clone(),
+        }
+    }
+}
+
+/// A lightweight result shown while the org still works on the test run.
+fn started_test_view(run_id: &str) -> ResultView {
+    ResultView {
+        kind: ResultKind::ApexTests,
+        title: "Apex tests".to_owned(),
+        status: "Running".to_owned(),
+        ok: true,
+        summary: format!("test run {run_id} started"),
+        items: vec![ResultItem {
+            ok: true,
+            label: format!("Test run {run_id}"),
+            detail: "waiting for org results".to_owned(),
+            progress: None,
+        }],
+        coverage: Vec::new(),
+        sections: Vec::new(),
+    }
+}
+
 fn task_for_purpose(purpose: &JobPurpose) -> Option<TaskKind> {
     match purpose {
         JobPurpose::Transfer { options } if options.retrieve => Some(TaskKind::Retrieve),
         JobPurpose::Transfer { .. } => Some(TaskKind::Deploy),
         JobPurpose::ApexTests { .. } => Some(TaskKind::Tests),
-        JobPurpose::Command { .. } => Some(TaskKind::Catalog),
+        JobPurpose::Command { .. } => Some(TaskKind::Command),
         JobPurpose::Installer { .. } => Some(TaskKind::Setup),
         JobPurpose::OrgList | JobPurpose::OrgDetail { .. } | JobPurpose::OrgAction { .. } => {
             Some(TaskKind::Organization)
         }
-        JobPurpose::CatalogRefresh | JobPurpose::Help { .. } | JobPurpose::Report { .. } => None,
+        JobPurpose::Report { .. } | JobPurpose::TestReport { .. } => None,
     }
 }
 
@@ -3532,26 +3593,6 @@ fn is_user_purpose(purpose: &JobPurpose) -> bool {
             | JobPurpose::Installer { .. }
             | JobPurpose::OrgAction { .. }
     )
-}
-
-/// Commands that change org, project or package state need an explicit confirmation.
-fn is_destructive_command(id: &str) -> bool {
-    let id = id.to_ascii_lowercase();
-    [
-        "org delete",
-        "org logout",
-        "org create",
-        "data delete",
-        "project deploy",
-        "project retrieve",
-        "package install",
-        "package uninstall",
-        "config set",
-        "config unset",
-        "alias delete",
-    ]
-    .iter()
-    .any(|prefix| id.starts_with(prefix))
 }
 
 /// Commands whose output or arguments must not be retained or shown verbatim.
@@ -3666,7 +3707,6 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sf::catalog::CatalogSource;
 
     fn test_app() -> App {
         let _guard = tokio::runtime::Runtime::new()
@@ -3677,27 +3717,6 @@ mod tests {
                 installation: None,
                 version: None,
                 current_org: None,
-                catalog: Catalog {
-                    commands: vec![
-                        CommandSpec {
-                            id: "org list".to_owned(),
-                            summary: "List orgs".to_owned(),
-                            description: String::new(),
-                            category: "Orgs".to_owned(),
-                            flags: Vec::new(),
-                            examples: Vec::new(),
-                        },
-                        CommandSpec {
-                            id: "project deploy start".to_owned(),
-                            summary: "Deploy".to_owned(),
-                            description: String::new(),
-                            category: "Project".to_owned(),
-                            flags: Vec::new(),
-                            examples: Vec::new(),
-                        },
-                    ],
-                    source: CatalogSource::Snapshot,
-                },
                 notices: Vec::new(),
             },
             Config::default(),
@@ -3731,23 +3750,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_search_navigates_and_toggles_favorite() {
-        let mut app = test_app();
-        app.tab = Tab::Catalog;
-        app.handle_key(key(KeyCode::Char('/')));
-        for character in "deploy".chars() {
-            app.handle_key(key(KeyCode::Char(character)));
-        }
-        app.handle_key(key(KeyCode::Enter));
-        assert_eq!(
-            app.selected_catalog_id().as_deref(),
-            Some("project deploy start")
-        );
-        app.handle_key(key(KeyCode::Char('f')));
-        assert!(app.config.is_favorite("project deploy start"));
-    }
-
-    #[test]
     fn prompt_text_editing_supports_typing_backspace_and_submit() {
         let mut app = test_app();
         app.open_prompt(
@@ -3770,6 +3772,8 @@ mod tests {
     }
 
     fn record(id: u64, task: TaskKind, exit_code: Option<i32>) -> OutputRecord {
+        let now = Instant::now();
+        let finished = exit_code.is_some();
         OutputRecord {
             id,
             command: format!("sf project transfer --job {id}"),
@@ -3780,10 +3784,13 @@ mod tests {
             lines: Vec::new(),
             line_bytes: 0,
             exit_code,
-            finished: exit_code.is_some(),
+            finished,
             queued: false,
+            started_at: Some(now),
+            ended_at: finished.then_some(now),
             json: None,
             result: None,
+            pending_report: false,
         }
     }
 
@@ -3812,37 +3819,185 @@ mod tests {
     }
 
     #[test]
-    fn task_history_lists_only_that_tasks_records() {
+    fn job_rows_order_running_then_queued_then_finished() {
         let mut app = test_app();
-        for (id, task, exit_code) in [
-            (1, TaskKind::Retrieve, Some(0)),
-            (2, TaskKind::Deploy, Some(1)),
-            (3, TaskKind::Retrieve, None),
-        ] {
-            app.output_state.records.push(record(id, task, exit_code));
+        let now = Instant::now();
+        let mut older = record(1, TaskKind::Deploy, None);
+        older.started_at = now.checked_sub(Duration::from_secs(5));
+        let mut newer = record(2, TaskKind::Deploy, None);
+        newer.started_at = Some(now);
+        let mut queued = record(3, TaskKind::Retrieve, None);
+        queued.queued = true;
+        queued.started_at = None;
+        let mut finished_older = record(4, TaskKind::Tests, Some(0));
+        finished_older.ended_at = now.checked_sub(Duration::from_secs(5));
+        let mut finished_newer = record(5, TaskKind::Tests, Some(1));
+        finished_newer.ended_at = Some(now);
+        app.output_state.records = vec![finished_older, queued, newer, finished_newer, older];
+
+        let rows = app.job_rows();
+        let ids: Vec<u64> = rows.iter().map(|row| row.record.id).collect();
+        assert_eq!(ids, vec![2, 1, 3, 5, 4]);
+        let sections: Vec<JobSection> = rows.iter().map(|row| row.section).collect();
+        assert_eq!(
+            sections,
+            vec![
+                JobSection::Running,
+                JobSection::Running,
+                JobSection::Queued,
+                JobSection::Finished,
+                JobSection::Finished,
+            ]
+        );
+    }
+
+    #[test]
+    fn clearing_finished_jobs_keeps_running_and_queued() {
+        let mut app = test_app();
+        let mut queued = record(2, TaskKind::Retrieve, None);
+        queued.queued = true;
+        app.output_state.records = vec![
+            record(1, TaskKind::Deploy, None),
+            queued,
+            record(3, TaskKind::Tests, Some(0)),
+        ];
+        app.clear_finished_jobs();
+        let ids: Vec<u64> = app
+            .output_state
+            .records
+            .iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn cancelling_a_queued_job_marks_it_stopped() {
+        let mut app = test_app();
+        let mut queued = record(7, TaskKind::Retrieve, None);
+        queued.queued = true;
+        queued.started_at = None;
+        app.output_state.records.push(queued);
+        app.pending_jobs.push_back(PendingJob {
+            id: 7,
+            executable: PathBuf::from("sf"),
+            argv: vec!["project".to_owned(), "retrieve".to_owned()],
+            purpose: JobPurpose::Transfer {
+                options: TransferOptions::default(),
+            },
+        });
+        assert!(app.cancel_job(7));
+        let record = app
+            .output_state
+            .records
+            .iter()
+            .find(|record| record.id == 7)
+            .expect("record");
+        assert!(record.finished);
+        assert!(!record.queued);
+        assert!(record.ended_at.is_some());
+        assert!(app.pending_jobs.is_empty());
+        let rows = app.job_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].section, JobSection::Finished);
+    }
+
+    #[test]
+    fn jobs_detail_scroll_moves_after_end_and_resets_on_selection() {
+        let mut app = test_app();
+        let mut finished = record(1, TaskKind::Deploy, Some(0));
+        finished.lines = (0..40)
+            .map(|index| JobLine {
+                job_id: 1,
+                stream: crate::sf::runner::OutputStream::Stdout,
+                text: format!("line {index}"),
+            })
+            .collect();
+        app.output_state.records = vec![finished, record(2, TaskKind::Deploy, Some(0))];
+        app.open_jobs();
+        // The newer empty record is selected first; move to the one with output.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::End));
+        let end_scroll = match app.modal {
+            Some(Modal::Jobs { scroll, .. }) => scroll,
+            other => panic!("expected jobs modal, got {other:?}"),
+        };
+        assert!(end_scroll > 0);
+        app.handle_key(key(KeyCode::Char('k')));
+        match app.modal {
+            Some(Modal::Jobs { scroll, focus, .. }) => {
+                assert_eq!(scroll + 1, end_scroll);
+                assert_eq!(focus, JobsFocus::Detail);
+            }
+            other => panic!("expected jobs modal, got {other:?}"),
         }
-        let retrieves = app.task_records(TaskKind::Retrieve);
-        assert_eq!(retrieves.len(), 2);
-        assert_eq!(retrieves[0].id, 3);
-        assert!(!retrieves[0].queued);
-        assert_eq!(app.task_records(TaskKind::Deploy).len(), 1);
-        app.open_task_history(TaskKind::Deploy);
-        assert!(matches!(
-            app.modal.as_ref(),
-            Some(Modal::TaskHistory {
-                kind: TaskKind::Deploy,
+        app.handle_key(key(KeyCode::Up));
+        match app.modal {
+            Some(Modal::Jobs {
+                scroll,
+                follow,
+                focus,
                 ..
-            })
-        ));
-        app.handle_key(key(KeyCode::Enter));
-        assert!(matches!(
-            app.modal.as_ref(),
-            Some(Modal::JobResult {
-                kind: TaskKind::Deploy,
-                record_id: 2,
-                ..
-            })
-        ));
+            }) => {
+                assert_eq!(scroll, 0);
+                assert!(!follow);
+                assert_eq!(focus, JobsFocus::Detail);
+            }
+            other => panic!("expected jobs modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn f2_opens_the_jobs_window_from_every_screen() {
+        let mut app = test_app();
+        for tab in [
+            Tab::Home,
+            Tab::Retrieve,
+            Tab::Deploy,
+            Tab::Tests,
+            Tab::Orgs,
+            Tab::Setup,
+        ] {
+            app.tab = tab;
+            app.modal = None;
+            app.handle_key(key(KeyCode::F(2)));
+            assert!(
+                matches!(app.modal, Some(Modal::Jobs { .. })),
+                "F2 did not open the Jobs window on {tab:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn jobs_window_selects_the_newest_running_job() {
+        let mut app = test_app();
+        let now = Instant::now();
+        let mut older = record(1, TaskKind::Deploy, None);
+        older.started_at = now.checked_sub(Duration::from_secs(5));
+        let mut newer = record(2, TaskKind::Deploy, None);
+        newer.started_at = Some(now);
+        app.output_state.records = vec![record(3, TaskKind::Tests, Some(0)), older, newer];
+        app.open_jobs();
+        match app.modal {
+            Some(Modal::Jobs {
+                selected, focus, ..
+            }) => {
+                assert_eq!(selected, 0);
+                assert_eq!(focus, JobsFocus::List);
+            }
+            other => panic!("expected jobs modal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jobs_window_opens_with_an_empty_state_and_stays_open() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::F(2)));
+        app.handle_key(key(KeyCode::Down));
+        assert!(matches!(app.modal, Some(Modal::Jobs { .. })));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
     }
 
     #[test]
@@ -3950,6 +4105,179 @@ mod tests {
     }
 
     #[test]
+    fn run_command_strips_sf_and_keeps_quoted_arguments() {
+        assert_eq!(
+            parse_run_command("sf org list --json"),
+            Some(vec![
+                "org".to_owned(),
+                "list".to_owned(),
+                "--json".to_owned()
+            ])
+        );
+        assert_eq!(
+            parse_run_command("sfdx data query --query \"SELECT Id FROM Account\""),
+            Some(vec![
+                "data".to_owned(),
+                "query".to_owned(),
+                "--query".to_owned(),
+                "SELECT Id FROM Account".to_owned()
+            ])
+        );
+        assert_eq!(parse_run_command("sf"), None);
+        assert_eq!(parse_run_command("sf --json"), None);
+        assert_eq!(parse_run_command("   "), None);
+    }
+
+    #[test]
+    fn run_command_prompt_confirms_the_exact_command_and_redacts_secrets() {
+        let mut app = test_app();
+        assert!(app.submit_prompt(
+            &PromptKind::RunCommand,
+            &[PromptField::new("Command", "sf org list --json")]
+        ));
+        match app.modal.take() {
+            Some(Modal::Confirm {
+                message,
+                action: PendingAction::RunCommand { argv, command },
+                ..
+            }) => {
+                assert!(message.contains("sf org list --json"));
+                assert_eq!(
+                    argv,
+                    vec!["org".to_owned(), "list".to_owned(), "--json".to_owned()]
+                );
+                assert_eq!(command, "sf org list --json");
+            }
+            other => panic!("expected run confirmation, got {other:?}"),
+        }
+        assert!(app.submit_prompt(
+            &PromptKind::RunCommand,
+            &[PromptField::new(
+                "Command",
+                "sf org login web --client-secret hunter2"
+            )]
+        ));
+        match app.modal.take() {
+            Some(Modal::Confirm { message, .. }) => {
+                assert!(message.contains("[redacted]"));
+                assert!(!message.contains("hunter2"));
+                assert!(message.contains("output is not retained"));
+            }
+            other => panic!("expected run confirmation, got {other:?}"),
+        }
+        assert!(!app.submit_prompt(
+            &PromptKind::RunCommand,
+            &[PromptField::new("Command", "  ")]
+        ));
+    }
+
+    #[test]
+    fn apex_report_decision_polls_only_non_terminal_runs_with_an_id() {
+        let processing = test_results::parse(
+            &serde_json::json!({
+                "result": {"testRunId": "08N000000000001", "summary": {"outcome": "Processing"}}
+            }),
+            "",
+        );
+        assert_eq!(
+            apex_report_action(&processing),
+            ApexReportAction::Poll {
+                run_id: "08N000000000001".to_owned()
+            }
+        );
+        let passed = test_results::parse(
+            &serde_json::json!({"result": {"summary": {"outcome": "Passed"}}}),
+            "",
+        );
+        assert_eq!(apex_report_action(&passed), ApexReportAction::Final);
+        let no_id = test_results::parse(
+            &serde_json::json!({"result": {"summary": {"outcome": "Processing"}}}),
+            "",
+        );
+        assert_eq!(apex_report_action(&no_id), ApexReportAction::Final);
+    }
+
+    #[test]
+    fn pending_report_records_stay_in_the_running_section() {
+        let mut app = test_app();
+        let mut pending = record(1, TaskKind::Tests, Some(0));
+        pending.pending_report = true;
+        app.output_state.records.push(pending);
+        let rows = app.job_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].section, JobSection::Running);
+        assert!(rows[0].record.is_running());
+    }
+
+    #[test]
+    fn cancelling_a_pending_report_removes_the_poll_entry() {
+        let mut app = test_app();
+        let mut pending = record(4, TaskKind::Tests, Some(0));
+        pending.pending_report = true;
+        app.output_state.records.push(pending);
+        app.test_reports.insert(
+            4,
+            TestReport {
+                run_id: "08N000000000001".to_owned(),
+                org: Some("test-scratch".to_owned()),
+                poll_after: Instant::now(),
+                attempts: 1,
+                failures: 0,
+            },
+        );
+        assert!(app.cancel_job(4));
+        assert!(!app.test_reports.contains_key(&4));
+        let record = app
+            .output_state
+            .records
+            .iter()
+            .find(|record| record.id == 4)
+            .expect("record");
+        assert!(!record.pending_report);
+        assert!(record.finished);
+        assert_eq!(record.exit_code, None);
+        assert_eq!(app.job_rows()[0].section, JobSection::Finished);
+    }
+
+    #[test]
+    fn tests_tab_switches_to_coverage_only_when_a_table_exists() {
+        let mut app = test_app();
+        app.tab = Tab::Tests;
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.tests_focus, TestsFocus::Search);
+
+        let mut finished = record(1, TaskKind::Tests, Some(0));
+        finished.result = Some(ResultView {
+            kind: ResultKind::ApexTests,
+            title: "Apex tests".to_owned(),
+            status: "Passed".to_owned(),
+            ok: true,
+            summary: "2 run · 2 passed · 0 failed".to_owned(),
+            items: Vec::new(),
+            coverage: (0..8)
+                .map(|index| ResultItem {
+                    ok: true,
+                    label: format!("Demo{index}"),
+                    detail: format!("{}%", 30 + index * 5),
+                    progress: Some((index + 1, 10)),
+                })
+                .collect(),
+            sections: Vec::new(),
+        });
+        app.output_state.records.push(finished);
+        app.tests_coverage_rows.set(2);
+
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.tests_focus, TestsFocus::Coverage);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.coverage_scroll, 1);
+        app.handle_key(key(KeyCode::End));
+        assert_eq!(app.coverage_scroll, 6);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.tests_focus, TestsFocus::Search);
+    }
+
+    #[test]
     fn menu_lists_task_screens_in_order() {
         let labels: Vec<&str> = MENU_ITEMS.iter().map(|item| item.label).collect();
         assert_eq!(
@@ -3960,7 +4288,7 @@ mod tests {
                 "Create Metadata",
                 "Apex Tests",
                 "Organization",
-                "Command Catalog",
+                "Run command",
             ]
         );
         let mut app = test_app();
