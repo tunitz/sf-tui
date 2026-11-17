@@ -3,6 +3,22 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.1.7] - 2026-11-17
+
+### Changed
+
+- Redesigned Retrieve and Deploy as separate, identical, plain search screens with an async,
+  debounced component search and checkbox multi-select.
+- Selection now goes straight to a confirmation dialog with checkbox toggles, advanced options,
+  org cycling, command preview and one-key run — no intermediate path picker.
+- Home is reduced to the menu plus the current org.
+- Output is a result screen (`SUCCESS`/`FAILED`) with details collapsed behind `o`; it stays open
+  until you press a key.
+- Fixed input routing: search and modal screens consume all keys, so digits, arrows and hotkeys no
+  longer trigger global actions while typing or confirming.
+
+[0.1.7]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.7
+
 ## [0.1.6] - 2026-11-17
 
 ### Added

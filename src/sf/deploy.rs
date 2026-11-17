@@ -117,8 +117,10 @@ impl TransferOptions {
             if self.check_only {
                 argv.push("--dry-run".to_owned());
             }
-            argv.push("--test-level".to_owned());
-            argv.push(self.test_level.as_str().to_owned());
+            if self.check_only || self.test_level != TestLevel::NoTestRun {
+                argv.push("--test-level".to_owned());
+                argv.push(self.test_level.as_str().to_owned());
+            }
             if self.test_level == TestLevel::RunSpecifiedTests {
                 for test in &self.tests {
                     argv.push("--tests".to_owned());

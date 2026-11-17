@@ -54,56 +54,25 @@ For a nonstandard location, set `SFTUI_SF_PATH` to the full path of the executab
 
 ## Keybindings
 
-Every screen shows a compact **Actions** bar with keys and labels. `Tab` cycles screens, digits
-`1`–`7` jump directly, `h` returns Home, `Backspace` goes back to the previous screen, `?` opens
-the full key map and `q` quits. After a successful command the status bar reminds you of `h` and
-`Backspace`.
+Home is just the menu:
 
-The layout adapts to the terminal: below 105 columns or 30 rows it collapses side-by-side panes
-and trims the header; below 72 columns or 20 rows it becomes a single column with a one-line
-header and status bar, aimed at VS Code and Zed terminal panels. Rendering is tested down to
-48x12.
+```text
+[1] Retrieve        [2] Deploy        [3] Run tests
+[4] Test results    [5] Create metadata    [6] Log in
+```
 
-| Screen | Keys |
-| --- | --- |
-| Home | `r` retrieve · `d` deploy · `t` run tests · `g` results · `c` create metadata · `a` login |
-| Catalog | `/` search · `↑↓` move · `Enter` live `--help` · `r` run with flags · `f` favorite |
-| Favorites | `Enter` run · `Ctrl+↑↓` reorder · `e` preset flags · `x` remove |
-| Orgs | `↑↓` move · `Enter` details · `o` open browser · `d` project default · `D` dev hub · `x` logout · `l` login · `c` scratch org |
-| Deploy/Retrieve | `Space` select · `m` payload mode · `v` validate · `t` test level · `w` ignore warnings · `o` target org · `r` toggle retrieve · `Enter` run |
-| Output | `h` home · `Backspace` back · `↑↓` history · `j`/`k` scroll · `z` JSON table · `y` copy command |
-| Setup | `↑↓` installer · `Enter` run · `r` re-probe |
+Global: `Tab` next screen · `h` Home · `Backspace` back · `?` help · `q` quit.
 
-## Walkthroughs
+On the Retrieve/Deploy screens, type to search, `↑↓` move, `Space` check/uncheck, `Enter`
+confirm, `Esc` back. The search is async and debounced; selected components keep their source
+paths and become `--metadata` entries in the command.
 
-### Create metadata
+The confirmation dialog shows every selected component as a checkbox: `Space` toggles, `↑↓` moves,
+`c` shows the exact command, `v/t/w` toggle deploy options, `g` cycles orgs, `Enter` runs and `Esc`
+goes back.
 
-Press `c` on Home. Type part of a template name — `apex class`, `lwc`, `flexi`, `custom object` —
-and pick from the fuzzy list, then enter the component name. `sftui` builds the matching
-`sf template generate`, `sf schema generate` or `sf cmdt generate` command and streams it in Output.
-
-### Work with orgs
-
-Open **Orgs** and press `F5` to run `sf org list --json`. The table shows alias, username, type,
-default markers and connection status. Select an org and press `Enter` for `sf org display --json`;
-tokens and auth URLs are filtered out. From the same screen you can open the org in a browser, set
-the project default org or dev hub, log out with confirmation, log in via the web flow or create a
-scratch org with an alias, definition file and duration.
-
-### Deploy or retrieve metadata
-
-From Home press `r` or `d`, then type part of a component name — for example `apex demo` or
-`flow`. `sftui` searches the local source files and `package.xml` manifests, showing matches with
-their source paths. Use `↑↓` to move, `Space` to check/uncheck as many components as you want, and
-`Enter` to confirm. A single dialog then shows the exact command (one `--metadata` per component,
-defaulting to the current org); press `Enter` to run or `Esc` to go back. There is no intermediate
-path picker in this flow — the project path comes from the matched file.
-
-Deploy uses `sf project deploy start --source-dir …` with `--dry-run` for validation, and an async
-job id triggers `sf project deploy report --json --job-id …` polling with a spinner and component
-counts. Retrieve uses `sf project retrieve start` and shows its final result directly, matching the
-current CLI (there is no `project retrieve report` command). Failures and their problems are shown
-in the results panel and the raw stream stays in Output.
+The result screen shows `SUCCESS` or `FAILED`; press `o` to expand raw details, `h` for Home,
+`Esc` to go back, or `r` to rerun.
 
 ## Configuration
 

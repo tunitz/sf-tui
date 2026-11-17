@@ -20,7 +20,7 @@ case "$*" in
   "project deploy start --source-dir force-app --json" | "project deploy start --source-dir force-app --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Queued"}}'
     ;;
-  "project retrieve start --metadata ApexClass --json")
+  "project retrieve start --metadata ApexClass --json" | "project retrieve start --metadata CustomLabel --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000002","status":"Succeeded"}}'
     ;;
   "apex run test --result-format json --wait 10 --json")

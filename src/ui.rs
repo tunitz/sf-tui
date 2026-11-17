@@ -5,12 +5,11 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{
-    Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs, Wrap,
+    Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs,
 };
 
 use crate::app::{App, CatalogRow, Modal, Tab};
 use crate::json_view;
-use crate::sf::deploy::PayloadMode;
 
 fn accent(app: &App) -> Color {
     app.accent()
@@ -37,10 +36,11 @@ fn density(area: Rect) -> Density {
 fn short_tab(tab: Tab) -> &'static str {
     match tab {
         Tab::Home => "Home",
+        Tab::Retrieve => "Retrieve",
+        Tab::Deploy => "Deploy",
         Tab::Catalog => "Cat",
         Tab::Favorites => "Fav",
         Tab::Orgs => "Orgs",
-        Tab::Deploy => "Dep",
         Tab::Output => "Out",
         Tab::Setup => "Setup",
     }
@@ -93,10 +93,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_header(frame, layout[0], app);
     match app.tab {
         Tab::Home => draw_home(frame, layout[1], app),
+        Tab::Retrieve | Tab::Deploy => draw_transfer(frame, layout[1], app),
         Tab::Catalog => draw_catalog(frame, layout[1], app),
         Tab::Favorites => draw_favorites(frame, layout[1], app),
         Tab::Orgs => draw_orgs(frame, layout[1], app),
-        Tab::Deploy => draw_deploy(frame, layout[1], app),
         Tab::Output => draw_output(frame, layout[1], app),
         Tab::Setup => draw_setup(frame, layout[1], app),
     }
@@ -276,10 +276,10 @@ fn key_hints(app: &App) -> String {
     let common = "Tab next screen · ? help · q quit";
     let specific = match app.tab {
         Tab::Home => "r retrieve · d deploy · t tests · g results · c create · a login",
+        Tab::Retrieve | Tab::Deploy => "type · Space select · Enter confirm · Esc back",
         Tab::Catalog => "/ search · Enter help · r run · f favorite",
         Tab::Favorites => "Enter run · Ctrl+↑↓ reorder · e preset",
         Tab::Orgs => "Enter details · o open · d default · l login",
-        Tab::Deploy => "Space select · m payload · Enter run",
         Tab::Output => "↑↓ records · j/k scroll · z JSON",
         Tab::Setup => "Enter run installer · r re-probe",
     };
@@ -305,170 +305,39 @@ fn action_bar<'a>(items: Vec<(&'a str, &'a str)>, app: &App) -> Line<'a> {
 }
 
 fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
-    let density = density(area);
-    if density != Density::Roomy {
-        let compact = density == Density::Compact;
-        let rows = Layout::vertical([
-            Constraint::Length(if compact { 3 } else { 7 }),
-            Constraint::Min(3),
-        ])
-        .split(area);
-        let items: Vec<ListItem> = crate::app::QUICK_ACTIONS
-            .iter()
-            .map(|action| {
-                let mut line = vec![
-                    strong(format!("[{}] ", action.key), accent(app)),
-                    strong(action.label, Color::White),
-                ];
-                if compact {
-                    line.push(faint(truncated(
-                        action.command.trim_start_matches("sf "),
-                        area.width.saturating_sub(26) as usize,
-                    )));
-                }
-                ListItem::new(Line::from(line))
-            })
-            .collect();
-        let mut state = ListState::default();
-        state.select(Some(
-            app.home_state
-                .selected
-                .min(crate::app::QUICK_ACTIONS.len() - 1),
-        ));
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(block("Home — a/r/d/t/g run a task", app))
-                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-                .highlight_symbol(">"),
-            rows[1],
-            &mut state,
-        );
-        let project = app
-            .deploy_state
-            .project
-            .as_ref()
-            .map(|project| project.name())
-            .unwrap_or_else(|| "no project".to_owned());
-        let org = if app.org_target_hint().is_empty() {
-            "sf default".to_owned()
-        } else {
+    let lines: Vec<Line> = std::iter::once(Line::from(vec![
+        strong("SF TUI", accent(app)),
+        faint(format!(
+            "                         Org: {}",
             app.org_target_hint()
-        };
-        let mut context = if compact {
-            vec![
-                Line::from(faint(format!("project: {project} | org: {org}"))),
-                Line::from(faint(format!(
-                    "sf {} | ? help | Enter run selected",
-                    app.startup.version.as_deref().unwrap_or("detecting…")
-                ))),
-            ]
-        } else {
-            vec![Line::from(faint(truncated(
-                &format!("{project} | {org}"),
-                area.width.saturating_sub(2) as usize,
-            )))]
-        };
-        if !app.startup_stage.done {
-            let frames = ["-", "\\", "|", "/"];
-            context.push(Line::from(Span::styled(
-                format!(
-                    "{} {} ({}s) — usable now",
-                    frames[app.spinner_tick() % frames.len()],
-                    app.startup_stage.label,
-                    app.startup_stage.started.elapsed().as_secs()
-                ),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        frame.render_widget(Paragraph::new(Text::from(context)), rows[0]);
-        return;
-    }
-    let columns =
-        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(area);
-    let items: Vec<ListItem> = crate::app::QUICK_ACTIONS
-        .iter()
-        .map(|action| {
-            let mut lines = vec![Line::from(vec![
-                strong(format!("[{}] ", action.key), accent(app)),
-                strong(action.label, Color::White),
-                Span::styled(
-                    format!("   {}", action.command.trim_start_matches("sf ")),
-                    Style::default().fg(Color::DarkGray),
-                ),
-            ])];
-            if !action.hint.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("     {}", action.hint),
-                    Style::default().fg(Color::Gray),
-                )));
-            }
-            ListItem::new(lines)
-        })
-        .collect();
-    let mut state = ListState::default();
-    state.select(Some(
-        app.home_state
-            .selected
-            .min(crate::app::QUICK_ACTIONS.len() - 1),
-    ));
-    let list = List::new(items)
-        .block(block(
-            "What do you want to do? Five keys cover most work.",
-            app,
-        ))
-        .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-        .highlight_symbol(">");
-    frame.render_stateful_widget(list, columns[0], &mut state);
-
-    let mut details = vec![
-        strong_line("CURRENT CONTEXT", accent(app)),
-        Line::from(faint(format!(
-            "project: {}",
-            app.deploy_state
-                .project
-                .as_ref()
-                .map(|project| project.name())
-                .unwrap_or_else(|| "none found".to_owned())
-        ))),
-        Line::from(faint(format!(
-            "default org: {}",
-            if app.org_target_hint().is_empty() {
-                "sf default (not loaded yet)".to_owned()
-            } else {
-                app.org_target_hint()
-            }
-        ))),
-        Line::from(faint(format!(
-            "cli: {}",
-            app.startup.version.as_deref().unwrap_or("detecting…")
-        ))),
-        Line::from(" "),
-        action_bar(
-            vec![("r/d", "retrieve/deploy"), ("c", "create"), ("?", "keys")],
-            app,
-        ),
-        Line::from(" "),
-        Line::from(faint(
-            "Paths and the default org are pre-filled; you only confirm or edit them.",
         )),
-    ];
-    if !app.startup_stage.done {
-        let elapsed = app.startup_stage.started.elapsed().as_secs();
-        let frames = ["-", "\\", "|", "/"];
-        details.push(Line::from(Span::styled(
-            format!(
-                "{} {} ({}s) — the UI is usable now",
-                frames[app.spinner_tick() % frames.len()],
-                app.startup_stage.label,
-                elapsed
-            ),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-    frame.render_widget(
-        Paragraph::new(Text::from(details)).block(block("context", app)),
-        columns[1],
-    );
+    ]))
+    .chain(
+        crate::app::QUICK_ACTIONS
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                let selected = index == app.home_state.selected;
+                Line::from(vec![Span::styled(
+                    format!(
+                        "{} [{}] {}\n",
+                        if selected { ">" } else { " " },
+                        action.key,
+                        action.label
+                    ),
+                    Style::default()
+                        .fg(if selected { accent(app) } else { Color::White })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )])
+            }),
+    )
+    .chain(std::iter::once(Line::from(faint("[?] Help    [q] Quit"))))
+    .collect();
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn draw_catalog(frame: &mut Frame, area: Rect, app: &App) {
@@ -1020,381 +889,145 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
-    let density = density(area);
-    if density != Density::Roomy {
-        let sections = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(2),
-            Constraint::Length(2),
-        ])
-        .split(area);
-        let options = &app.deploy_state.options;
-        let preview = truncated(
-            &app.transfer_preview(),
-            usize::from(area.width).saturating_sub(1),
-        );
-        frame.render_widget(
-            Paragraph::new(Text::from(vec![
-                Line::from(vec![
-                    strong(
-                        if options.retrieve {
-                            "RETRIEVE"
-                        } else {
-                            "DEPLOY"
-                        },
-                        accent(app),
-                    ),
-                    faint(format!("  {}", options.mode.label())),
-                ]),
-                Line::from(Span::styled(preview, Style::default().fg(accent(app)))),
-            ])),
-            sections[0],
-        );
-        let rows: Vec<Row> = app
-            .deploy_state
-            .items
-            .iter()
-            .map(|item| {
-                let selected = match options.mode {
-                    PayloadMode::Source => options.paths.contains(&item.path),
-                    PayloadMode::Manifest => {
-                        options.manifest.as_deref() == Some(item.path.as_str())
-                    }
-                    PayloadMode::Metadata => options.metadata_names.contains(&item.path),
-                };
-                Row::new(vec![
-                    if selected { "x" } else { " " }.to_owned(),
-                    truncated(&item.label, usize::from(area.width).saturating_sub(8)),
-                ])
-            })
-            .collect();
-        let mut state = TableState::default();
-        state.select(if app.deploy_state.items.is_empty() {
-            None
-        } else {
-            Some(app.deploy_state.selected)
-        });
-        frame.render_stateful_widget(
-            Table::new(rows, [Constraint::Length(2), Constraint::Min(8)])
-                .header(Row::new(vec!["", "Path"]).style(Style::default().fg(accent(app))))
-                .block(block(
-                    app.deploy_state
-                        .selected_component
-                        .as_deref()
-                        .map(|component| format!("Selected: {component} — Enter runs"))
-                        .unwrap_or_else(|| "components — Space selects".to_owned()),
-                    app,
-                ))
-                .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-                .highlight_symbol(">"),
-            sections[1],
-            &mut state,
-        );
-        let status = if let Some(report) = &app.deploy_state.report {
-            format!(
-                "{}: {} ok / {} failed",
-                report.status, report.succeeded, report.failed
-            )
-        } else if let Some(job) = &app.deploy_state.job_id {
-            format!("polling {job}…")
-        } else {
-            "Space select · m mode · v validate · Enter run".to_owned()
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(strong(
-                truncated(&status, usize::from(area.width).saturating_sub(1)),
-                accent(app),
-            ))),
-            sections[2],
-        );
-        return;
-    }
+fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
+    let state = &app.transfer_search;
     let sections = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Min(4),
-        Constraint::Length(9),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(2),
+        Constraint::Length(1),
     ])
     .split(area);
-    let options = &app.deploy_state.options;
-    let project_name = app
-        .deploy_state
-        .project
-        .as_ref()
-        .map(|project| project.name())
-        .unwrap_or_else(|| "no project".to_owned());
-    let test = if options.retrieve {
-        "n/a".to_owned()
-    } else {
-        options.test_level.as_str().to_owned()
-    };
-    let mut summary = vec![
+    let title = if state.retrieve { "Retrieve" } else { "Deploy" };
+    frame.render_widget(
         Line::from(vec![
-            strong(
-                if options.retrieve {
-                    "RETRIEVE"
-                } else {
-                    "DEPLOY"
-                },
-                accent(app),
-            ),
-            faint(format!("  project: {project_name}")),
-            faint(format!("  payload: {}", options.mode.label())),
+            strong(title, accent(app)),
+            faint(format!(
+                "                              Org: {}",
+                app.org_target_hint()
+            )),
+            faint("       [Esc] back"),
         ]),
+        sections[0],
+    );
+    let query = if state.query.is_empty() {
+        "type a component name".to_owned()
+    } else {
+        state.query.clone()
+    };
+    frame.render_widget(
         Line::from(vec![
-            faint("flags: "),
+            strong("Search: ", accent(app)),
             Span::styled(
-                format!(
-                    "target={} validate={} warnings={} test={}",
-                    options.target_org.as_deref().unwrap_or("default"),
-                    options.check_only,
-                    options.ignore_warnings,
-                    test
-                ),
+                format!("[{query}{}", if state.searching { " …" } else { "" }),
                 Style::default().fg(Color::White),
             ),
         ]),
-    ];
-    if let Some(error) = &app.deploy_state.project_error {
-        summary.push(Line::from(Span::styled(
-            error.clone(),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-    summary.push(Line::from(Span::styled(
-        truncated(
-            &app.transfer_preview(),
-            area.width.saturating_sub(4) as usize,
-        ),
-        Style::default().fg(accent(app)),
-    )));
-    frame.render_widget(
-        Paragraph::new(Text::from(summary)).block(block("transfer options", app)),
-        sections[0],
+        sections[1],
     );
-
-    let rows: Vec<Row> = app
-        .deploy_state
-        .items
+    let items: Vec<ListItem> = state
+        .results
         .iter()
-        .map(|item| {
-            let selected = match options.mode {
-                PayloadMode::Source => options.paths.contains(&item.path),
-                PayloadMode::Manifest => options.manifest.as_deref() == Some(item.path.as_str()),
-                PayloadMode::Metadata => options.metadata_names.contains(&item.path),
-            };
-            Row::new(vec![
-                if selected { "✓" } else { " " }.to_owned(),
-                item.kind.to_owned(),
-                item.label.clone(),
+        .enumerate()
+        .map(|(index, item)| {
+            let checked = state
+                .selected
+                .iter()
+                .find(|entry| entry.item.value == item.value)
+                .is_some_and(|entry| entry.checked);
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{} [{}] ",
+                            if index == state.cursor { ">" } else { " " },
+                            if checked { "x" } else { " " }
+                        ),
+                        Style::default().fg(if checked { accent(app) } else { Color::White }),
+                    ),
+                    Span::styled(item.value.clone(), Style::default().fg(Color::White)),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        "    {}",
+                        truncated(&item.path, usize::from(area.width).saturating_sub(6))
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )),
             ])
         })
         .collect();
-    let mut state = TableState::default();
-    state.select(if app.deploy_state.items.is_empty() {
-        None
-    } else {
-        Some(app.deploy_state.selected)
-    });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(3),
-            Constraint::Length(10),
-            Constraint::Min(10),
-        ],
-    )
-    .header(Row::new(["", "kind", "path"]).style(Style::default().fg(accent(app))))
-    .block(block(
-        app.deploy_state
-            .selected_component
-            .as_deref()
-            .map(|component| format!("Selected: {component} — Enter runs"))
-            .unwrap_or_else(|| "components — Space selects".to_owned()),
-        app,
-    ))
-    .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-    .highlight_symbol("›");
-    frame.render_stateful_widget(table, sections[1], &mut state);
-
-    let mut lines = vec![strong_line("PROGRESS / RESULTS", accent(app))];
-    if let Some(report) = &app.deploy_state.report {
-        let frames = ["-", "\\", "|", "/"];
-        let spinner = frames[app.spinner_tick() % frames.len()];
-        lines.push(Line::from(vec![Span::styled(
-            format!(
-                "{} {} · total {} · ok {} · failed {}",
-                spinner, report.status, report.total, report.succeeded, report.failed
-            ),
-            Style::default().fg(if report.failed > 0 {
-                Color::Red
-            } else {
-                Color::Green
-            }),
-        )]));
-        for component in report.components.iter().take(6) {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "  {} {} — {} {}",
-                    component.component_type, component.name, component.status, component.problem
-                ),
-                Style::default().fg(if component.problem.is_empty() {
-                    Color::Gray
-                } else {
-                    Color::Red
-                }),
-            )));
-        }
-    } else if let Some(job_id) = &app.deploy_state.job_id {
-        let frames = ["-", "\\", "|", "/"];
-        lines.push(Line::from(Span::styled(
-            format!(
-                "{} polling job {job_id}…",
-                frames[app.spinner_tick() % frames.len()]
-            ),
-            Style::default().fg(Color::Yellow),
-        )));
-    } else {
-        lines.push(Line::from(faint(
-            "Select metadata and press Enter to start. Progress is polled automatically.",
-        )));
-    }
-    lines.push(action_bar(
-        vec![
-            ("Space", "select"),
-            ("m", "payload"),
-            ("v", "validate"),
-            ("t", "test"),
-            ("o", "org"),
-            ("Enter", "run"),
-        ],
-        app,
-    ));
+    frame.render_widget(List::new(items), sections[2]);
+    let count = state.checked().len();
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).block(block("monitor", app)),
-        sections[2],
+        Line::from(vec![
+            faint(format!("{count} selected")),
+            faint("                                  [Space] select   [Enter] confirm"),
+        ]),
+        sections[3],
     );
 }
 
 fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
-    let density = density(area);
-    if density != Density::Roomy {
-        let rows = Layout::vertical([Constraint::Length(3), Constraint::Min(2)]).split(area);
-        let records: Vec<ListItem> = app
-            .output_state
-            .records
-            .iter()
-            .map(|record| ListItem::new(Line::from(faint(truncated(&record.label(), 60)))))
-            .collect();
-        let mut state = ListState::default();
-        state.select(if records.is_empty() {
-            None
-        } else {
-            Some(app.output_state.selected)
-        });
-        frame.render_stateful_widget(
-            List::new(records)
-                .block(block("history", app))
-                .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
-                .highlight_symbol(">"),
-            rows[0],
-            &mut state,
-        );
-        let text = app
-            .output_state
-            .records
-            .get(app.output_state.selected)
-            .map(|record| {
-                record
-                    .lines
-                    .iter()
-                    .rev()
-                    .take(usize::from(rows[1].height).saturating_sub(2))
-                    .rev()
-                    .map(|line| line.text.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_else(|| "No output yet — run a command from Home.".to_owned());
-        frame.render_widget(
-            Paragraph::new(text)
-                .block(block("output", app))
-                .wrap(Wrap { trim: false }),
-            rows[1],
-        );
-        return;
-    }
-    let rows = Layout::vertical([Constraint::Length(7), Constraint::Min(3)]).split(area);
-    let records: Vec<ListItem> = app
-        .output_state
-        .records
-        .iter()
-        .map(|record| {
-            ListItem::new(Line::from(Span::styled(
-                record.label(),
-                Style::default().fg(Color::Gray),
-            )))
-        })
-        .collect();
-    let mut state = ListState::default();
-    state.select(if records.is_empty() {
-        None
-    } else {
-        Some(app.output_state.selected)
-    });
-    frame.render_stateful_widget(
-        List::new(records)
-            .block(block("history — most recent last", app))
-            .highlight_style(Style::default().bg(Color::DarkGray).fg(accent(app)))
-            .highlight_symbol("› "),
-        rows[0],
-        &mut state,
-    );
     let Some(record) = app.output_state.records.get(app.output_state.selected) else {
         frame.render_widget(
-            Paragraph::new("No commands yet. Run one from the Catalog, Favorites or Orgs tab.")
-                .block(block("streamed output", app)),
-            rows[1],
+            Paragraph::new("No commands yet. Use Home to retrieve or deploy."),
+            area,
         );
         return;
     };
-    if app.output_state.show_json
-        && let Some(value) = &record.json
-    {
-        let view = json_view::table(value);
-        let table_rows: Vec<Row> = view
-            .rows
-            .iter()
-            .skip(app.output_state.scroll)
-            .take(rows[1].height.saturating_sub(3) as usize)
-            .map(|row| Row::new(row.clone()))
-            .collect();
-        let widths: Vec<Constraint> = view.headers.iter().map(|_| Constraint::Min(14)).collect();
-        let table = Table::new(table_rows, widths)
-            .header(Row::new(view.headers.clone()).style(Style::default().fg(accent(app))))
-            .block(block("parsed JSON — z for raw output", app));
-        frame.render_widget(table, rows[1]);
-        return;
+    let succeeded = record
+        .status
+        .as_ref()
+        .is_some_and(|status| status.succeeded());
+    let label = match &record.status {
+        Some(status) if status.succeeded() => "SUCCESS",
+        Some(_) => "FAILED",
+        None => "RUNNING",
+    };
+    let color = if succeeded {
+        Color::Green
+    } else if record.status.is_some() {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let mut lines = vec![
+        strong(record.purpose.to_uppercase(), accent(app))
+            + Span::styled(" — ", Style::default().fg(Color::DarkGray))
+            + strong(label, color),
+        Line::from(faint(&record.command)),
+        Line::from(" "),
+        Line::from(faint("[o] details   [h] Home   [Esc] Back   [r] Rerun")),
+    ];
+    if app.output_state.show_details {
+        lines.push(Line::from(" "));
+        lines.push(strong_line("DETAILS", accent(app)));
+        if app.output_state.show_json
+            && let Some(value) = &record.json
+        {
+            let view = json_view::table(value);
+            for row in view.rows.iter().take(12) {
+                lines.push(Line::from(faint(row.join(" | "))));
+            }
+            lines.push(Line::from(faint("[z] raw output")));
+        } else {
+            for line in record.lines.iter().rev().take(20).rev() {
+                lines.push(Line::from(Span::styled(
+                    line.text.clone(),
+                    Style::default().fg(
+                        if line.stream == crate::sf::runner::OutputStream::Stderr {
+                            Color::Red
+                        } else {
+                            Color::Gray
+                        },
+                    ),
+                )));
+            }
+            lines.push(Line::from(faint("[z] JSON")));
+        }
     }
-    let lines: Vec<Line> = record
-        .lines
-        .iter()
-        .map(|line| {
-            let color = if line.stream == crate::sf::runner::OutputStream::Stderr {
-                Color::Red
-            } else {
-                Color::Gray
-            };
-            Line::from(Span::styled(line.text.clone(), Style::default().fg(color)))
-        })
-        .collect();
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(block(format!("output #{} — sf stream", record.id), app))
-            .wrap(Wrap { trim: false })
-            .scroll((app.output_state.scroll as u16, 0)),
-        rows[1],
-    );
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
@@ -1541,6 +1174,69 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             ];
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block(title.clone(), app)),
+                area,
+            );
+        }
+        Modal::TransferConfirm {
+            retrieve,
+            entries,
+            focus,
+            show_command,
+            options,
+        } => {
+            let mut lines = vec![
+                Line::from(strong(
+                    format!(
+                        "{} {} components to {}",
+                        if *retrieve { "Retrieve" } else { "Deploy" },
+                        entries.iter().filter(|entry| entry.checked).count(),
+                        options.target_org.as_deref().unwrap_or("default org")
+                    ),
+                    accent(app),
+                )),
+                Line::from(" "),
+            ];
+            for (index, entry) in entries.iter().enumerate() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} [{}] {}",
+                        if index == *focus { ">" } else { " " },
+                        if entry.checked { "x" } else { " " },
+                        entry.item.value
+                    ),
+                    Style::default().fg(if entry.checked {
+                        Color::White
+                    } else {
+                        Color::DarkGray
+                    }),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", truncated(&entry.item.path, 60)),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            lines.push(Line::from(" "));
+            if *show_command {
+                lines.push(Line::from(faint(format!(
+                    "sf {}",
+                    options.argv().join(" ")
+                ))));
+                lines.push(Line::from(" "));
+            }
+            lines.push(Line::from(faint(
+                "[Enter] run   [Esc] back   [Space] toggle   [c] command",
+            )));
+            if !*retrieve {
+                lines.push(Line::from(faint(
+                    "[v] validate   [t] test level   [w] warnings",
+                )));
+            }
+            lines.push(Line::from(faint("[g] org")));
+            let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
+            let area = centered(frame.area(), 90, height);
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(block("Confirm", app)),
                 area,
             );
         }

@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use crate::clipboard;
 use crate::config::Config;
 use crate::sf::catalog::{self, Catalog, CatalogSource, CommandSpec, Flag};
-use crate::sf::deploy::{PayloadMode, TestLevel, TransferOptions, TransferReport};
+use crate::sf::deploy::{PayloadMode, TransferOptions, TransferReport};
 use crate::sf::metadata::{SuggestionItem, SuggestionSet};
 use crate::sf::org::{OrgDetail, OrgSummary};
 use crate::sf::project::{self, SfProject};
@@ -25,10 +25,11 @@ use crate::sf::{self, Startup};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Home,
+    Retrieve,
+    Deploy,
     Catalog,
     Favorites,
     Orgs,
-    Deploy,
     Output,
     Setup,
 }
@@ -37,10 +38,11 @@ impl Tab {
     pub fn label(self) -> &'static str {
         match self {
             Self::Home => "Home",
+            Self::Retrieve => "Retrieve",
+            Self::Deploy => "Deploy",
             Self::Catalog => "Catalog",
             Self::Favorites => "Favorites",
             Self::Orgs => "Orgs",
-            Self::Deploy => "Deploy/Retrieve",
             Self::Output => "Output",
             Self::Setup => "Setup",
         }
@@ -81,8 +83,16 @@ impl JobPurpose {
 #[derive(Debug)]
 pub enum AppEvent {
     Sf(SfEvent),
+    TransferResults {
+        retrieve: bool,
+        query: String,
+        results: Vec<SuggestionItem>,
+    },
     Startup(crate::sf::StartupEvent),
-    Notice { text: String, error: bool },
+    Notice {
+        text: String,
+        error: bool,
+    },
 }
 
 /// One row of the fuzzy-searchable catalog tree.
@@ -211,6 +221,75 @@ pub struct DeployState {
     pub selected_component: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TransferSelection {
+    pub item: SuggestionItem,
+    pub checked: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferSearchState {
+    pub retrieve: bool,
+    pub query: String,
+    pub results: Vec<SuggestionItem>,
+    pub cursor: usize,
+    pub selected: Vec<TransferSelection>,
+    pub dirty: bool,
+    pub last_edit: Instant,
+    pub searching: bool,
+}
+
+impl TransferSearchState {
+    pub fn new(retrieve: bool) -> Self {
+        Self {
+            retrieve,
+            query: String::new(),
+            results: Vec::new(),
+            cursor: 0,
+            selected: Vec::new(),
+            dirty: true,
+            last_edit: Instant::now(),
+            searching: false,
+        }
+    }
+
+    pub fn mark_edited(&mut self) {
+        self.dirty = true;
+        self.last_edit = Instant::now();
+        self.cursor = 0;
+    }
+
+    pub fn debounce_ready(&self) -> bool {
+        self.dirty && self.last_edit.elapsed() >= Duration::from_millis(90)
+    }
+
+    pub fn toggle_result(&mut self) {
+        let Some(item) = self.results.get(self.cursor).cloned() else {
+            return;
+        };
+        if let Some(entry) = self
+            .selected
+            .iter_mut()
+            .find(|entry| entry.item.value == item.value)
+        {
+            entry.checked = !entry.checked;
+        } else {
+            self.selected.push(TransferSelection {
+                item,
+                checked: true,
+            });
+        }
+    }
+
+    pub fn checked(&self) -> Vec<SuggestionItem> {
+        self.selected
+            .iter()
+            .filter(|entry| entry.checked)
+            .map(|entry| entry.item.clone())
+            .collect()
+    }
+}
+
 /// A single recorded command invocation and its streamed output.
 #[derive(Debug, Clone)]
 pub struct OutputRecord {
@@ -245,6 +324,7 @@ pub struct OutputState {
     pub selected: usize,
     pub scroll: usize,
     pub show_json: bool,
+    pub show_details: bool,
 }
 
 impl OutputState {
@@ -396,6 +476,13 @@ pub enum Modal {
         message: String,
         action: PendingAction,
     },
+    TransferConfirm {
+        retrieve: bool,
+        entries: Vec<TransferSelection>,
+        focus: usize,
+        show_command: bool,
+        options: TransferOptions,
+    },
     Prompt {
         title: String,
         kind: PromptKind,
@@ -425,6 +512,7 @@ pub struct App {
     pub favorites_state: FavoritesState,
     pub org_state: OrgState,
     pub deploy_state: DeployState,
+    pub transfer_search: TransferSearchState,
     pub output_state: OutputState,
     pub modal: Option<Modal>,
     pub setup_selected: usize,
@@ -432,6 +520,7 @@ pub struct App {
     suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
     ticks: usize,
     probe_task: Option<JoinHandle<()>>,
+    search_task: Option<JoinHandle<()>>,
     event_tx: UnboundedSender<AppEvent>,
     event_rx: UnboundedReceiver<AppEvent>,
     jobs: HashMap<u64, JobEntry>,
@@ -467,6 +556,7 @@ impl App {
             favorites_state: FavoritesState::default(),
             org_state: OrgState::default(),
             deploy_state: DeployState::default(),
+            transfer_search: TransferSearchState::new(false),
             output_state: OutputState::default(),
             modal: None,
             setup_selected: 0,
@@ -474,6 +564,7 @@ impl App {
             suggestion_cache: None,
             ticks: 0,
             probe_task: None,
+            search_task: None,
             event_tx,
             event_rx,
             jobs: HashMap::new(),
@@ -503,10 +594,11 @@ impl App {
     pub fn tabs(&self) -> Vec<Tab> {
         let mut tabs = vec![
             Tab::Home,
+            Tab::Retrieve,
+            Tab::Deploy,
             Tab::Catalog,
             Tab::Favorites,
             Tab::Orgs,
-            Tab::Deploy,
             Tab::Output,
         ];
         if self.startup_stage.done && !self.startup.is_ready() {
@@ -606,6 +698,19 @@ impl App {
             AppEvent::Startup(sf::StartupEvent::Finished) => {
                 self.startup_stage.done = true;
                 self.notice("Ready");
+            }
+            AppEvent::TransferResults {
+                retrieve,
+                query,
+                results,
+            } => {
+                if self.transfer_search.retrieve == retrieve && self.transfer_search.query == query
+                {
+                    self.transfer_search.results = results;
+                    self.transfer_search.cursor = 0;
+                    self.transfer_search.searching = false;
+                    self.transfer_search.dirty = false;
+                }
             }
             AppEvent::Notice { text, error } => {
                 if error {
@@ -740,6 +845,36 @@ impl App {
 
     pub async fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
+        if self
+            .search_task
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+            && let Some(task) = self.search_task.take()
+        {
+            let _ = task.await;
+            if self.transfer_search.dirty {
+                self.transfer_search.searching = false;
+            }
+        }
+        if self.transfer_search.debounce_ready()
+            && !self.transfer_search.searching
+            && let Some((_, set)) = &self.suggestion_cache
+        {
+            let set = Arc::clone(set);
+            let query = self.transfer_search.query.clone();
+            let retrieve = self.transfer_search.retrieve;
+            let tx = self.event_tx.clone();
+            self.transfer_search.searching = true;
+            self.transfer_search.dirty = false;
+            self.search_task = Some(tokio::spawn(async move {
+                let results = set.filter(&query, 8);
+                let _ = tx.send(AppEvent::TransferResults {
+                    retrieve,
+                    query,
+                    results,
+                });
+            }));
+        }
         if let Some(Modal::Prompt { fields, .. }) = self.modal.as_mut()
             && fields.iter().any(PromptField::debounce_ready)
         {
@@ -906,6 +1041,9 @@ impl App {
                 KeyCode::Char('u') => {
                     if self.catalog_state.search_focused {
                         self.catalog_state.query.clear();
+                    } else if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
+                        self.transfer_search.query.clear();
+                        self.transfer_search.mark_edited();
                     }
                     return;
                 }
@@ -918,6 +1056,14 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
+            self.transfer_key(key);
+            return;
+        }
+        if self.catalog_state.search_focused {
+            self.catalog_key(key);
+            return;
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
@@ -941,10 +1087,10 @@ impl App {
             KeyCode::Char('y') => self.copy_context(),
             _ => match self.tab {
                 Tab::Home => self.home_key(key),
+                Tab::Retrieve | Tab::Deploy => self.transfer_key(key),
                 Tab::Catalog => self.catalog_key(key),
                 Tab::Favorites => self.favorites_key(key),
                 Tab::Orgs => self.org_key(key),
-                Tab::Deploy => self.deploy_key(key),
                 Tab::Output => self.output_key(key),
                 Tab::Setup => self.setup_key(key),
             },
@@ -959,6 +1105,12 @@ impl App {
     }
 
     fn set_tab(&mut self, tab: Tab) {
+        if matches!(tab, Tab::Retrieve | Tab::Deploy) {
+            let retrieve = tab == Tab::Retrieve;
+            if self.transfer_search.retrieve != retrieve {
+                self.transfer_search = TransferSearchState::new(retrieve);
+            }
+        }
         if tab != self.tab {
             self.tab_history.push(self.tab);
             if self.tab_history.len() > 16 {
@@ -986,10 +1138,11 @@ impl App {
     fn tab_action_hint(&self) -> &'static str {
         match self.tab {
             Tab::Home => "r retrieve · d deploy · t tests · g results · c create · a login",
+            Tab::Retrieve => "type component · Space select · Enter confirm · Esc home",
+            Tab::Deploy => "type component · Space select · Enter confirm · Esc home",
             Tab::Catalog => "/ search · Enter help · r run",
             Tab::Favorites => "Enter run · e preset · x remove",
             Tab::Orgs => "Enter details · o open · l login",
-            Tab::Deploy => "Space select · m payload · Enter run",
             Tab::Output => "h home · Backspace back · j/k scroll · z JSON",
             Tab::Setup => "Enter installer · r re-probe",
         }
@@ -998,7 +1151,10 @@ impl App {
     fn refresh_current_tab(&mut self) {
         match self.tab {
             Tab::Orgs => self.refresh_orgs(),
-            Tab::Deploy => self.reload_project(),
+            Tab::Retrieve | Tab::Deploy => {
+                self.transfer_search.mark_edited();
+                self.notice("Component search refreshed");
+            }
             Tab::Catalog => {
                 let argv = vec!["commands".to_owned(), "--json".to_owned()];
                 self.spawn(argv, JobPurpose::CatalogRefresh);
@@ -1010,6 +1166,14 @@ impl App {
     fn copy_context(&mut self) {
         let text = match self.tab {
             Tab::Home => Some(QUICK_ACTIONS[self.home_state.selected].command.to_owned()),
+            Tab::Retrieve | Tab::Deploy => Some(
+                self.transfer_search
+                    .checked()
+                    .iter()
+                    .map(|item| item.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
             Tab::Catalog => self.selected_catalog_id().map(|id| format!("sf {id}")),
             Tab::Favorites => self.selected_favorite_id().map(|id| {
                 format!("sf {id} {}", self.preset_flags(&id).join(" "))
@@ -1017,7 +1181,6 @@ impl App {
                     .to_owned()
             }),
             Tab::Orgs => self.selected_org().map(|org| org.label()),
-            Tab::Deploy => Some(self.deploy_state.options.argv().join(" ")),
             Tab::Output => self
                 .output_state
                 .records
@@ -1058,6 +1221,65 @@ impl App {
         }
     }
 
+    fn transfer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => {
+                self.transfer_search.cursor = self.transfer_search.cursor.saturating_sub(1)
+            }
+            KeyCode::Down => {
+                if !self.transfer_search.results.is_empty() {
+                    self.transfer_search.cursor = (self.transfer_search.cursor + 1)
+                        .min(self.transfer_search.results.len() - 1);
+                }
+            }
+            KeyCode::Char(' ') => self.transfer_search.toggle_result(),
+            KeyCode::Enter => self.open_transfer_confirm(),
+            KeyCode::Backspace => {
+                self.transfer_search.query.pop();
+                self.transfer_search.mark_edited();
+            }
+            KeyCode::Esc => self.go_home(),
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.transfer_search.query.push(character);
+                self.transfer_search.mark_edited();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_transfer_confirm(&mut self) {
+        let checked = self.transfer_search.checked();
+        if checked.is_empty() {
+            self.error("Select at least one component with Space");
+            return;
+        }
+        let retrieve = self.transfer_search.retrieve;
+        let mut options = TransferOptions {
+            retrieve,
+            mode: PayloadMode::Metadata,
+            metadata_names: checked.iter().map(|item| item.value.clone()).collect(),
+            target_org: self.org_target_hint().into(),
+            ..TransferOptions::default()
+        };
+        options.target_org = options.target_org.filter(|org| !org.is_empty());
+        let entries = self
+            .transfer_search
+            .selected
+            .iter()
+            .map(|entry| TransferSelection {
+                item: entry.item.clone(),
+                checked: entry.checked,
+            })
+            .collect();
+        self.modal = Some(Modal::TransferConfirm {
+            retrieve,
+            entries,
+            focus: 0,
+            show_command: false,
+            options,
+        });
+    }
+
     fn run_quick_action(&mut self, index: usize) {
         let Some(action) = QUICK_ACTIONS.get(index) else {
             return;
@@ -1089,29 +1311,9 @@ impl App {
                     ));
                     self.suggestion_cache = Some((root, set));
                 }
-                let suggestions = self
-                    .suggestion_cache
-                    .as_ref()
-                    .map(|(_, set)| Arc::clone(set))
-                    .unwrap_or_else(|| Arc::new(crate::sf::metadata::transfer_suggestions(None)));
-                self.open_prompt(
-                    if retrieve {
-                        "Retrieve metadata"
-                    } else {
-                        "Deploy metadata"
-                    },
-                    if retrieve {
-                        PromptKind::QuickRetrieve
-                    } else {
-                        PromptKind::QuickDeploy
-                    },
-                    vec![
-                        PromptField::new("Component", "")
-                            .with_suggestions(suggestions)
-                            .multi_select(),
-                        PromptField::new("Org", target),
-                    ],
-                );
+                self.transfer_search = TransferSearchState::new(retrieve);
+                self.set_tab(if retrieve { Tab::Retrieve } else { Tab::Deploy });
+                self.notice("Type a component name to search");
             }
             "sf apex run test" => {
                 self.open_prompt(
@@ -1513,209 +1715,43 @@ impl App {
 
     // ----- Deploy / Retrieve --------------------------------------------------------
 
-    fn deploy_key(&mut self, key: KeyEvent) {
+    fn output_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => {
-                self.deploy_state.selected = self.deploy_state.selected.saturating_sub(1)
-            }
-            KeyCode::Down => {
-                if !self.deploy_state.items.is_empty() {
-                    self.deploy_state.selected =
-                        (self.deploy_state.selected + 1).min(self.deploy_state.items.len() - 1);
-                }
-            }
-            KeyCode::Char(' ') => self.toggle_pick(),
-            KeyCode::Char('m') => {
-                self.deploy_state.options.mode = match self.deploy_state.options.mode {
-                    PayloadMode::Source => PayloadMode::Manifest,
-                    PayloadMode::Manifest => PayloadMode::Metadata,
-                    PayloadMode::Metadata => PayloadMode::Source,
-                };
-            }
-            KeyCode::Char('v') => {
-                self.deploy_state.options.check_only = !self.deploy_state.options.check_only
-            }
-            KeyCode::Char('w') => {
-                self.deploy_state.options.ignore_warnings =
-                    !self.deploy_state.options.ignore_warnings
-            }
-            KeyCode::Char('t') => {
-                self.deploy_state.options.test_level = self.deploy_state.options.test_level.cycle()
+            KeyCode::Char('o') => self.output_state.show_details = !self.output_state.show_details,
+            KeyCode::Char('z') => {
+                self.output_state.show_details = true;
+                self.output_state.show_json = !self.output_state.show_json;
             }
             KeyCode::Char('r') => {
-                self.deploy_state.options.retrieve = !self.deploy_state.options.retrieve
-            }
-            KeyCode::Char('R') => {
-                self.reload_project();
-                self.notice("Project reloaded");
-            }
-            KeyCode::Char('o') => {
-                let current = self
-                    .deploy_state
-                    .options
-                    .target_org
-                    .clone()
-                    .unwrap_or_default();
-                self.open_prompt(
-                    "Target org",
-                    PromptKind::TargetOrg,
-                    vec![PromptField::new("Username or alias", current)],
-                );
-            }
-            KeyCode::Char('p') => {
-                if let Some(job_id) = self.deploy_state.job_id.clone() {
-                    let options = self.deploy_state.options.clone();
-                    if let Some(argv) = options.report_argv(&job_id) {
-                        self.spawn(argv, JobPurpose::Report { options });
-                        self.deploy_state.poll_after =
-                            Some(Instant::now() + Duration::from_secs(4));
+                let command = self
+                    .output_state
+                    .records
+                    .get(self.output_state.selected)
+                    .map(|record| record.command.clone());
+                if let Some(command) = command {
+                    let mut parts = split_args(&command).into_iter();
+                    let _exe = parts.next();
+                    let argv: Vec<String> = parts.collect();
+                    if !argv.is_empty() {
+                        self.spawn(
+                            argv.clone(),
+                            JobPurpose::Command {
+                                id: argv.iter().take(3).cloned().collect::<Vec<_>>().join(" "),
+                                command,
+                            },
+                        );
                     }
                 }
             }
-            KeyCode::Enter => {
-                if self.deploy_state.options.test_level == TestLevel::RunSpecifiedTests
-                    && !self.deploy_state.options.retrieve
-                    && self.deploy_state.options.tests.is_empty()
-                {
-                    self.open_prompt(
-                        "Tests to run",
-                        PromptKind::Tests,
-                        vec![PromptField::new("Comma-separated Apex test classes", "")],
-                    );
-                } else {
-                    self.run_transfer();
-                }
-            }
-            KeyCode::Esc => {
-                self.deploy_state.report = None;
-                self.deploy_state.job_id = None;
-                self.deploy_state.poll_after = None;
-            }
             _ => {}
-        }
-    }
-
-    fn toggle_pick(&mut self) {
-        let Some(item) = self
-            .deploy_state
-            .items
-            .get(self.deploy_state.selected)
-            .cloned()
-        else {
-            return;
-        };
-        let options = &mut self.deploy_state.options;
-        match options.mode {
-            PayloadMode::Source => {
-                if item.kind == "manifest" {
-                    self.deploy_state.options.mode = PayloadMode::Manifest;
-                    self.deploy_state.options.manifest = Some(item.path);
-                    return;
-                }
-                if let Some(position) = options.paths.iter().position(|path| *path == item.path) {
-                    options.paths.remove(position);
-                } else {
-                    options.paths.push(item.path);
-                }
-            }
-            PayloadMode::Manifest => {
-                options.manifest = Some(item.path);
-            }
-            PayloadMode::Metadata => {
-                if let Some(position) = options
-                    .metadata_names
-                    .iter()
-                    .position(|name| *name == item.path)
-                {
-                    options.metadata_names.remove(position);
-                } else {
-                    options.metadata_names.push(item.path);
-                }
-            }
         }
     }
 
     fn run_transfer(&mut self) {
         let options = self.deploy_state.options.clone();
-        if options.mode == PayloadMode::Source && options.paths.is_empty() {
-            self.error("Select at least one source path (Space) or switch payload mode (m)");
-            return;
-        }
-        if options.mode == PayloadMode::Manifest && options.manifest.is_none() {
-            self.error("Select a package.xml manifest first");
-            return;
-        }
-        if options.mode == PayloadMode::Metadata && options.metadata_names.is_empty() {
-            self.open_prompt(
-                "Metadata names",
-                PromptKind::MetadataNames,
-                vec![PromptField::new(
-                    "Comma separated, e.g. ApexClass, Flow, CustomObject",
-                    "",
-                )],
-            );
-            return;
-        }
         let argv = options.argv();
-        self.deploy_state.report = None;
         self.spawn(argv, JobPurpose::Transfer { options });
-    }
-
-    pub fn transfer_preview(&self) -> String {
-        format!("sf {}", self.deploy_state.options.argv().join(" "))
-    }
-
-    // ----- Output -------------------------------------------------------------------
-
-    fn output_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => {
-                self.output_state.selected = self.output_state.selected.saturating_sub(1)
-            }
-            KeyCode::Down => {
-                if !self.output_state.records.is_empty() {
-                    self.output_state.selected =
-                        (self.output_state.selected + 1).min(self.output_state.records.len() - 1);
-                }
-            }
-            KeyCode::PageUp => {
-                self.output_state.scroll = self.output_state.scroll.saturating_sub(15)
-            }
-            KeyCode::PageDown => self.output_state.scroll += 15,
-            KeyCode::Char('j') | KeyCode::Char('k') => {
-                let delta = if key.code == KeyCode::Char('j') {
-                    1
-                } else {
-                    -1
-                };
-                if delta < 0 {
-                    self.output_state.scroll = self.output_state.scroll.saturating_sub(1);
-                } else {
-                    self.output_state.scroll += 1;
-                }
-            }
-            KeyCode::Char('z') => self.output_state.show_json = !self.output_state.show_json,
-            KeyCode::Char('Y') => {
-                let text = self
-                    .output_state
-                    .records
-                    .get(self.output_state.selected)
-                    .map(|record| {
-                        record
-                            .lines
-                            .iter()
-                            .map(|line| line.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                match clipboard::copy(&text) {
-                    Ok(()) => self.notice("Copied output to clipboard"),
-                    Err(error) => self.error(error.to_string()),
-                }
-            }
-            _ => {}
-        }
+        self.tab = Tab::Output;
     }
 
     // ----- Dialogs and actions -------------------------------------------------------
@@ -1735,6 +1771,154 @@ impl App {
             Modal::Confirm { action, .. } => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => self.execute(action),
                 _ => self.notice("Cancelled"),
+            },
+            Modal::TransferConfirm {
+                retrieve,
+                mut entries,
+                mut focus,
+                mut show_command,
+                mut options,
+            } => match key.code {
+                KeyCode::Up => {
+                    focus = focus.saturating_sub(1);
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                KeyCode::Down => {
+                    if !entries.is_empty() {
+                        focus = (focus + 1).min(entries.len() - 1);
+                    }
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(entry) = entries.get_mut(focus) {
+                        entry.checked = !entry.checked;
+                    }
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                KeyCode::Enter => {
+                    let names: Vec<String> = entries
+                        .iter()
+                        .filter(|entry| entry.checked)
+                        .map(|entry| entry.item.value.clone())
+                        .collect();
+                    if names.is_empty() {
+                        self.error("Select at least one component");
+                        self.modal = Some(Modal::TransferConfirm {
+                            retrieve,
+                            entries,
+                            focus,
+                            show_command,
+                            options,
+                        });
+                        return;
+                    }
+                    options.metadata_names = names;
+                    let argv = options.argv();
+                    self.spawn(argv, JobPurpose::Transfer { options });
+                    self.tab = Tab::Output;
+                }
+                KeyCode::Esc => {
+                    self.tab = if retrieve { Tab::Retrieve } else { Tab::Deploy };
+                    self.notice("Back to selection");
+                }
+                KeyCode::Char('c') => {
+                    show_command = !show_command;
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                KeyCode::Char('v') if !retrieve => {
+                    options.check_only = !options.check_only;
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                KeyCode::Char('w') if !retrieve => {
+                    options.ignore_warnings = !options.ignore_warnings;
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                KeyCode::Char('t') if !retrieve => {
+                    options.test_level = options.test_level.cycle();
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                KeyCode::Char('g') => {
+                    let mut choices = vec![String::new()];
+                    choices.extend(
+                        self.org_state
+                            .orgs
+                            .iter()
+                            .map(|org| org.label())
+                            .collect::<Vec<_>>(),
+                    );
+                    if let Some(current) = &options.target_org {
+                        choices.push(current.clone());
+                    }
+                    choices.sort();
+                    choices.dedup();
+                    if let Some(index) = choices
+                        .iter()
+                        .position(|org| Some(org) == options.target_org.as_ref())
+                    {
+                        let next = (index + 1) % choices.len();
+                        options.target_org = choices[next].clone().into();
+                    } else {
+                        options.target_org = choices.first().cloned();
+                    }
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
+                _ => {
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
             },
             Modal::Prompt {
                 title,
@@ -2425,7 +2609,7 @@ mod tests {
         assert_eq!(app.tab, Tab::Home);
         app.handle_key(key(KeyCode::BackTab));
         assert_eq!(app.tab, Tab::Output);
-        app.handle_key(key(KeyCode::Char('4')));
+        app.handle_key(key(KeyCode::Char('6')));
         assert_eq!(app.tab, Tab::Orgs);
         app.handle_key(key(KeyCode::Char('1')));
         assert_eq!(app.tab, Tab::Home);
@@ -2478,15 +2662,12 @@ mod tests {
         let mut app = test_app();
         app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('r')));
-        match app.modal.as_ref() {
-            Some(Modal::Prompt { kind, fields, .. }) => {
-                assert!(matches!(kind, PromptKind::QuickRetrieve));
-                assert!(fields[0].suggestion_set.is_some());
-                assert!(fields[0].value.is_empty());
-            }
-            other => panic!("expected retrieve prompt, got {other:?}"),
-        }
-        app.modal = None;
+        assert_eq!(app.tab, Tab::Retrieve);
+        assert!(app.transfer_search.retrieve);
+        app.tab = Tab::Home;
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.tab, Tab::Deploy);
+        app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(
             app.modal.as_ref(),
@@ -2498,19 +2679,37 @@ mod tests {
     }
 
     #[test]
-    fn suggestion_keys_select_and_submit_a_component() {
+    fn suggestion_keys_open_confirmation_and_consume_arrows() {
         let mut app = test_app();
         app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('d')));
-        for character in "Apex".chars() {
-            app.handle_key(key(KeyCode::Char(character)));
-        }
+        app.transfer_search.results = vec![
+            SuggestionItem::new("ApexClass:Demo", "force-app/classes/Demo.cls"),
+            SuggestionItem::new("Flow:Other", "force-app/flows/Other.flow-meta.xml"),
+        ];
+        app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Enter));
         match app.modal.as_ref() {
-            Some(Modal::Confirm { message, .. }) => assert!(message.contains("--metadata")),
-            other => panic!("expected confirmation, got {other:?}"),
+            Some(Modal::TransferConfirm { entries, focus, .. }) => {
+                assert_eq!(*focus, 0);
+                assert_eq!(entries.len(), 1);
+                assert!(entries[0].checked);
+            }
+            other => panic!("expected transfer confirmation, got {other:?}"),
         }
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.tab, Tab::Deploy);
+    }
+
+    #[test]
+    fn digits_are_typed_into_the_component_search() {
+        let mut app = test_app();
+        app.tab = Tab::Retrieve;
+        app.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(app.tab, Tab::Retrieve);
+        assert_eq!(app.transfer_search.query, "3");
     }
 
     #[test]
@@ -2550,15 +2749,19 @@ mod tests {
         let mut app = test_app();
         app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('d')));
+        app.transfer_search.results = vec![
+            SuggestionItem::new("ApexClass:Demo", "force-app/classes/Demo.cls"),
+            SuggestionItem::new("Flow:Other", "force-app/flows/Other.flow-meta.xml"),
+        ];
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Enter));
         match app.modal.as_ref() {
-            Some(Modal::Confirm { message, .. }) => {
-                assert_eq!(message.matches("--metadata").count(), 2);
+            Some(Modal::TransferConfirm { entries, .. }) => {
+                assert_eq!(entries.iter().filter(|entry| entry.checked).count(), 2);
             }
-            other => panic!("expected confirmation, got {other:?}"),
+            other => panic!("expected transfer confirmation, got {other:?}"),
         }
     }
 
