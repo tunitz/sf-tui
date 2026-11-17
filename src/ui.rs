@@ -138,7 +138,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         faint(format!(" v{}", env!("CARGO_PKG_VERSION"))),
         faint(format!("  |  sf {version}")),
         faint(format!("  |  project {project}")),
-        faint(format!("  |  org {}", app.org_target_hint())),
+        faint(format!("  |  org {}", app.org_display())),
         Span::styled(
             format!("  |  {activity}"),
             Style::default().fg(if app.startup_stage.done && !app.busy() {
@@ -191,7 +191,7 @@ fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, density: Densit
         let text = format!(
             "SFTUI {} | {} | {activity}",
             short_tab(app.tab),
-            app.org_target_hint()
+            app.org_display()
         );
         frame.render_widget(
             Paragraph::new(Line::from(strong(
@@ -207,7 +207,7 @@ fn draw_compact_header(frame: &mut Frame, area: Rect, app: &App, density: Densit
         faint(format!(
             " v{} | {} | {activity}",
             env!("CARGO_PKG_VERSION"),
-            app.org_target_hint()
+            app.org_display()
         )),
     ]);
     let mut tabs = vec![faint("Tab:").clone()];
@@ -313,7 +313,7 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
         strong("SF TUI", accent(app)),
         faint(format!(
             "                         Org: {}",
-            app.org_target_hint()
+            app.org_display()
         )),
     ]))
     .chain(
@@ -358,7 +358,7 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
             strong("Run tests", accent(app)),
             faint(format!(
                 "                             Org: {}",
-                app.org_target_hint()
+                app.org_display()
             )),
             faint("       [Esc] back"),
         ]),
@@ -985,7 +985,7 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
             strong(title, accent(app)),
             faint(format!(
                 "                              Org: {}",
-                app.org_target_hint()
+                app.org_display()
             )),
             faint("       [Esc] back"),
         ]),
@@ -1367,25 +1367,37 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
         }
         Modal::TestHistory { runs, selected } => {
             let mut lines = vec![strong_line("SAVED APEX TEST RUNS", accent(app))];
-            for (index, run) in runs.iter().take(12).enumerate() {
+            for (index, run) in runs.iter().take(6).enumerate() {
                 let passed = run.outcome.eq_ignore_ascii_case("Passed")
                     || run.outcome.eq_ignore_ascii_case("Pass");
+                let marker = if index == *selected { ">" } else { " " };
+                let color = if index == *selected {
+                    accent(app)
+                } else {
+                    Color::Gray
+                };
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "{} {} {} · {} run · {} failed · coverage {}",
-                        if index == *selected { ">" } else { " " },
+                        "{} {}  run {}  {}",
+                        marker,
                         if passed { "PASS" } else { "FAIL" },
                         run.at,
-                        run.tests_run,
-                        run.failing,
-                        run.coverage
+                        run.outcome
                     ),
-                    Style::default().fg(if index == *selected {
-                        accent(app)
-                    } else {
-                        Color::Gray
-                    }),
+                    Style::default().fg(color),
                 )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    {} run · {} passed · {} failed · {} skipped · coverage {}",
+                        run.tests_run, run.passing, run.failing, run.skipped, run.coverage
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("    {}", truncated(&run.command, 68)),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(" "));
             }
             lines.push(Line::from(faint("↑↓ move   Enter open   Esc close")));
             let area = centered(

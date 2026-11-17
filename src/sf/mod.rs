@@ -14,7 +14,7 @@ use std::time::Duration;
 use catalog::Catalog;
 use detect::SfInstallation;
 
-use self::runner::{RunnerError, parse_json_document};
+use self::runner::parse_json_document;
 
 /// Result of probing the CLI. The TUI now starts with a pending snapshot and fills this in
 /// through [`StartupEvent`]s, so a slow CLI never blocks the first frame.
@@ -56,7 +56,6 @@ pub enum StartupEvent {
 }
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
-const CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
 const CACHE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Stage the startup work so the UI can render immediately and show real progress.
@@ -131,53 +130,10 @@ pub async fn probe_with(
                 commands,
                 source: catalog::CatalogSource::Cached,
             }));
-            return None;
         }
-        if installation.flavor != detect::SfFlavor::Sf {
-            return None;
-        }
-        send(StartupEvent::Stage("Loading command catalog"));
-        let argv = installation.argv(&["commands".to_owned(), "--json".to_owned()]);
-        match runner::capture_with_env(
-            &installation.executable,
-            &argv,
-            CATALOG_TIMEOUT,
-            runner::sf_env(),
-        )
-        .await
-        {
-            Ok(outcome) => match parse_json_document(&outcome.stdout).and_then(|value| {
-                catalog::parse_commands_json(&value.to_string())
-                    .ok()
-                    .map(|commands| (value, commands))
-            }) {
-                Some((value, commands)) => {
-                    let _ = catalog::write_cache(&cache_path, &value.to_string());
-                    Some(Catalog {
-                        commands,
-                        source: catalog::CatalogSource::Live,
-                    })
-                }
-                None => {
-                    send(StartupEvent::Notice(
-                        "Using bundled catalog: unreadable command response".to_owned(),
-                    ));
-                    None
-                }
-            },
-            Err(RunnerError::TimedOut { .. }) => {
-                send(StartupEvent::Notice(
-                    "Catalog refresh timed out; using bundled snapshot".to_owned(),
-                ));
-                None
-            }
-            Err(error) => {
-                send(StartupEvent::Notice(format!(
-                    "Using bundled catalog: {error}"
-                )));
-                None
-            }
-        }
+        // No automatic network/CLI catalog refresh: the bundled snapshot is always ready and
+        // F5 on the Catalog tab performs an explicit refresh when requested.
+        None::<Catalog>
     };
 
     let org_probe = async {

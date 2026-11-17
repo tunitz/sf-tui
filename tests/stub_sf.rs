@@ -110,7 +110,7 @@ async fn runner_streams_stdout_and_reports_completion() {
 }
 
 #[tokio::test]
-async fn staged_startup_reports_progress_and_caches_the_catalog() {
+async fn staged_startup_reports_progress_without_catalog_probe() {
     assert_synthetic_environment();
     let dir = tempfile::tempdir().expect("temp dir");
     let (tx, mut rx) = mpsc::unbounded_channel::<StartupEvent>();
@@ -140,42 +140,41 @@ async fn staged_startup_reports_progress_and_caches_the_catalog() {
     .await
     .expect("startup probe finished");
     let startup = task.await.expect("probe task");
-    assert!(saw_stage && saw_detected && saw_version && saw_catalog && saw_org);
+    assert!(saw_stage && saw_detected && saw_version && saw_org);
+    assert!(
+        !saw_catalog,
+        "catalog should come from the bundled snapshot by default"
+    );
     assert_eq!(startup.version.as_deref(), Some("99.0.0"));
-    assert!(dir.path().join(sftui::sf::catalog::CACHE_FILE).is_file());
 }
 
 #[tokio::test]
-async fn second_launch_reuses_the_catalog_cache() {
+async fn startup_never_announces_a_catalog_refresh() {
     assert_synthetic_environment();
     let dir = tempfile::tempdir().expect("temp dir");
-    for launch in 1..=2 {
-        let (tx, mut rx) = mpsc::unbounded_channel::<StartupEvent>();
-        let task = tokio::spawn(sftui::sf::probe_with(
-            dir.path().to_path_buf(),
-            tx,
-            Some(stub_installation()),
-        ));
-        let mut saw_loading = false;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(event) = rx.recv().await {
-                if matches!(event, StartupEvent::Stage("Loading command catalog")) {
-                    saw_loading = true;
-                }
-                if matches!(event, StartupEvent::Finished) {
-                    break;
-                }
+    let (tx, mut rx) = mpsc::unbounded_channel::<StartupEvent>();
+    let task = tokio::spawn(sftui::sf::probe_with(
+        dir.path().to_path_buf(),
+        tx,
+        Some(stub_installation()),
+    ));
+    let mut noisy = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StartupEvent::Stage("Loading command catalog"))
+                || matches!(event, StartupEvent::Notice(ref text) if text.contains("catalog"))
+            {
+                noisy = true;
             }
-        })
-        .await
-        .expect("probe finished");
-        let _ = task.await.expect("probe task");
-        if launch == 1 {
-            assert!(saw_loading, "first launch should build the cache");
-        } else {
-            assert!(!saw_loading, "second launch should reuse the cache");
+            if matches!(event, StartupEvent::Finished) {
+                break;
+            }
         }
-    }
+    })
+    .await
+    .expect("probe finished");
+    let _ = task.await.expect("probe task");
+    assert!(!noisy);
 }
 
 #[tokio::test]

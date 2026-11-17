@@ -3,6 +3,20 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.2.1] - 2026-11-17
+
+### Fixed
+
+- Removed the automatic catalog probe on startup; no more "catalog refresh timeout" message.
+  The bundled snapshot is instant, and `F5` performs an explicit refresh that now updates the cache.
+- Blank org now displays as `default org` instead of an empty label.
+- Apex test results open expanded as soon as the run finishes.
+- Corrected Apex coverage parsing to Salesforce's actual `result.codecoverage` and
+  `summary.testRunCoverage` shape.
+- Test history and result details are formatted as multi-line sections, not one compressed row.
+
+[0.2.1]: https://github.com/tunitz/sf-tui/releases/tag/v0.2.1
+
 ## [0.2.0] - 2026-11-17
 
 ### Added

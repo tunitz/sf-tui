@@ -73,7 +73,8 @@ pub fn parse(value: &Value, command: &str) -> TestRun {
     let summary = result.get("summary").unwrap_or(result);
     let tests = result.get("tests").and_then(Value::as_array);
     let coverages = result
-        .get("coverages")
+        .get("codecoverage")
+        .or_else(|| result.get("coverages"))
         .or_else(|| result.get("coverage"))
         .and_then(Value::as_array);
     let failures = tests
@@ -83,15 +84,18 @@ pub fn parse(value: &Value, command: &str) -> TestRun {
             let outcome = string_field(test, "Outcome")
                 .or_else(|| string_field(test, "outcome"))
                 .unwrap_or_default();
-            outcome.eq_ignore_ascii_case("Fail") || outcome.eq_ignore_ascii_case("Failed")
+            outcome.eq_ignore_ascii_case("Fail")
+                || outcome.eq_ignore_ascii_case("Failed")
+                || outcome.eq_ignore_ascii_case("CompileFail")
         })
         .map(|test| TestFailure {
-            name: string_field(test, "FullName")
+            name: string_field(test, "fullName")
+                .or_else(|| string_field(test, "FullName"))
                 .or_else(|| string_field(test, "Name"))
                 .or_else(|| string_field(test, "name"))
                 .unwrap_or_default(),
-            message: string_field(test, "Message")
-                .or_else(|| string_field(test, "message"))
+            message: string_field(test, "message")
+                .or_else(|| string_field(test, "Message"))
                 .unwrap_or_default(),
         })
         .collect();
@@ -99,20 +103,33 @@ pub fn parse(value: &Value, command: &str) -> TestRun {
         .into_iter()
         .flatten()
         .filter_map(|item| {
-            let name = string_field(item, "Name")
-                .or_else(|| string_field(item, "name"))
+            let name = string_field(item, "name")
+                .or_else(|| string_field(item, "Name"))
                 .unwrap_or_default();
             if name.is_empty() {
                 return None;
             }
             Some(Coverage {
                 name,
-                percent: string_field(item, "Coverage")
+                percent: string_field(item, "percentage")
                     .or_else(|| string_field(item, "percent"))
-                    .or_else(|| item.get("Coverage").map(Value::to_string))
+                    .or_else(|| item.get("percentage").map(Value::to_string))
                     .unwrap_or_default(),
-                covered: count(item.get("CoveredLines").or_else(|| item.get("covered"))),
-                total: count(item.get("NumLinesCovered").or_else(|| item.get("total"))),
+                covered: count(
+                    item.get("numLinesCovered")
+                        .or_else(|| item.get("NumLinesCovered")),
+                ),
+                total: {
+                    let covered = count(
+                        item.get("numLinesCovered")
+                            .or_else(|| item.get("NumLinesCovered")),
+                    );
+                    let uncovered = count(
+                        item.get("numLinesUncovered")
+                            .or_else(|| item.get("NumLinesUncovered")),
+                    );
+                    covered + uncovered
+                },
             })
         })
         .collect();
@@ -132,7 +149,9 @@ pub fn parse(value: &Value, command: &str) -> TestRun {
         passing: count(summary.get("passing").or_else(|| summary.get("Passed"))),
         failing: count(summary.get("failing").or_else(|| summary.get("Failed"))),
         skipped: count(summary.get("skipped")),
-        coverage: string_field(summary, "coverage")
+        coverage: string_field(summary, "testRunCoverage")
+            .or_else(|| string_field(summary, "orgWideCoverage"))
+            .or_else(|| string_field(summary, "coverage"))
             .or_else(|| summary.get("coverage").map(Value::to_string))
             .unwrap_or_default(),
         failures,
@@ -164,7 +183,7 @@ mod tests {
               {"FullName": "DemoTest.ok", "Outcome": "Pass"},
               {"FullName": "DemoTest.bad", "Outcome": "Fail", "Message": "assertion failed"}
             ],
-            "coverages": [{"Name": "Demo", "Coverage": 81, "NumLinesCovered": 17}]
+            "codecoverage": [{"name": "Demo", "percentage": "81%", "numLinesCovered": 17, "numLinesUncovered": 4}]
           }
         });
         let run = parse(&value, "sf apex run test");

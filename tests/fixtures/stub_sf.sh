@@ -25,7 +25,7 @@ case "$*" in
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000002","status":"Succeeded"}}'
     ;;
   "apex run test --result-format json --wait 10 --json" | "apex run test --result-format json --wait 10 --class-names DemoTest --target-org test-scratch --json")
-    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"coverage":"81%"},"tests":[{"FullName":"DemoTest.ok","Outcome":"Pass"},{"FullName":"DemoTest.alsoOk","Outcome":"Pass"}],"coverages":[{"Name":"Demo","Coverage":81,"NumLinesCovered":17}]}}'
+    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"81%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"codecoverage":[{"name":"Demo","percentage":"81%","numLinesCovered":17,"numLinesUncovered":4}]}}'
     ;;
   "apex run test --result-format human --wait 10 --class-names DemoTest --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed"}}}'

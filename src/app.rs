@@ -827,6 +827,7 @@ impl App {
             }
             (JobPurpose::CatalogRefresh, Some(value)) => {
                 if let Ok(commands) = catalog::parse_commands_json(&value.to_string()) {
+                    let _ = catalog::write_cache(&self.config_dir, &value.to_string());
                     self.startup.catalog = Catalog {
                         commands,
                         source: CatalogSource::Live,
@@ -876,6 +877,7 @@ impl App {
                 let run = test_results::parse(&value, &command);
                 self.test_runs = test_results::record(&self.config_dir, run.clone());
                 self.latest_test_run = Some(run);
+                self.output_state.show_details = true;
                 self.notice("Apex test results saved");
             }
             _ => {}
@@ -1437,11 +1439,12 @@ impl App {
                 checked: entry.checked,
             })
             .collect();
+        let org = self.org_target_hint();
         self.modal = Some(Modal::TestConfirm {
             entries,
             focus: 0,
             show_command: false,
-            org: self.org_target_hint().into(),
+            org: if org.is_empty() { None } else { Some(org) },
         });
     }
 
@@ -1496,6 +1499,15 @@ impl App {
             .as_ref()
             .map(|project| project.package_directories.join(", "))
             .unwrap_or_else(|| "force-app".to_owned())
+    }
+
+    pub fn org_display(&self) -> String {
+        let org = self.org_target_hint();
+        if org.is_empty() {
+            "default org".to_owned()
+        } else {
+            org
+        }
     }
 
     pub fn org_target_hint(&self) -> String {
