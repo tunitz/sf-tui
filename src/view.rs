@@ -321,6 +321,24 @@ mod tests {
     }
 
     #[test]
+    fn generic_result_renders_human_stdout_without_json() {
+        // Retrieve no longer uses --json, so its result comes from this path.
+        let stdout = "Retrieving: ApexClass:Demo\nRetrieved: ApexClass:Demo\n";
+        let view = generic_result("retrieve", &outcome(stdout, 0), None);
+        assert!(view.ok);
+        assert!(
+            view.items
+                .iter()
+                .any(|item| item.label == "Retrieving: ApexClass:Demo")
+        );
+        assert!(
+            view.items
+                .iter()
+                .any(|item| item.label == "Retrieved: ApexClass:Demo")
+        );
+    }
+
+    #[test]
     fn transfer_result_marks_failed_components() {
         let report = TransferReport {
             status: "Failed".to_owned(),

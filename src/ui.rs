@@ -203,7 +203,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Constraint::Length(footer_height),
     ])
     .split(frame.area());
-    draw_header(frame, layout[0], app);
+    draw_header(frame, layout[0], app, density);
     match app.tab {
         Tab::Home => draw_home(frame, layout[1], app),
         Tab::Retrieve | Tab::Deploy => draw_transfer(frame, layout[1], app),
@@ -243,20 +243,33 @@ fn strip_colors(cells: &mut [ratatui::buffer::Cell]) {
     }
 }
 
-fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let frames = ["-", "\\", "|", "/"];
-    let spinner = frames[app.spinner_tick() % frames.len()];
-    let activity = if !app.startup_stage.done {
-        format!("{spinner} {}", app.startup_stage.label)
-    } else if app.busy() {
-        format!("{spinner} {} job(s)", app.job_count())
+fn draw_header(frame: &mut Frame, area: Rect, app: &App, density: Density) {
+    // Tiny has a single footer row, so keep it for key hints and show the transient status here
+    // instead. Wider densities keep the status on their dedicated footer row.
+    let (right_text, right_style) = if density == Density::Tiny && !app.status.is_empty() {
+        let style = if app.status_error {
+            Style::default().fg(Color::Red)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let max = area.width.saturating_div(2).saturating_sub(2) as usize;
+        (truncated(&app.status, max), style)
     } else {
-        "ready".to_owned()
-    };
-    let activity_style = if app.startup_stage.done && !app.busy() {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default().fg(Color::Yellow)
+        let frames = ["-", "\\", "|", "/"];
+        let spinner = frames[app.spinner_tick() % frames.len()];
+        let activity = if !app.startup_stage.done {
+            format!("{spinner} {}", app.startup_stage.label)
+        } else if app.busy() {
+            format!("{spinner} {} job(s)", app.job_count())
+        } else {
+            "ready".to_owned()
+        };
+        let style = if app.startup_stage.done && !app.busy() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        (activity, style)
     };
 
     let mut left: Vec<Span> = vec![
@@ -275,12 +288,12 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     left.push(faint("   "));
     left.push(faint(org_context(app)));
 
-    let right_width = (activity.chars().count() as u16 + 1).min(area.width / 2);
+    let right_width = (right_text.chars().count() as u16 + 1).min(area.width / 2);
     let columns =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).split(area);
     frame.render_widget(Paragraph::new(Line::from(left)), columns[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(activity, activity_style)))
+        Paragraph::new(Line::from(Span::styled(right_text, right_style)))
             .alignment(ratatui::layout::Alignment::Right),
         columns[1],
     );
@@ -316,15 +329,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
         Style::default().fg(Color::Green)
     };
     if density == Density::Tiny {
-        let line = if app.status.is_empty() {
-            keycap_line(app, usize::from(area.width))
-        } else {
-            Line::from(Span::styled(
-                truncated(&app.status, area.width.saturating_sub(1) as usize),
-                status_style,
-            ))
-        };
-        frame.render_widget(Paragraph::new(line), area);
+        frame.render_widget(
+            Paragraph::new(keycap_line(app, usize::from(area.width))),
+            area,
+        );
         return;
     }
     let status = if app.status.is_empty() {

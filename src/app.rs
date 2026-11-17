@@ -723,6 +723,23 @@ struct PendingJob {
     purpose: JobPurpose,
 }
 
+/// Aborts a nested probe task when its owner is cancelled before the task can be joined.
+struct AbortOnDrop(Option<JoinHandle<Startup>>);
+
+impl AbortOnDrop {
+    fn take(&mut self) -> Option<JoinHandle<Startup>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
 const MAX_PARALLEL_JOBS: usize = 4;
 /// Bounded capacity for the UI event channel. More than enough to absorb a burst of batched
 /// stream events while giving the producer backpressure instead of unbounded memory growth.
@@ -848,13 +865,17 @@ impl App {
         let app_tx = self.event_tx.clone();
         self.probe_task = Some(tokio::spawn(async move {
             let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<sf::StartupEvent>();
-            let probe = tokio::spawn(sf::probe(config_dir, probe_tx));
+            // The inner task owns the `sf version`/`sf config get` children. If this outer task is
+            // aborted at an await, dropping the guard aborts the inner task and kills its children.
+            let mut probe = AbortOnDrop(Some(tokio::spawn(sf::probe(config_dir, probe_tx))));
             while let Some(event) = probe_rx.recv().await {
                 if app_tx.send(AppEvent::Startup(event)).await.is_err() {
                     break;
                 }
             }
-            let _ = probe.await;
+            if let Some(task) = probe.take() {
+                let _ = task.await;
+            }
         }));
     }
 
@@ -891,8 +912,8 @@ impl App {
         self.status_set_at = Some(Instant::now());
     }
 
-    /// Clear an expired status so the footer key hints reappear (notably in Tiny density, where
-    /// the single footer row is replaced by status while one is active).
+    /// Clear an expired status so it stops occupying the header (Tiny) or the status footer row
+    /// (Compact and Roomy).
     fn expire_status(&mut self, now: Instant) {
         if !self.status.is_empty()
             && self
@@ -1102,6 +1123,41 @@ impl App {
         }
     }
 
+    /// Seed deploy report polling from a started deploy's job id and return its initial result
+    /// view. Both JSON and human-readable `deploy start` output funnel through here.
+    fn register_started_deploy(
+        &mut self,
+        options: &TransferOptions,
+        job_id: u64,
+        id: &str,
+    ) -> ResultView {
+        self.deploy_reports.insert(
+            job_id,
+            DeployReport {
+                server_job_id: id.to_owned(),
+                options: options.clone(),
+                poll_after: Instant::now() + Duration::from_secs(3),
+                attempts: 0,
+                failures: 0,
+            },
+        );
+        ResultView {
+            kind: ResultKind::Deploy,
+            title: "Deploy".to_owned(),
+            status: "Queued".to_owned(),
+            ok: true,
+            summary: format!("Job {id} started"),
+            items: vec![ResultItem {
+                ok: true,
+                label: "Deploy request accepted".to_owned(),
+                detail: id.to_owned(),
+                progress: None,
+            }],
+            coverage: Vec::new(),
+            sections: Vec::new(),
+        }
+    }
+
     fn finish_job(&mut self, job_id: u64, outcome: ProcessOutcome) {
         if let Some(record) = self.output_state.find_mut(job_id) {
             record.bump_render_revision();
@@ -1232,38 +1288,27 @@ impl App {
                     if succeeded {
                         self.notice("Retrieve finished — F2 jobs shows the result");
                     }
-                } else if let Some(id) = sf::deploy::parse_started_job_id(&value) {
-                    self.deploy_reports.insert(
-                        job_id,
-                        DeployReport {
-                            server_job_id: id.clone(),
-                            options: options.clone(),
-                            poll_after: Instant::now() + Duration::from_secs(3),
-                            attempts: 0,
-                            failures: 0,
-                        },
-                    );
-                    result_view = Some(ResultView {
-                        kind: ResultKind::Deploy,
-                        title: "Deploy".to_owned(),
-                        status: "Queued".to_owned(),
-                        ok: true,
-                        summary: format!("Job {id} started"),
-                        items: vec![ResultItem {
-                            ok: true,
-                            label: "Deploy request accepted".to_owned(),
-                            detail: id.clone(),
-                            progress: None,
-                        }],
-                        coverage: Vec::new(),
-                        sections: Vec::new(),
-                    });
+                } else if let Some(id) = sf::deploy::parse_started_job_id(&value).or_else(|| {
+                    if succeeded {
+                        sf::deploy::parse_started_job_id_from_text(&outcome.stdout)
+                    } else {
+                        None
+                    }
+                }) {
+                    result_view = Some(self.register_started_deploy(&options, job_id, &id));
                     if succeeded {
                         self.notice(format!("Deploy {id} started — F2 jobs shows progress"));
                     }
                 }
             }
-            (JobPurpose::Transfer { .. }, None) => {}
+            (JobPurpose::Transfer { options }, None) => {
+                if succeeded
+                    && let Some(id) = sf::deploy::parse_started_job_id_from_text(&outcome.stdout)
+                {
+                    result_view = Some(self.register_started_deploy(&options, job_id, &id));
+                    self.notice(format!("Deploy {id} started — F2 jobs shows progress"));
+                }
+            }
             (
                 JobPurpose::Report {
                     options,
@@ -1776,7 +1821,7 @@ impl App {
         cancelled
     }
 
-    /// Cancel every tracked job. Used during shutdown and by the quit confirmation.
+    /// Cancel every tracked job and helper task. Used during shutdown and by the quit confirmation.
     pub async fn shutdown(&mut self) {
         // Closing the receiver makes any in-flight bounded-channel sends fail immediately with a
         // SendError instead of blocking forever while we await the jobs that are sending them.
@@ -1784,6 +1829,17 @@ impl App {
         // deadlock shutdown because the loop no longer drains `event_rx`.
         self.event_rx.close();
         self.pending_jobs.clear();
+        // A dropped JoinHandle detaches its task, leaving any in-flight `sf version`/`sf config
+        // get` probe running after exit. Abort then await so the runner's kill_on_drop children
+        // are torn down before we return.
+        if let Some(task) = self.probe_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.search_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
         let jobs = std::mem::take(&mut self.jobs);
         for (_, entry) in jobs {
             let _ = entry.job.cancel_and_join().await;
@@ -3348,7 +3404,7 @@ impl App {
                     argv.push("--target-org".to_owned());
                     argv.push(org.clone());
                 }
-                argv.push("--json".to_owned());
+                argv.push("--ignore-conflicts".to_owned());
                 let command = format!("sf {}", argv.join(" "));
                 self.modal = Some(Modal::Confirm {
                     title: if retrieve {
@@ -3997,6 +4053,48 @@ mod tests {
         });
         let result = tokio::time::timeout(Duration::from_secs(1), late).await;
         assert!(matches!(result, Ok(Err(_))));
+    }
+
+    struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_helper_tasks() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut app = App::new(
+            Startup {
+                installation: None,
+                version: None,
+                current_org: None,
+                notices: Vec::new(),
+            },
+            Config::default(),
+            std::path::PathBuf::from("/tmp/sftui-shutdown-abort-test"),
+        );
+        let ended = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(Arc::clone(&ended));
+        let waiting = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let previous = app.probe_task.replace(waiting);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+        app.shutdown().await;
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "shutdown must abort the stored probe task"
+        );
+        assert!(app.probe_task.is_none());
+        assert!(app.search_task.is_none());
     }
 
     #[test]
@@ -4814,9 +4912,9 @@ mod tests {
         match app.modal.as_ref() {
             Some(Modal::Confirm { title, message, .. }) => {
                 assert_eq!(title, "Confirm retrieve");
-                assert!(
-                    message.contains("sf project retrieve start --metadata ApexClass:Demo --json")
-                );
+                assert!(message.contains(
+                    "sf project retrieve start --metadata ApexClass:Demo --ignore-conflicts",
+                ));
             }
             other => panic!("expected confirmation, got {other:?}"),
         }
@@ -4891,10 +4989,30 @@ mod tests {
         );
         match app.modal.as_ref() {
             Some(Modal::Confirm { message, .. }) => {
-                assert!(message.contains("--metadata ApexClass:Demo"));
+                assert!(message.contains("sf project deploy start --metadata ApexClass:Demo"));
+                assert!(message.contains("--ignore-conflicts"));
+                assert!(!message.contains("--json"));
             }
             other => panic!("expected confirmation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn human_deploy_output_registers_a_report_poll() {
+        let options = TransferOptions {
+            metadata_names: vec!["ApexClass:Demo".to_owned()],
+            ..TransferOptions::default()
+        };
+        let stdout = "Deploy ID: 0Af0Y000003Dabc\nStatus: Queued\n";
+        let id = sf::deploy::parse_started_job_id_from_text(stdout).expect("job id");
+        let mut app = test_app();
+        let view = app.register_started_deploy(&options, 42, &id);
+        let report = app.deploy_reports.get(&42).expect("deploy report");
+        assert_eq!(report.server_job_id, id);
+        assert_eq!(report.options, options);
+        assert_eq!(report.attempts, 0);
+        assert_eq!(view.status, "Queued");
+        assert!(view.summary.contains(&id));
     }
 
     #[test]

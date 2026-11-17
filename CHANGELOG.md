@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.20] - 2026-11-17
+
+### Changed
+
+- Retrieve now runs `sf project retrieve start --ignore-conflicts` without `--json`, matching a direct CLI call and avoiding the extra time the structured-output mode takes. Results render from the CLI's human-readable output.
+- Deploy now runs `sf project deploy start --ignore-conflicts` without `--json`; the deploy id is parsed from human output, and the follow-up `sf project deploy report` still uses `--json` for structured status.
+- In a short terminal, the single footer row always shows key hints; transient status moves to the header.
+- Background `sf` probes are aborted and joined on exit, so no CLI process is left running when sftui quits, errors out or is shut down.
+
+### Fixed
+
+- Removed the stale comment claiming retrieve runs with `--wait`.
+
 ## [0.1.19] - 2026-11-17
 
 ### Added

@@ -137,12 +137,15 @@ impl TransferOptions {
             argv.push("--target-org".to_owned());
             argv.push(org.clone());
         }
-        argv.push("--json".to_owned());
+        // Both start commands run without --json: retrieve renders its human stdout, and deploy's
+        // job id is parsed from that same stdout. Only the follow-up report command uses --json.
+        argv.push("--ignore-conflicts".to_owned());
         argv
     }
 
-    /// The current CLI has `project deploy report` but no `project retrieve report`.
-    /// Retrieve commands are run with `--wait` and produce their final result directly.
+    /// The current CLI has `project deploy report` but no `project retrieve report`. Retrieve runs
+    /// synchronously; deploy polls this report for structured status, which is why this one query
+    /// keeps `--json` even though neither `start` command does.
     pub fn report_argv(&self, job_id: &str) -> Option<Vec<String>> {
         if self.retrieve {
             return None;
@@ -200,12 +203,27 @@ impl TransferReport {
     }
 }
 
-/// Pull the async job id out of a `deploy start` / `retrieve start` response.
+/// Pull the async job id out of a `deploy start` / `retrieve start` JSON response.
 pub fn parse_started_job_id(value: &Value) -> Option<String> {
     let result = value.get("result").unwrap_or(value);
     string_field(result, "id")
         .or_else(|| string_field(result, "jobId"))
         .or_else(|| result.get("id").and_then(Value::as_str).map(str::to_owned))
+}
+
+/// Fallback for `deploy start` without `--json`: scan human output for a Salesforce job id.
+/// Job ids start with `0Af` and are 15 or 18 alphanumeric characters. Output is untrusted, so only
+/// whole alphanumeric tokens are considered and no byte offsets into the text are assumed.
+pub fn parse_started_job_id_from_text(stdout: &str) -> Option<String> {
+    stdout
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .find(|token| {
+            let bytes = token.as_bytes();
+            (bytes.len() == 15 || bytes.len() == 18)
+                && token.starts_with("0Af")
+                && bytes.iter().all(u8::is_ascii_alphanumeric)
+        })
+        .map(str::to_owned)
 }
 
 /// Parse a report from several SF and legacy response shapes.
@@ -303,9 +321,10 @@ mod tests {
                 "DemoTest",
                 "--target-org",
                 "test-scratch",
-                "--json"
+                "--ignore-conflicts"
             ]
         );
+        assert!(!options.argv().contains(&"--json".to_owned()));
     }
 
     #[test]
@@ -324,9 +343,10 @@ mod tests {
                 "start",
                 "--metadata",
                 "ApexClass",
-                "--json"
+                "--ignore-conflicts"
             ]
         );
+        assert!(!options.argv().contains(&"--json".to_owned()));
         assert!(options.report_argv("0Af000000000001").is_none());
     }
 
@@ -382,5 +402,19 @@ mod tests {
             parse_started_job_id(&value).as_deref(),
             Some("0Af000000000003")
         );
+    }
+
+    #[test]
+    fn started_job_id_is_extracted_from_human_output() {
+        let fifteen = format!("0Af{}", "A".repeat(12));
+        let eighteen = format!("0Af{}", "B".repeat(15));
+        let human = format!("Deploy ID: {fifteen}\nStatus: Queued — Deploy ID: {eighteen}\n");
+        assert_eq!(
+            parse_started_job_id_from_text(&human).as_deref(),
+            Some(fifteen.as_str())
+        );
+        assert_eq!(parse_started_job_id_from_text("nothing to see here"), None);
+        assert_eq!(parse_started_job_id_from_text("0Afshort"), None);
+        assert_eq!(parse_started_job_id_from_text("0AfAAAAAAAAAAAAAAAA"), None);
     }
 }

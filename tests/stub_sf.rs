@@ -323,6 +323,49 @@ fn every_screen_renders_without_panicking() {
 }
 
 #[test]
+fn tiny_footer_keeps_key_hints_and_moves_status_to_the_header() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup {
+            installation: None,
+            version: Some("99.0.0".to_owned()),
+            current_org: None,
+            notices: Vec::new(),
+        },
+        Config::default(),
+        std::path::PathBuf::from("/tmp/sftui-test"),
+    );
+    app.tab = sftui::app::Tab::Home;
+    app.error("tiny status");
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+
+    let buffer = terminal.backend().buffer();
+    let row = |y: u16| -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    };
+    let header = row(0);
+    let footer = row(buffer.area.height - 1);
+    assert!(
+        header.contains("tiny status"),
+        "status missing from tiny header: {header}"
+    );
+    assert!(
+        footer.contains("[F2]") || footer.contains("[?]") || footer.contains("[q]"),
+        "key hints missing from tiny footer: {footer}"
+    );
+    assert!(
+        !footer.contains("tiny status"),
+        "status must not replace the tiny footer: {footer}"
+    );
+}
+
+#[test]
 fn prompt_overlay_renders_with_a_cursor() {
     assert_synthetic_environment();
     let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
