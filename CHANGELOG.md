@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.22] - 2026-11-17
+
+### Added
+
+- **Persistent state**, stored per project under the config directory and written atomically with owner-only permissions. The org list and org details load at startup; F5 refreshes them. A cached default org is used immediately instead of querying `sf config get target-org`.
+- A global cached Salesforce CLI version. With both caches warm, sftui makes **no `sf` calls at startup**; F5 or Setup `r` forces a fresh probe.
+- Apex **test run history**: full results from sftui runs are saved (newest 50). On the Tests screen, `F6` opens a popup with a run list and the full result; `d` deletes a run and `c` twice clears all. The hint is shown only in the Tests footer.
+- F4's org switcher now has a `d` action to fetch and cache an org's details, with a small detail pane.
+
+### Changed
+
+- Header status no longer claims sf is being probed when both caches are warm.
+
 ## [0.1.21] - 2026-11-17
 
 ### Added

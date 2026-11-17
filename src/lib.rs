@@ -9,6 +9,7 @@ pub mod config;
 pub mod fsutil;
 pub mod json_view;
 pub mod sf;
+pub mod state_store;
 pub mod ui;
 pub mod update;
 pub mod view;
@@ -63,6 +64,7 @@ mod layering_tests {
             include_str!("sf/project.rs"),
             include_str!("sf/runner.rs"),
             include_str!("sf/test_results.rs"),
+            include_str!("state_store.rs"),
         ];
         for source in sources {
             assert!(

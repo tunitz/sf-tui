@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use crate::sf::project::{self, SfProject};
 use crate::sf::runner::{JobLine, ProcessOutcome, RunningJob, SfEvent};
 use crate::sf::test_results;
 use crate::sf::{self, Startup};
+use crate::state_store::{self, OrgCache, SavedTestRun, SfVersionCache, TestHistory};
 use crate::ui::RenderCache;
 use crate::view::{apex_result, generic_result, transfer_result};
 
@@ -186,6 +187,8 @@ pub struct OrgState {
     pub selected: usize,
     pub detail: Option<OrgDetail>,
     pub detail_for: Option<String>,
+    /// Cached `org display` details keyed by username, restored from the project state store.
+    pub detail_cache: HashMap<String, OrgDetail>,
     pub loading: bool,
 }
 
@@ -212,6 +215,7 @@ struct DeployReport {
 struct TestReport {
     run_id: String,
     org: Option<String>,
+    command: String,
     poll_after: Instant,
     attempts: u32,
     failures: u32,
@@ -489,6 +493,13 @@ pub enum JobsFocus {
     Detail,
 }
 
+/// Which pane of the F6 Apex test history modal receives navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestHistoryFocus {
+    List,
+    Detail,
+}
+
 const MAX_RECORDS: usize = 40;
 const MAX_LINES_PER_RECORD: usize = 3_000;
 const MAX_RECORD_BYTES: usize = 2 * 1024 * 1024;
@@ -683,6 +694,14 @@ pub enum Modal {
         scroll: usize,
         follow: bool,
     },
+    /// F6 on the Tests screen: two-pane list of saved Apex runs and their full results.
+    TestHistory {
+        selected: usize,
+        list_scroll: usize,
+        detail_scroll: usize,
+        focus: TestHistoryFocus,
+        confirm_clear: bool,
+    },
     TestConfirm {
         entries: Vec<TransferSelection>,
         focus: usize,
@@ -749,6 +768,12 @@ pub struct App {
     pub tab: Tab,
     pub startup_stage: StartupStage,
     pub config_dir: PathBuf,
+    /// Canonical project root and derived state directory, once a Salesforce project is known.
+    pub state_root: Option<PathBuf>,
+    pub state_dir: Option<PathBuf>,
+    /// Best-effort caches restored at startup and re-saved when their source data changes.
+    pub org_cache: OrgCache,
+    pub test_history: TestHistory,
     pub home_state: HomeState,
     pub should_quit: bool,
     pub status: String,
@@ -784,6 +809,9 @@ pub struct App {
     pub(crate) jobs_detail_height: Cell<u16>,
     /// Coverage rows visible at the last Tests draw, used to clamp table scrolling.
     pub(crate) tests_coverage_rows: Cell<usize>,
+    /// List rows and detail line count recorded for the F6 history modal at the last draw.
+    pub(crate) test_history_list_rows: Cell<usize>,
+    pub(crate) test_history_detail_lines: Cell<usize>,
     /// Memoized result/detail line vectors, keyed by record revision, width and render flags.
     pub(crate) render_cache: RefCell<RenderCache>,
 }
@@ -804,6 +832,39 @@ fn emit_event(tx: Sender<AppEvent>, event: AppEvent) {
 impl App {
     pub fn new(startup: Startup, config: Config, config_dir: PathBuf) -> Self {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        // Finding the project root is a short upward walk for sfdx-project.json, so the small
+        // per-project state files can be read before the probe starts. A cached default org then
+        // lets the probe skip `sf config get target-org` entirely.
+        let state_root =
+            project::find_project(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let (state_dir, org_cache, test_history) = match state_root.as_deref() {
+            Some(root) => (
+                Some(state_store::state_dir(root, &config_dir)),
+                OrgCache::load(root, &config_dir),
+                TestHistory::load(root, &config_dir),
+            ),
+            None => (None, OrgCache::default(), TestHistory::default()),
+        };
+        let cached_default = org_cache
+            .orgs
+            .iter()
+            .find(|org| org.is_default)
+            .map(|org| org.label());
+        // The CLI version is machine-wide, so one small file in the config dir covers every
+        // project. With both caches warm, startup makes no sf calls at all.
+        let version_cache = SfVersionCache::load(&config_dir);
+        let cached_version = version_cache
+            .is_present()
+            .then(|| version_cache.version.clone());
+        let mut startup = startup;
+        if let Some(org) = cached_default.clone() {
+            startup.current_org = Some(org);
+        }
+        if let Some(version) = cached_version.clone() {
+            startup.version = Some(version);
+        }
+        let initial_orgs = org_cache.orgs.clone();
+        let initial_details = org_cache.details.clone();
         let mut app = Self {
             startup,
             config,
@@ -814,12 +875,20 @@ impl App {
                 done: false,
             },
             config_dir,
+            state_root,
+            state_dir,
+            org_cache,
+            test_history,
             home_state: HomeState::default(),
             should_quit: false,
             status: String::new(),
             status_error: false,
             status_set_at: None,
-            org_state: OrgState::default(),
+            org_state: OrgState {
+                orgs: initial_orgs,
+                detail_cache: initial_details,
+                ..OrgState::default()
+            },
             deploy_state: DeployState::default(),
             transfer_search: TransferSearchState::new(false),
             test_search: TransferSearchState::new(false),
@@ -846,22 +915,36 @@ impl App {
             next_job_id: 1,
             jobs_detail_height: Cell::new(10),
             tests_coverage_rows: Cell::new(6),
+            test_history_list_rows: Cell::new(6),
+            test_history_detail_lines: Cell::new(10),
             render_cache: RefCell::new(RenderCache::default()),
         };
         app.start_project_scan();
-        app.notice("Starting sftui — the interface is ready while sf is probed");
-        app.start_probe();
+        // With both caches warm the probe makes no sf calls, so don't claim it is probing.
+        if cached_default.is_some() && cached_version.is_some() {
+            app.notice("Ready — F5 refreshes the CLI and orgs");
+        } else {
+            app.notice("Starting sftui — the interface is ready while sf is probed");
+        }
+        app.start_probe(cached_default, cached_version);
         app
     }
 
-    fn start_probe(&mut self) {
+    fn start_probe(&mut self, cached_org: Option<String>, cached_version: Option<String>) {
         let config_dir = self.config_dir.clone();
         let app_tx = self.event_tx.clone();
         self.probe_task = Some(tokio::spawn(async move {
             let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<sf::StartupEvent>();
             // The inner task owns the `sf version`/`sf config get` children. If this outer task is
             // aborted at an await, dropping the guard aborts the inner task and kills its children.
-            let mut probe = AbortOnDrop(Some(tokio::spawn(sf::probe(config_dir, probe_tx))));
+            // Warm org/version caches replace both probes, so no sf call is made for either.
+            let mut probe = AbortOnDrop(Some(tokio::spawn(sf::probe_cached(
+                config_dir,
+                probe_tx,
+                None,
+                cached_org,
+                cached_version,
+            ))));
             while let Some(event) = probe_rx.recv().await {
                 if app_tx.send(AppEvent::Startup(event)).await.is_err() {
                     break;
@@ -871,6 +954,71 @@ impl App {
                 let _ = task.await;
             }
         }));
+    }
+
+    /// Bind a project discovered by the async scan when synchronous discovery found none.
+    /// `App::new` normally does this work before the probe; this is the fallback path.
+    fn initialize_project_state(&mut self, root: &Path) {
+        if self.state_root.is_some() {
+            return;
+        }
+        self.state_root = Some(root.to_path_buf());
+        self.state_dir = Some(state_store::state_dir(root, &self.config_dir));
+        let cache = OrgCache::load(root, &self.config_dir);
+        if self.org_state.orgs.is_empty() {
+            self.org_state.orgs = cache.orgs.clone();
+        }
+        for (username, detail) in cache.details.clone() {
+            self.org_state
+                .detail_cache
+                .entry(username)
+                .or_insert(detail);
+        }
+        if self.startup.current_org.is_none() {
+            self.startup.current_org = cache
+                .orgs
+                .iter()
+                .find(|org| org.is_default)
+                .map(|org| org.label());
+        }
+        self.org_cache = cache;
+        self.test_history = TestHistory::load(root, &self.config_dir);
+    }
+
+    /// Persist the current org list and cached details. Skipped silently outside a project.
+    fn save_org_cache(&mut self) {
+        let Some(root) = self.state_root.clone() else {
+            return;
+        };
+        let cache = OrgCache {
+            orgs: self.org_state.orgs.clone(),
+            details: self.org_state.detail_cache.clone(),
+            saved_at: state_store::now_ms(),
+        };
+        self.org_cache = cache.clone();
+        let _ = cache.save(&root, &self.config_dir);
+    }
+
+    /// Persist a finished Apex run into the current project's capped history.
+    fn remember_apex_run(&mut self, run: &test_results::TestRun, org: Option<String>, job_id: u64) {
+        let Some(root) = self.state_root.clone() else {
+            return;
+        };
+        let finished_at = state_store::now_ms();
+        let id = format!("{job_id}:{finished_at}");
+        let command = if run.command.is_empty() {
+            format!("sf apex run test — run {}", run.id)
+        } else {
+            run.command.clone()
+        };
+        self.test_history.push(SavedTestRun {
+            id,
+            finished_at,
+            org,
+            command,
+            run: run.clone(),
+        });
+        let _ = self.test_history.save(&root, &self.config_dir);
     }
 
     /// Screens rendered by headless smoke tests; navigation itself is menu-only.
@@ -982,7 +1130,14 @@ impl App {
                 self.startup.installation = Some(installation);
             }
             AppEvent::Startup(sf::StartupEvent::Version(version)) => {
-                self.startup.version = Some(version);
+                self.startup.version = Some(version.clone());
+                // Every freshly probed version (startup or F5 / Setup re-probe) updates the global
+                // cache. Staleness is informational only, so no status text is emitted here.
+                let cache = SfVersionCache {
+                    version,
+                    saved_at: state_store::now_ms(),
+                };
+                let _ = cache.save(&self.config_dir);
             }
             AppEvent::Startup(sf::StartupEvent::CurrentOrg(org)) => {
                 self.startup.current_org = Some(org);
@@ -1011,7 +1166,13 @@ impl App {
                 } else {
                     error
                 };
-                if self.deploy_state.project.is_some() {
+                let discovered_root = self
+                    .deploy_state
+                    .project
+                    .as_ref()
+                    .map(|project| project.root.clone());
+                if let Some(root) = discovered_root {
+                    self.initialize_project_state(&root);
                     self.ensure_suggestion_sets();
                 }
             }
@@ -1251,6 +1412,8 @@ impl App {
                     .min(self.org_state.orgs.len().saturating_sub(1));
                 result_view = Some(generic_result(&purpose_title, &outcome, parsed.as_ref()));
                 if succeeded {
+                    // A failed list must not overwrite a good cache with an empty one.
+                    self.save_org_cache();
                     self.notice(format!(
                         "Loaded {} orgs — F2 jobs shows the result",
                         self.org_state.orgs.len()
@@ -1264,8 +1427,10 @@ impl App {
             (JobPurpose::OrgDetail { username }, Some(value)) => {
                 let detail = sf::org::parse_org_display(&value);
                 result_view = Some(org_display_result(&username, &detail, succeeded));
-                self.org_state.detail = Some(detail);
-                self.org_state.detail_for = Some(username);
+                self.org_state.detail = Some(detail.clone());
+                self.org_state.detail_for = Some(username.clone());
+                self.org_state.detail_cache.insert(username, detail);
+                self.save_org_cache();
                 if succeeded {
                     self.notice("Org details loaded — F2 jobs shows the result");
                 }
@@ -1348,6 +1513,7 @@ impl App {
                         self.output_state.show_details = false;
                         self.tests_focus = TestsFocus::Search;
                         self.coverage_scroll = 0;
+                        self.remember_apex_run(&run, org.clone(), job_id);
                         if succeeded {
                             self.notice("Apex test results ready — F2 jobs shows the details");
                         }
@@ -1364,6 +1530,7 @@ impl App {
                             TestReport {
                                 run_id: run_id.clone(),
                                 org,
+                                command: command.clone(),
                                 poll_after: Instant::now() + Duration::from_secs(3),
                                 attempts: 0,
                                 failures: 0,
@@ -1411,14 +1578,16 @@ impl App {
             return;
         };
         let run_id = report.run_id.clone();
+        let org = report.org.clone();
+        let command = report.command.clone();
+        let coverage_polls = report.coverage_polls;
         if !succeeded {
             self.fail_test_report(record_id);
             return;
         }
-        let run = test_results::parse(value, "");
+        let run = test_results::parse(value, &command);
         let terminal = test_results::is_terminal_outcome(&run.outcome);
         let coverage_pending = run.coverages.is_empty() && !run.coverage.is_empty();
-        let coverage_polls = report.coverage_polls;
         if terminal && (!coverage_pending || coverage_polls >= 3) {
             let view = apex_result(&run);
             if let Some(record) = self.output_state.find_mut(record_id) {
@@ -1428,6 +1597,7 @@ impl App {
             self.test_reports.remove(&record_id);
             self.coverage_scroll = 0;
             self.tests_focus = TestsFocus::Search;
+            self.remember_apex_run(&run, org, record_id);
             self.notice("Apex tests finished — F2 jobs");
             return;
         }
@@ -1927,6 +2097,19 @@ impl App {
             self.open_switch_org();
             return;
         }
+        if key.code == KeyCode::F(6) {
+            // Apex test history is a Tests-only popup; F6 is inert on every other screen.
+            if self.tab == Tab::Tests {
+                self.modal = Some(Modal::TestHistory {
+                    selected: 0,
+                    list_scroll: 0,
+                    detail_scroll: 0,
+                    focus: TestHistoryFocus::List,
+                    confirm_clear: false,
+                });
+            }
+            return;
+        }
         if matches!(self.tab, Tab::Retrieve | Tab::Deploy) {
             self.transfer_key(key);
             return;
@@ -2003,7 +2186,19 @@ impl App {
         self.notice(format!("Back to {}", self.tab.label()));
     }
 
+    /// Force a fresh `sf version` probe through the existing background probe task. The resulting
+    /// `Version` event re-saves the global cache without blocking the UI thread.
+    fn refresh_version(&mut self) {
+        if self.probe_task.is_some() {
+            self.notice("A probe is already running");
+            return;
+        }
+        self.start_probe(None, None);
+    }
+
     fn refresh_current_tab(&mut self) {
+        // F5 is the global refresh: re-probe the CLI version in addition to the tab's own data.
+        self.refresh_version();
         match self.tab {
             Tab::Orgs => self.refresh_orgs(),
             Tab::Retrieve | Tab::Deploy => {
@@ -2687,6 +2882,130 @@ impl App {
         });
     }
 
+    /// Keys for the Tests-only F6 history popup. The list keeps ↑↓ selection while the detail
+    /// pane scrolls with j/k/PgUp/PgDn/Home/End once focused.
+    fn handle_test_history_key(
+        &mut self,
+        selected: usize,
+        list_scroll: usize,
+        mut detail_scroll: usize,
+        focus: TestHistoryFocus,
+        mut confirm_clear: bool,
+        key: KeyEvent,
+    ) {
+        let count = self.test_history.runs.len();
+        let mut selected = selected.min(count.saturating_sub(1));
+        let mut list_scroll = list_scroll;
+        let mut focus = focus;
+        let mut close = false;
+        match key.code {
+            KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+                detail_scroll = 0;
+            }
+            KeyCode::Down => {
+                if count > 0 {
+                    selected = (selected + 1).min(count - 1);
+                }
+                detail_scroll = 0;
+            }
+            KeyCode::PageUp if focus == TestHistoryFocus::Detail => {
+                detail_scroll = detail_scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown if focus == TestHistoryFocus::Detail => detail_scroll += 10,
+            KeyCode::Home if focus == TestHistoryFocus::Detail => detail_scroll = 0,
+            KeyCode::End if focus == TestHistoryFocus::Detail => {
+                detail_scroll = self.test_history_detail_lines.get().saturating_sub(1);
+            }
+            KeyCode::PageUp => {
+                selected = selected.saturating_sub(10);
+                detail_scroll = 0;
+            }
+            KeyCode::PageDown => {
+                if count > 0 {
+                    selected = (selected + 10).min(count - 1);
+                }
+                detail_scroll = 0;
+            }
+            KeyCode::Home => {
+                selected = 0;
+                detail_scroll = 0;
+            }
+            KeyCode::End => {
+                selected = count.saturating_sub(1);
+                detail_scroll = 0;
+            }
+            KeyCode::Enter | KeyCode::Tab => {
+                focus = match focus {
+                    TestHistoryFocus::List => TestHistoryFocus::Detail,
+                    TestHistoryFocus::Detail => TestHistoryFocus::List,
+                };
+            }
+            KeyCode::Esc => {
+                if focus == TestHistoryFocus::Detail {
+                    focus = TestHistoryFocus::List;
+                } else {
+                    close = true;
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if let Some(run) = self.test_history.runs.get(selected).cloned() {
+                    let root = self.state_root.clone();
+                    if self.test_history.remove(&run.id) {
+                        if let Some(root) = root {
+                            let _ = self.test_history.save(&root, &self.config_dir);
+                        }
+                        self.notice(format!("Removed saved run {}", run.id));
+                    }
+                    selected = selected.min(self.test_history.runs.len().saturating_sub(1));
+                    detail_scroll = 0;
+                }
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if confirm_clear {
+                    let root = self.state_root.clone();
+                    self.test_history.clear();
+                    if let Some(root) = root {
+                        let _ = self.test_history.save(&root, &self.config_dir);
+                    }
+                    confirm_clear = false;
+                    selected = 0;
+                    list_scroll = 0;
+                    detail_scroll = 0;
+                    self.notice("Apex test history cleared");
+                } else {
+                    confirm_clear = true;
+                    self.notice("Press c again to clear all saved runs");
+                }
+            }
+            KeyCode::Char('j') if focus == TestHistoryFocus::Detail => detail_scroll += 1,
+            KeyCode::Char('k') if focus == TestHistoryFocus::Detail => {
+                detail_scroll = detail_scroll.saturating_sub(1);
+            }
+            _ => {}
+        }
+        if !matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            confirm_clear = false;
+        }
+        if close {
+            self.modal = None;
+            return;
+        }
+        let visible = self.test_history_list_rows.get().max(1);
+        if selected < list_scroll {
+            list_scroll = selected;
+        } else if selected >= list_scroll + visible {
+            list_scroll = selected + 1 - visible;
+        }
+        self.modal = Some(Modal::TestHistory {
+            selected,
+            list_scroll,
+            detail_scroll,
+            focus,
+            confirm_clear,
+        });
+    }
+
     fn handle_modal_key(&mut self, modal: Modal, key: KeyEvent) {
         match modal {
             Modal::Help { mut scroll } => match key.code {
@@ -2804,6 +3123,20 @@ impl App {
                 scroll,
                 follow,
             } => self.handle_jobs_key(selected, focus, scroll, follow, key),
+            Modal::TestHistory {
+                selected,
+                list_scroll,
+                detail_scroll,
+                focus,
+                confirm_clear,
+            } => self.handle_test_history_key(
+                selected,
+                list_scroll,
+                detail_scroll,
+                focus,
+                confirm_clear,
+                key,
+            ),
             Modal::SwitchOrg { mut selected } => {
                 let count = self.org_state.orgs.len();
                 match key.code {
@@ -2846,13 +3179,19 @@ impl App {
                         };
                         let username = org.username.clone();
                         let label = org.label();
-                        if org.is_default {
+                        let already_default = org.is_default;
+                        if already_default {
                             self.notice(format!("{label} is already the default org"));
                             self.modal = None;
                             return;
                         }
-                        // Optimistic header update; the org refresh confirms it.
+                        // Optimistic header and cache update; the org refresh confirms it and makes
+                        // the next launch instant.
                         self.startup.current_org = Some(label.clone());
+                        for entry in &mut self.org_state.orgs {
+                            entry.is_default = entry.username == username;
+                        }
+                        self.save_org_cache();
                         self.spawn(
                             crate::sf::commands::config_set("target-org", &username),
                             JobPurpose::OrgAction {
@@ -2860,6 +3199,20 @@ impl App {
                             },
                         );
                         self.modal = None;
+                    }
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        let Some(org) = self.org_state.orgs.get(selected) else {
+                            self.modal = Some(Modal::SwitchOrg { selected });
+                            return;
+                        };
+                        let username = org.username.clone();
+                        if !self.org_state.detail_cache.contains_key(&username) {
+                            self.org_state.detail = None;
+                            self.org_state.detail_for = None;
+                            let argv = crate::sf::commands::org_display(Some(&username));
+                            self.spawn(argv, JobPurpose::OrgDetail { username });
+                        }
+                        self.modal = Some(Modal::SwitchOrg { selected });
                     }
                     KeyCode::Esc => self.modal = None,
                     _ => self.modal = Some(Modal::SwitchOrg { selected }),
@@ -3703,7 +4056,8 @@ Output appears in the Jobs window (F2)."
             self.notice("A probe is already running");
             return;
         }
-        self.start_probe();
+        // An explicit re-probe always asks sf, even when the org/version caches are warm.
+        self.start_probe(None, None);
         self.notice("Re-probing the Salesforce CLI…");
     }
 }
@@ -5144,6 +5498,7 @@ mod tests {
             TestReport {
                 run_id: "08N000000000001".to_owned(),
                 org: Some("test-scratch".to_owned()),
+                command: "sf apex run test".to_owned(),
                 poll_after: Instant::now(),
                 attempts: 1,
                 failures: 0,
@@ -5539,5 +5894,254 @@ mod tests {
         app.modal = Some(Modal::Help { scroll: 0 });
         app.handle_key(key(KeyCode::Enter));
         assert!(app.modal.is_none());
+    }
+
+    /// App wired to a throwaway config dir. Call only inside a Tokio runtime (`#[tokio::test]`).
+    fn state_app(config_dir: &Path) -> App {
+        App::new(
+            Startup::pending(),
+            Config::default(),
+            config_dir.to_path_buf(),
+        )
+    }
+
+    fn sample_org(username: &str, alias: &str, is_default: bool) -> OrgSummary {
+        OrgSummary {
+            username: username.to_owned(),
+            aliases: vec![alias.to_owned()],
+            org_id: "00D000000000001".to_owned(),
+            is_default,
+            is_devhub: false,
+            connected_status: "Connected".to_owned(),
+            instance_url: "https://example.invalid.my.salesforce.com".to_owned(),
+            scratch: true,
+        }
+    }
+
+    fn saved_run(id: &str) -> SavedTestRun {
+        SavedTestRun {
+            id: id.to_owned(),
+            finished_at: state_store::now_ms(),
+            org: Some("alias".to_owned()),
+            command: "sf apex run test".to_owned(),
+            run: test_results::TestRun {
+                command: "sf apex run test".to_owned(),
+                outcome: "Passed".to_owned(),
+                ..test_results::TestRun::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_default_org_is_applied_to_the_header_at_startup() {
+        let config = tempfile::tempdir().expect("config dir");
+        let root = PathBuf::from("/work/project");
+        let cache = OrgCache {
+            orgs: vec![sample_org("cached@example.invalid", "cached-scratch", true)],
+            ..OrgCache::default()
+        };
+        cache.save(&root, config.path()).expect("save cache");
+
+        let mut app = state_app(config.path());
+        app.initialize_project_state(&root);
+        assert_eq!(app.startup.current_org.as_deref(), Some("cached-scratch"));
+        assert_eq!(app.org_target_hint(), "cached-scratch");
+        assert_eq!(app.org_state.orgs.len(), 1);
+        assert!(app.state_dir.is_some());
+    }
+
+    #[tokio::test]
+    async fn switching_the_default_org_updates_and_saves_the_cache() {
+        let config = tempfile::tempdir().expect("config dir");
+        let root = PathBuf::from("/work/project");
+        let cache = OrgCache {
+            orgs: vec![
+                sample_org("a@example.invalid", "alias-a", false),
+                sample_org("b@example.invalid", "alias-b", true),
+            ],
+            ..OrgCache::default()
+        };
+        cache.save(&root, config.path()).expect("save cache");
+
+        let mut app = state_app(config.path());
+        app.initialize_project_state(&root);
+        app.startup.installation = Some(crate::sf::detect::SfInstallation {
+            executable: PathBuf::from("sf"),
+            source: "test".to_owned(),
+        });
+        app.modal = Some(Modal::SwitchOrg { selected: 0 });
+        app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(app.startup.current_org.as_deref(), Some("alias-a"));
+        let saved = OrgCache::load(&root, config.path());
+        assert!(saved.orgs[0].is_default, "new default must be persisted");
+        assert!(!saved.orgs[1].is_default);
+    }
+
+    #[tokio::test]
+    async fn org_detail_finish_populates_and_persists_the_detail_cache() {
+        let config = tempfile::tempdir().expect("config dir");
+        let root = PathBuf::from("/work/project");
+        let mut app = state_app(config.path());
+        app.initialize_project_state(&root);
+        let id = spawn_tracked(
+            &mut app,
+            JobPurpose::OrgDetail {
+                username: "demo@example.invalid".to_owned(),
+            },
+        );
+        app.finish_job(
+            id,
+            sf::runner::ProcessOutcome {
+                exit_code: Some(0),
+                stdout: r#"{"result":{"username":"demo@example.invalid","instanceUrl":"https://example.invalid","accessToken":"SUPER_SECRET"}}"#.to_owned(),
+                stderr: String::new(),
+            },
+        );
+        assert!(
+            app.org_state
+                .detail_cache
+                .contains_key("demo@example.invalid")
+        );
+        let saved = OrgCache::load(&root, config.path());
+        assert!(saved.details.contains_key("demo@example.invalid"));
+        let raw =
+            std::fs::read_to_string(state_store::state_dir(&root, config.path()).join("orgs.json"))
+                .expect("orgs file");
+        assert!(
+            !raw.contains("SUPER_SECRET"),
+            "credentials must never be saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_apex_result_is_saved_to_project_history() {
+        let config = tempfile::tempdir().expect("config dir");
+        let root = PathBuf::from("/work/project");
+        let mut app = state_app(config.path());
+        app.initialize_project_state(&root);
+        let id = spawn_tracked(
+            &mut app,
+            JobPurpose::ApexTests {
+                command: "sf apex run test".to_owned(),
+                org: Some("alias".to_owned()),
+            },
+        );
+        app.finish_job(
+            id,
+            sf::runner::ProcessOutcome {
+                exit_code: Some(0),
+                stdout: r#"{"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":1,"passing":1,"failing":0},"tests":[{"FullName":"DemoTest.ok","Outcome":"Pass"}]}}"#.to_owned(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(app.test_history.runs.len(), 1);
+        let saved = TestHistory::load(&root, config.path());
+        assert_eq!(saved.runs.len(), 1);
+        assert_eq!(saved.runs[0].org.as_deref(), Some("alias"));
+        assert_eq!(saved.runs[0].run.outcome, "Passed");
+    }
+
+    #[test]
+    fn f6_opens_test_history_only_on_the_tests_screen() {
+        let mut app = test_app();
+        app.handle_key(key(KeyCode::F(6)));
+        assert!(app.modal.is_none(), "F6 must be inert outside Tests");
+        app.tab = Tab::Tests;
+        app.handle_key(key(KeyCode::F(6)));
+        assert!(matches!(app.modal, Some(Modal::TestHistory { .. })));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.modal.is_none());
+    }
+
+    #[tokio::test]
+    async fn cached_version_is_applied_at_startup() {
+        let config = tempfile::tempdir().expect("config dir");
+        SfVersionCache {
+            version: "99.0.0".to_owned(),
+            saved_at: state_store::now_ms(),
+        }
+        .save(config.path())
+        .expect("save version");
+
+        let app = state_app(config.path());
+        assert_eq!(app.startup.version.as_deref(), Some("99.0.0"));
+    }
+
+    #[tokio::test]
+    async fn corrupt_version_cache_keeps_the_probe_path() {
+        let config = tempfile::tempdir().expect("config dir");
+        std::fs::write(config.path().join("sf-version.json"), b"{broken").expect("write corrupt");
+        // A corrupt file loads as no cache, so start_probe still receives None and runs sf version.
+        let app = state_app(config.path());
+        assert!(app.startup.version.is_none());
+        assert!(app.probe_task.is_some());
+    }
+
+    #[tokio::test]
+    async fn probed_version_is_persisted_to_the_global_cache() {
+        let config = tempfile::tempdir().expect("config dir");
+        let mut app = state_app(config.path());
+        app.on_event(AppEvent::Startup(sf::StartupEvent::Version(
+            "99.0.0".to_owned(),
+        )));
+        assert_eq!(SfVersionCache::load(config.path()).version, "99.0.0");
+    }
+
+    #[tokio::test]
+    async fn f5_and_setup_reprobe_force_a_fresh_version_probe() {
+        let config = tempfile::tempdir().expect("config dir");
+        SfVersionCache {
+            version: "99.0.0".to_owned(),
+            saved_at: state_store::now_ms(),
+        }
+        .save(config.path())
+        .expect("save version");
+        let mut app = state_app(config.path());
+
+        // Simulate a completed startup probe, then check each manual refresh starts a new one.
+        if let Some(task) = app.probe_task.take() {
+            task.abort();
+        }
+        app.handle_key(key(KeyCode::F(5)));
+        assert!(app.probe_task.is_some(), "F5 must re-probe the CLI version");
+        if let Some(task) = app.probe_task.take() {
+            task.abort();
+        }
+        app.tab = Tab::Setup;
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(
+            app.probe_task.is_some(),
+            "Setup r must re-probe the CLI version"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_history_delete_and_two_step_clear_work() {
+        let config = tempfile::tempdir().expect("config dir");
+        let root = PathBuf::from("/work/project");
+        let mut app = state_app(config.path());
+        app.initialize_project_state(&root);
+        app.test_history.push(saved_run("job-1"));
+        app.test_history.push(saved_run("job-2"));
+        app.modal = Some(Modal::TestHistory {
+            selected: 0,
+            list_scroll: 0,
+            detail_scroll: 0,
+            focus: TestHistoryFocus::List,
+            confirm_clear: false,
+        });
+
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.test_history.runs.len(), 1);
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(
+            app.test_history.runs.len(),
+            1,
+            "first c only asks for confirmation"
+        );
+        app.handle_key(key(KeyCode::Char('c')));
+        assert!(app.test_history.runs.is_empty());
+        assert!(TestHistory::load(&root, config.path()).runs.is_empty());
     }
 }

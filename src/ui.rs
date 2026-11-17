@@ -8,8 +8,11 @@ use ratatui::widgets::{
     Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 
-use crate::app::{App, JobSection, JobsFocus, Modal, ResultItem, Tab, TestsFocus};
+use crate::app::{
+    App, JobSection, JobsFocus, Modal, ResultItem, Tab, TestHistoryFocus, TestsFocus,
+};
 use crate::json_view;
+use crate::view::apex_result;
 
 fn accent(app: &App) -> Color {
     app.accent()
@@ -465,6 +468,17 @@ const KEYMAP: &[KeyBinding] = &[
         order: 15,
         help_key: "F5",
         help: "refresh component search",
+    },
+    KeyBinding {
+        cap: "F6",
+        hints: &[
+            (HintContext::TestsSearch, "history"),
+            (HintContext::TestsCoverage, "history"),
+            (HintContext::TestsPlain, "history"),
+        ],
+        order: 6,
+        help_key: "F6",
+        help: "Apex test history (Tests screen)",
     },
     KeyBinding {
         cap: "r",
@@ -1338,9 +1352,11 @@ fn result_item_line(item: &crate::app::ResultItem) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Render a result view. `record` is `None` for a reconstructed saved result (F6 history), which
+/// has no retained raw output or JSON to show.
 fn result_lines(
     app: &App,
-    record: &crate::app::OutputRecord,
+    record: Option<&crate::app::OutputRecord>,
     result: &crate::app::ResultView,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -1388,7 +1404,9 @@ fn result_lines(
             ))));
         }
     }
-    if app.output_state.show_details {
+    if let Some(record) = record
+        && app.output_state.show_details
+    {
         lines.push(Line::from(" "));
         if app.output_state.show_json
             && let Some(value) = &record.json
@@ -1502,7 +1520,7 @@ fn build_job_detail_lines(
         lines.push(Line::from(" "));
     }
     if let Some(result) = &record.result {
-        lines.extend(result_lines(app, record, result, width));
+        lines.extend(result_lines(app, Some(record), result, width));
     } else if app.output_state.show_json && record.finished {
         lines.push(strong_line("JSON", accent(app)));
         if let Some(value) = &record.json {
@@ -1908,6 +1926,223 @@ fn jobs_hint_pairs(
     ]
 }
 
+/// Compact UTC timestamp for a saved run; no date crate is needed for a `YYYY-MM-DD HH:MM` label.
+fn run_time_label(millis: u64) -> String {
+    let days = (millis / 1_000 / 86_400) as i64;
+    let seconds = (millis / 1_000) % 86_400;
+    let year_z = days + 719_468;
+    let era = if year_z >= 0 {
+        year_z
+    } else {
+        year_z - 146_096
+    } / 146_097;
+    let day_of_era = year_z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        seconds / 3_600,
+        (seconds % 3_600) / 60
+    )
+}
+
+/// F6 history popup: newest-first run list on the left, full result for the selected run on the
+/// right (stacked on narrow terminals). The detail view reuses the standard result renderer.
+fn draw_test_history(
+    frame: &mut Frame,
+    app: &App,
+    selected: usize,
+    list_scroll: usize,
+    detail_scroll: usize,
+    focus: TestHistoryFocus,
+    confirm_clear: bool,
+) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let runs = &app.test_history.runs;
+    let title = if runs.is_empty() {
+        "Apex test history".to_owned()
+    } else {
+        format!("Apex test history — {} runs", runs.len())
+    };
+    let outer = block(title, app);
+    frame.render_widget(outer.clone(), area);
+    let inner = outer.inner(area);
+    let sections = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
+
+    let clear_hint = if confirm_clear {
+        ("c", "clear all?")
+    } else {
+        ("c", "clear")
+    };
+    // Keep delete/clear ahead of the less critical hints so they survive narrow-terminal
+    // truncation.
+    let hints: Vec<(&str, &str)> = if focus == TestHistoryFocus::Detail {
+        vec![
+            ("j/k", "scroll"),
+            ("↑↓", "run"),
+            ("Tab", "list"),
+            ("d", "delete"),
+            clear_hint,
+            ("Esc", "back"),
+        ]
+    } else {
+        vec![
+            ("↑↓", "select"),
+            ("Enter", "detail"),
+            ("d", "delete"),
+            clear_hint,
+            ("Esc", "close"),
+        ]
+    };
+    frame.render_widget(
+        Paragraph::new(keycap_pairs_line(&hints, app, usize::from(inner.width))),
+        sections[1],
+    );
+
+    if runs.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(faint(
+                "No saved runs — finished Apex tests appear here.",
+            ))),
+            sections[0],
+        );
+        app.test_history_list_rows.set(1);
+        app.test_history_detail_lines.set(1);
+        return;
+    }
+    let selected = selected.min(runs.len() - 1);
+
+    let (list_area, detail_area) = if area.width >= 100 {
+        let columns = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(sections[0]);
+        (columns[0], columns[1])
+    } else {
+        let wanted = (runs.len() as u16).saturating_add(3);
+        let list_height = wanted.min((sections[0].height / 2).max(5));
+        let panes = Layout::vertical([Constraint::Length(list_height), Constraint::Min(3)])
+            .split(sections[0]);
+        (panes[0], panes[1])
+    };
+
+    let list_block = pane_block(
+        if focus == TestHistoryFocus::List {
+            "› runs"
+        } else {
+            "runs"
+        },
+        app,
+        focus == TestHistoryFocus::List,
+    );
+    frame.render_widget(list_block.clone(), list_area);
+    let list_inner = list_block.inner(list_area);
+    let visible = usize::from(list_inner.height).saturating_sub(1).max(1); // header row
+    app.test_history_list_rows.set(visible);
+    let max_top = runs.len().saturating_sub(visible);
+    let mut top = list_scroll.min(max_top);
+    if selected < top {
+        top = selected;
+    } else if selected >= top + visible {
+        top = selected + 1 - visible;
+    }
+    let top = top.min(max_top);
+    let rows: Vec<Row> = runs
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(visible.max(1))
+        .map(|(index, saved)| {
+            let outcome = if saved.run.failing == 0 && saved.run.failures.is_empty() {
+                "✓"
+            } else {
+                "✗"
+            };
+            let summary = format!(
+                "{} run · {} ✓ · {} ✗ · cov {}",
+                saved.run.tests_run,
+                saved.run.passing,
+                saved.run.failing,
+                if saved.run.coverage.is_empty() {
+                    "—"
+                } else {
+                    saved.run.coverage.as_str()
+                }
+            );
+            let width = usize::from(list_inner.width)
+                .saturating_div(3)
+                .clamp(10, 34);
+            Row::new(vec![
+                Line::from(Span::styled(
+                    run_time_label(saved.finished_at),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    truncated(saved.org.as_deref().unwrap_or("default"), 14),
+                    Style::default().fg(Color::Reset),
+                )),
+                Line::from(Span::styled(
+                    outcome.to_owned(),
+                    Style::default().fg(if outcome == "✓" {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
+                )),
+                Line::from(Span::styled(
+                    truncated(&summary, width),
+                    Style::default().fg(Color::Gray),
+                )),
+            ])
+            .style(if index == selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            })
+        })
+        .collect();
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(16),
+            Constraint::Length(15),
+            Constraint::Length(3),
+            Constraint::Min(12),
+        ],
+    )
+    .header(
+        Row::new(["FINISHED (UTC)", "ORG", "", "SUMMARY"]).style(
+            Style::default()
+                .fg(accent(app))
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .column_spacing(1);
+    frame.render_widget(table, list_inner);
+
+    let saved = &runs[selected];
+    let detail_title = format!("result — {}", saved.org.as_deref().unwrap_or("default org"));
+    let detail_block = pane_block(&detail_title, app, focus == TestHistoryFocus::Detail);
+    frame.render_widget(detail_block.clone(), detail_area);
+    let detail_inner = detail_block.inner(detail_area);
+    let view = apex_result(&saved.run);
+    let lines = result_lines(app, None, &view, usize::from(detail_inner.width));
+    app.test_history_detail_lines.set(lines.len());
+    let max_scroll = lines.len().saturating_sub(usize::from(detail_inner.height));
+    let top = detail_scroll.min(max_scroll);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((top.min(u16::MAX as usize) as u16, 0)),
+        detail_inner,
+    );
+}
+
 fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
     match modal {
         Modal::Help { scroll } => {
@@ -2081,16 +2316,20 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             let width = 78u16.min(frame.area().width);
             let rows = app.org_state.orgs.len();
             let height = (rows as u16)
-                .saturating_add(6)
+                .saturating_add(8)
                 .min(frame.area().height.saturating_sub(2))
-                .max(7);
+                .max(9);
             let area = centered(frame.area(), width, height);
             frame.render_widget(Clear, area);
             let outer = pane_block("Switch default org", app, true);
             frame.render_widget(outer.clone(), area);
             let inner = outer.inner(area);
-            let sections =
-                Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+            let sections = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ])
+            .split(inner);
             let row_width = usize::from(sections[0].width).saturating_sub(1); // highlight symbol
             let label_width = row_width.saturating_sub(20).clamp(8, 24);
             let username_width = row_width.saturating_sub(label_width + 6).clamp(8, 30);
@@ -2151,19 +2390,53 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                     &mut state,
                 );
             }
+            // Cached `org display` detail for the highlighted org, loaded on demand with `d`.
+            let org = app.org_state.orgs.get(*selected);
+            let cached = org.and_then(|org| {
+                app.org_state.detail_cache.get(&org.username).or_else(|| {
+                    if app.org_state.detail_for.as_deref() == Some(org.username.as_str()) {
+                        app.org_state.detail.as_ref()
+                    } else {
+                        None
+                    }
+                })
+            });
+            let detail_width = usize::from(sections[1].width);
+            let detail_lines = match (org, cached) {
+                (Some(org), Some(detail)) => {
+                    let org_id = detail
+                        .fields
+                        .iter()
+                        .find(|(key, _)| key.eq_ignore_ascii_case("id"))
+                        .map(|(_, value)| value.as_str())
+                        .unwrap_or(org.org_id.as_str());
+                    vec![
+                        strong(
+                            truncated(&org.label(), detail_width.saturating_sub(12)),
+                            accent(app),
+                        ) + faint(format!("  {}", truncated(&detail.username, 24))),
+                        Line::from(faint(truncated(
+                            &format!("id {} · {}", org_id, detail.instance_url),
+                            detail_width,
+                        ))),
+                    ]
+                }
+                _ => vec![Line::from(faint("d — load org details"))],
+            };
+            frame.render_widget(Paragraph::new(detail_lines), sections[1]);
             frame.render_widget(
                 Paragraph::new(keycap_pairs_line(
                     &[
                         ("↑↓", "select"),
                         ("Enter", "switch"),
+                        ("d", "details"),
                         ("F5", "refresh"),
-                        ("l", "log in"),
                         ("Esc", "close"),
                     ],
                     app,
                     usize::from(inner.width),
                 )),
-                sections[1],
+                sections[2],
             );
         }
         Modal::Jobs {
@@ -2172,6 +2445,21 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             scroll,
             follow,
         } => draw_jobs(frame, app, *selected, *focus, *scroll, *follow),
+        Modal::TestHistory {
+            selected,
+            list_scroll,
+            detail_scroll,
+            focus,
+            confirm_clear,
+        } => draw_test_history(
+            frame,
+            app,
+            *selected,
+            *list_scroll,
+            *detail_scroll,
+            *focus,
+            *confirm_clear,
+        ),
         Modal::TestConfirm {
             entries,
             focus,

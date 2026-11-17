@@ -1,11 +1,13 @@
 //! Parsing of `sf org list --json` and `sf org display --json` responses.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::string_field;
 
 /// One org from either the scratch or non-scratch section of `org list`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OrgSummary {
     pub username: String,
     pub aliases: Vec<String>,
@@ -27,7 +29,8 @@ impl OrgSummary {
 }
 
 /// A safe subset of `org display`; secrets are never shown in the UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OrgDetail {
     pub fields: Vec<(String, String)>,
     pub instance_url: String,

@@ -70,9 +70,22 @@ pub async fn probe(
 
 /// Same probe with a caller-supplied installation, used by tests and custom launchers.
 pub async fn probe_with(
+    config_dir: std::path::PathBuf,
+    events: tokio::sync::mpsc::UnboundedSender<StartupEvent>,
+    supplied: Option<SfInstallation>,
+) -> Startup {
+    probe_cached(config_dir, events, supplied, None, None).await
+}
+
+/// Probe with optional cached org and version. When present, the corresponding `sf config get
+/// target-org` / `sf version` call is skipped entirely and no `CurrentOrg`/`Version` progress
+/// event is emitted, because the application already applied those values from its caches.
+pub async fn probe_cached(
     _config_dir: std::path::PathBuf,
     events: tokio::sync::mpsc::UnboundedSender<StartupEvent>,
     supplied: Option<SfInstallation>,
+    cached_org: Option<String>,
+    cached_version: Option<String>,
 ) -> Startup {
     let send = |event: StartupEvent| {
         let _ = events.send(event);
@@ -95,7 +108,11 @@ pub async fn probe_with(
     result.installation = Some(installation.clone());
     send(StartupEvent::Detected(installation.clone()));
 
+    let version_from_cache = cached_version.is_some();
     let version_probe = async {
+        if let Some(version) = cached_version {
+            return Some(version);
+        }
         send(StartupEvent::Stage("Reading Salesforce CLI version"));
         let argv = installation.argv(&["version".to_owned(), "--json".to_owned()]);
         match runner::capture_with_env(
@@ -125,6 +142,9 @@ pub async fn probe_with(
     };
 
     let org_probe = async {
+        if let Some(org) = cached_org {
+            return Some(org);
+        }
         let argv = installation.argv(&[
             "config".to_owned(),
             "get".to_owned(),
@@ -150,7 +170,9 @@ pub async fn probe_with(
     let (version, current_org) = tokio::join!(version_probe, org_probe);
     if let Some(version) = version {
         result.version = Some(version.clone());
-        send(StartupEvent::Version(version));
+        if !version_from_cache {
+            send(StartupEvent::Version(version));
+        }
     }
     if let Some(org) = current_org {
         result.current_org = Some(org);
@@ -246,5 +268,63 @@ mod tests {
     #[test]
     fn install_instructions_are_nonempty() {
         assert!(!install_instructions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_default_org_is_used_without_a_config_probe() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let installation = detect::SfInstallation {
+            executable: std::path::PathBuf::from("definitely-missing-sf"),
+            source: "test".to_owned(),
+        };
+        let task = tokio::spawn(probe_cached(
+            std::path::PathBuf::from("."),
+            tx,
+            Some(installation),
+            Some("cached-scratch".to_owned()),
+            None,
+        ));
+        let mut saw_current_org = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StartupEvent::CurrentOrg(_)) {
+                saw_current_org = true;
+            }
+            if matches!(event, StartupEvent::Finished) {
+                break;
+            }
+        }
+        let startup = task.await.expect("probe task");
+        // The version probe uses a synthetic missing executable, but the cached org must still be
+        // returned and no `CurrentOrg` event may be emitted as if sf had been queried.
+        assert!(!saw_current_org);
+        assert_eq!(startup.current_org.as_deref(), Some("cached-scratch"));
+    }
+
+    #[tokio::test]
+    async fn cached_version_is_used_without_running_the_version_probe() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let installation = detect::SfInstallation {
+            executable: std::path::PathBuf::from("definitely-missing-sf"),
+            source: "test".to_owned(),
+        };
+        let task = tokio::spawn(probe_cached(
+            std::path::PathBuf::from("."),
+            tx,
+            Some(installation),
+            None,
+            Some("99.0.0".to_owned()),
+        ));
+        let mut saw_version = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, StartupEvent::Version(_)) {
+                saw_version = true;
+            }
+            if matches!(event, StartupEvent::Finished) {
+                break;
+            }
+        }
+        let startup = task.await.expect("probe task");
+        assert!(!saw_version, "a cached version must skip sf version --json");
+        assert_eq!(startup.version.as_deref(), Some("99.0.0"));
     }
 }

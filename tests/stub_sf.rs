@@ -501,6 +501,10 @@ fn help_modal_renders_as_a_table_at_multiple_sizes() {
                 rendered.contains("open the command catalog"),
                 "F3 help row missing at {width}x{height}"
             );
+            assert!(
+                rendered.contains("Apex test history (Tests screen)"),
+                "F6 help row missing at {width}x{height}"
+            );
         }
         assert!(
             !rendered.contains("Menu r/d/c/t/o/e"),
@@ -738,4 +742,180 @@ fn tests_screen_with_coverage_renders_at_small_and_roomy_sizes() {
             "test list has no usable rows at {width}x{height}"
         );
     }
+}
+
+fn saved_apex_run(id: &str, outcome: &str) -> sftui::state_store::SavedTestRun {
+    sftui::state_store::SavedTestRun {
+        id: id.to_owned(),
+        finished_at: 1_700_000_000_000,
+        org: Some("scratch-org".to_owned()),
+        command: "sf apex run test".to_owned(),
+        run: sftui::sf::test_results::TestRun {
+            id: "08N000000000001".to_owned(),
+            at: 1_700_000_000,
+            command: "sf apex run test".to_owned(),
+            outcome: outcome.to_owned(),
+            tests_run: 3,
+            passing: 2,
+            failing: 1,
+            skipped: 0,
+            coverage: "81%".to_owned(),
+            tests: vec![sftui::sf::test_results::TestResultRow {
+                name: "DemoTest.bad".to_owned(),
+                outcome: "Fail".to_owned(),
+                message: "assertion failed".to_owned(),
+            }],
+            failures: vec![sftui::sf::test_results::TestFailure {
+                name: "DemoTest.bad".to_owned(),
+                message: "assertion failed".to_owned(),
+            }],
+            coverages: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn f6_history_modal_renders_at_small_and_roomy_sizes() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup::pending(),
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.tab = sftui::app::Tab::Tests;
+    app.test_history.runs = vec![
+        saved_apex_run("job-2", "Failed"),
+        saved_apex_run("job-1", "Passed"),
+    ];
+    app.modal = Some(sftui::app::Modal::TestHistory {
+        selected: 0,
+        list_scroll: 0,
+        detail_scroll: 0,
+        focus: sftui::app::TestHistoryFocus::List,
+        confirm_clear: false,
+    });
+
+    for (width, height) in [(80, 24), (60, 16)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| ui::draw(frame, &app))
+            .expect("draw history");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("Apex test history"),
+            "history title missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("scratch-org"),
+            "org column missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("2023-11-14"),
+            "date/time column missing at {width}x{height}: {rendered}"
+        );
+        assert!(
+            rendered.contains("assertion failed") || rendered.contains("Failed"),
+            "result pane missing at {width}x{height}"
+        );
+        assert!(
+            rendered.to_lowercase().contains("delete") && rendered.to_lowercase().contains("clear"),
+            "modal hints missing at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn f4_switcher_shows_cached_org_detail() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup::pending(),
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.org_state.orgs.push(sftui::sf::org::OrgSummary {
+        username: "demo@example.invalid".to_owned(),
+        aliases: vec!["demo".to_owned()],
+        org_id: "00D000000000001".to_owned(),
+        is_default: true,
+        is_devhub: false,
+        connected_status: "Connected".to_owned(),
+        instance_url: "https://example.invalid".to_owned(),
+        scratch: true,
+    });
+    app.org_state.detail_cache.insert(
+        "demo@example.invalid".to_owned(),
+        sftui::sf::org::OrgDetail {
+            fields: vec![("Id".to_owned(), "00D000000000001".to_owned())],
+            instance_url: "https://cached.example.invalid".to_owned(),
+            username: "demo@example.invalid".to_owned(),
+        },
+    );
+    app.modal = Some(sftui::app::Modal::SwitchOrg { selected: 0 });
+
+    for (width, height) in [(80, 24), (60, 16)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| ui::draw(frame, &app))
+            .expect("draw org switcher");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.contains("https://cached.example.invalid"),
+            "cached instance URL missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("00D000000000001"),
+            "cached org id missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("details"),
+            "d details hint missing at {width}x{height}"
+        );
+    }
+}
+
+#[test]
+fn f6_hint_is_shown_only_on_the_tests_screen() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup::pending(),
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    let render = |app: &App| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| ui::draw(frame, app)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    };
+    assert!(
+        !render(&app).contains("[F6]"),
+        "F6 must not show outside Tests"
+    );
+    app.tab = sftui::app::Tab::Tests;
+    let tests = render(&app);
+    assert!(tests.contains("[F6]"), "F6 hint missing on Tests: {tests}");
+    assert!(tests.to_lowercase().contains("history"), "F6 label missing");
 }
