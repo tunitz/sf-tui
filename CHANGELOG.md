@@ -4,6 +4,30 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.17] - 2026-11-17
+
+### Fixed
+
+- Per-class Apex coverage now parses the CLI's real result shape: the class table under
+  `result.coverage.coverage` (name, totalLines, totalCovered, coveredPercent) and the per-method
+  records that carry covered/uncovered line numbers. Previously only a flat `codecoverage` array
+  was read, so a successful run showed the coverage percentage with no class rows.
+- A terminal test summary that arrives before the org has aggregated coverage is polled up to
+  three more times instead of finalizing with an empty table; if rows still never arrive, the
+  result says so instead of silently omitting them.
+- The header no longer shows `sf detecting…` after startup, or the doubled `org no default org`.
+  The CLI version moved out of the header, the configured org is resolved with longer Windows
+  timeouts (20 s version, 15 s org), and a missing org reads as `no default org` once.
+- Screen titles no longer repeat the project and org that the header already shows.
+
+### Changed
+
+- The Jobs window shows counts in its title (`Jobs — 1 running · 2 finished`), marks the focused
+  pane with an accent border, and uses one keycap bar for the whole window. `Enter` opens the
+  selected job (`Tab` only moves focus), and the hint text now says so.
+- On terminals narrower than 100 columns the job list takes only the height it needs, leaving the
+  result pane as much room as possible.
+
 ## [0.1.16] - 2026-11-17
 
 ### Added

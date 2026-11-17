@@ -87,16 +87,19 @@ Finishing jobs are announced in the status line instead of stealing the screen.
 `F2` opens the **Jobs** window from any screen. It lists every job in three sections — running,
 queued and finished — with its task, command, elapsed time and outcome. The selected job's live
 output, or its full result when finished, is shown beside the list and follows new output until you
-scroll up (`End` resumes). `x` cancels a running job or removes a queued one, `c` clears the
-finished list, `Enter`/`Tab` moves focus to the detail and `Esc` steps back.
+scroll up (`End` resumes). `Enter` opens the selected job and focuses its result, `Tab` moves focus
+between the list and the result, `x` cancels a running job or removes a queued one, `c` clears the
+finished list and `Esc` steps back.
 
 Apex Tests follows the same pattern: type to find real test classes (`*Test.cls` or `@IsTest`),
 `Space` check/uncheck, `Enter` confirm. A run returns a test run ID immediately and sftui polls the
 result, so a long org run never holds a job slot. Runs use `--code-coverage`, so results show one
 row per test class with `[✓]`/`[✗]`, the method outcomes underneath, and a coverage table with
 every class the CLI returned: percent, covered/total lines and a bar. The table is on the Tests
-screen (`Tab` focuses it and `↑↓` scrolls) and in the full result view. The Organization screen
-handles login: check the current org, switch, login, delete/logout or reauth.
+screen (`Tab` focuses it and `↑↓` scrolls) and in the full result view. Per-class rows come from
+the org; to include classes the run did not touch, turn off *Store Only Aggregate Code Coverage* in
+Setup › Apex Test Execution. The Organization screen handles login: check the current org, switch,
+login, delete/logout or reauth.
 
 On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
 `Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`; typing keeps

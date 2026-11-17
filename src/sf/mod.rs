@@ -53,7 +53,8 @@ pub enum StartupEvent {
     Finished,
 }
 
-const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+// Windows Node startups are slow; the probe is background work and must not give up early.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Stage the startup work so the UI can render immediately and show real progress.
 ///
@@ -132,7 +133,7 @@ pub async fn probe_with(
         if let Ok(outcome) = runner::capture_with_env(
             &installation.executable,
             &argv,
-            Duration::from_secs(4),
+            Duration::from_secs(15),
             runner::sf_env(),
         )
         .await

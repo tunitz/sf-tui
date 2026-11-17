@@ -259,6 +259,19 @@ pub fn apex_result(run: &TestRun) -> ResultView {
         })
         .collect();
     let mut sections = Vec::new();
+    if run.coverages.is_empty() && !run.coverage.is_empty() {
+        sections.push(ResultSection {
+            title: "COVERAGE".to_owned(),
+            rows: vec![ResultItem {
+                ok: false,
+                label: "Per-class coverage not returned by the CLI".to_owned(),
+                detail:
+                    "the org reported the total only; enable aggregate coverage in Setup › Apex Test Execution"
+                        .to_owned(),
+                progress: None,
+            }],
+        });
+    }
     if !method_rows.is_empty() {
         sections.push(ResultSection {
             title: "TEST METHODS".to_owned(),

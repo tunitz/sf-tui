@@ -33,17 +33,6 @@ fn density(area: Rect) -> Density {
     }
 }
 
-fn short_tab(tab: Tab) -> &'static str {
-    match tab {
-        Tab::Home => "Home",
-        Tab::Retrieve => "Retrieve",
-        Tab::Deploy => "Deploy",
-        Tab::Tests => "Tests",
-        Tab::Orgs => "Orgs",
-        Tab::Setup => "Setup",
-    }
-}
-
 fn block(title: impl Into<String>, app: &App) -> Block<'static> {
     Block::bordered()
         .title(title.into())
@@ -53,6 +42,25 @@ fn block(title: impl Into<String>, app: &App) -> Block<'static> {
                 .fg(accent(app))
                 .add_modifier(Modifier::BOLD),
         )
+}
+
+/// A pane border that shows which side of the Jobs window has keyboard focus.
+fn pane_block(title: impl Into<String>, app: &App, focused: bool) -> Block<'static> {
+    let title = title.into();
+    Block::bordered()
+        .title(if focused { format!(" {title} ") } else { title })
+        .border_style(Style::default().fg(if focused {
+            accent(app)
+        } else {
+            Color::DarkGray
+        }))
+        .title_style(if focused {
+            Style::default()
+                .fg(accent(app))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        })
 }
 
 fn faint(text: impl Into<String>) -> Span<'static> {
@@ -150,16 +158,6 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let version = app.startup.version.as_deref().unwrap_or("detecting…");
-    let project = if app.deploy_state.project_loading {
-        "scanning…".to_owned()
-    } else {
-        app.deploy_state
-            .project
-            .as_ref()
-            .map(|project| project.name())
-            .unwrap_or_else(|| "no project".to_owned())
-    };
     let frames = ["-", "\\", "|", "/"];
     let spinner = frames[app.spinner_tick() % frames.len()];
     let activity = if !app.startup_stage.done {
@@ -169,16 +167,60 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "ready".to_owned()
     };
-    let info = Line::from(vec![
+    let activity_style = if app.startup_stage.done && !app.busy() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+
+    let mut left: Vec<Span> = vec![
         strong("SFTUI", accent(app)),
-        faint(format!(
-            " v{} | {} | sf {version} | project {project} | org {} | {activity}",
-            env!("CARGO_PKG_VERSION"),
-            short_tab(app.tab),
-            app.org_display()
-        )),
-    ]);
-    frame.render_widget(Paragraph::new(info), area);
+        faint(format!(" {}", env!("CARGO_PKG_VERSION"))),
+        Span::styled("  ›  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            app.tab.label(),
+            Style::default()
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    left.push(faint("   "));
+    left.push(faint(project_context(app)));
+    left.push(faint("   "));
+    left.push(faint(org_context(app)));
+
+    let right_width = (activity.chars().count() as u16 + 1).min(area.width / 2);
+    let columns =
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(right_width)]).split(area);
+    frame.render_widget(Paragraph::new(Line::from(left)), columns[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(activity, activity_style)))
+            .alignment(ratatui::layout::Alignment::Right),
+        columns[1],
+    );
+}
+
+/// `project name`, `project …` while scanning, or `no project`.
+fn project_context(app: &App) -> String {
+    if app.deploy_state.project_loading {
+        return "project …".to_owned();
+    }
+    app.deploy_state.project.as_ref().map_or_else(
+        || "no project".to_owned(),
+        |project| format!("project {}", project.name()),
+    )
+}
+
+/// The configured default org, phrased once (no doubled `org no default org`).
+fn org_context(app: &App) -> String {
+    let org = app.org_target_hint();
+    if !org.is_empty() {
+        format!("org {org}")
+    } else if app.org_state.loading || !app.startup_stage.done {
+        "org …".to_owned()
+    } else {
+        "no default org".to_owned()
+    }
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
@@ -282,9 +324,17 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
 }
 
 fn keycap_line(app: &App, width: usize) -> Line<'static> {
+    keycap_pairs_line(&key_hints(app), app, width)
+}
+
+fn keycap_pairs_line(
+    pairs: &[(&'static str, &'static str)],
+    app: &App,
+    width: usize,
+) -> Line<'static> {
     let mut spans = Vec::new();
     let mut used = 0usize;
-    for (key, label) in key_hints(app) {
+    for (key, label) in pairs {
         let piece = key.chars().count() + label.chars().count() + 3;
         let separator = if spans.is_empty() { 0 } else { 2 };
         if used + separator + piece > width {
@@ -328,23 +378,7 @@ fn action_bar<'a>(items: Vec<(&'a str, &'a str)>, app: &App) -> Line<'a> {
 }
 
 fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
-    let project = if app.deploy_state.project_loading {
-        "scanning…".to_owned()
-    } else {
-        app.deploy_state
-            .project
-            .as_ref()
-            .map(|project| project.name())
-            .unwrap_or_else(|| "no project".to_owned())
-    };
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            strong("SF TUI", accent(app)),
-            faint(format!("   project {project} · org {}", app.org_display())),
-        ]),
-        Line::from(" "),
-        strong_line("MENU", accent(app)),
-    ];
+    let mut lines: Vec<Line> = vec![strong_line("MENU", accent(app))];
     for (index, item) in crate::app::MENU_ITEMS.iter().enumerate() {
         let selected = index == app.home_state.selected;
         lines.push(Line::from(vec![
@@ -410,21 +444,8 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ])
     .split(area);
-    let project = if app.deploy_state.project_loading {
-        "scanning…".to_owned()
-    } else {
-        app.deploy_state
-            .project
-            .as_ref()
-            .map(|project| project.name())
-            .unwrap_or_else(|| "no project".to_owned())
-    };
     frame.render_widget(
-        Line::from(vec![
-            strong("Run tests", accent(app)),
-            faint(format!("   project {project} · org {}", app.org_display())),
-            faint("   [Esc] back"),
-        ]),
+        Line::from(vec![strong("Apex tests", accent(app))]),
         sections[0],
     );
     let query = if state.query.is_empty() {
@@ -888,26 +909,13 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area);
     let title = if state.retrieve { "Retrieve" } else { "Deploy" };
-    let project = if app.deploy_state.project_loading {
-        "scanning…".to_owned()
-    } else {
-        app.deploy_state
-            .project
-            .as_ref()
-            .map(|project| project.name())
-            .unwrap_or_else(|| "no project".to_owned())
-    };
-    let mut heading = vec![
-        strong(title, accent(app)),
-        faint(format!("   project {project} · org {}", app.org_display())),
-    ];
+    let mut heading = vec![strong(title, accent(app))];
     if let Some(error) = &app.deploy_state.project_error {
         heading.push(faint(format!(
             "   {}",
-            truncated(error, usize::from(area.width).saturating_sub(48))
+            truncated(error, usize::from(area.width).saturating_sub(16))
         )));
     }
-    heading.push(faint("   [Esc] back"));
     frame.render_widget(Line::from(heading), sections[0]);
     let query = if state.query.is_empty() {
         "type a component name".to_owned()
@@ -1364,10 +1372,30 @@ fn draw_jobs(
 ) {
     let area = frame.area();
     frame.render_widget(Clear, area);
-    let outer = block("Jobs", app);
+    let rows = app.job_rows();
+    let running = rows
+        .iter()
+        .filter(|row| row.section == JobSection::Running)
+        .count();
+    let queued = rows
+        .iter()
+        .filter(|row| row.section == JobSection::Queued)
+        .count();
+    let finished = rows
+        .iter()
+        .filter(|row| row.section == JobSection::Finished)
+        .count();
+    let title = if rows.is_empty() {
+        "Jobs".to_owned()
+    } else {
+        format!(
+            "Jobs — {} running · {} queued · {} finished",
+            running, queued, finished
+        )
+    };
+    let outer = block(title, app);
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
-    let rows = app.job_rows();
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(faint(
@@ -1377,6 +1405,7 @@ fn draw_jobs(
         );
         return;
     }
+    let sections = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
     let view = JobsView {
         selected: selected.min(rows.len().saturating_sub(1)),
         focus,
@@ -1384,16 +1413,29 @@ fn draw_jobs(
         follow,
     };
     if area.width >= 100 {
-        let columns = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-            .split(inner);
+        let columns = Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)])
+            .split(sections[0]);
         draw_job_list(frame, columns[0], app, &rows, view);
         draw_job_detail(frame, columns[1], app, &rows, view);
     } else {
-        let sections =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(inner);
-        draw_job_list(frame, sections[0], app, &rows, view);
-        draw_job_detail(frame, sections[1], app, &rows, view);
+        // Stacked layout: give the list only the rows it needs (up to half the window) so the
+        // selected job's result keeps as much vertical space as possible.
+        let wanted = (rows.len() as u16).saturating_add(5);
+        let list_height = wanted.min((sections[0].height / 2).max(5));
+        let panes = Layout::vertical([Constraint::Length(list_height), Constraint::Min(3)])
+            .split(sections[0]);
+        draw_job_list(frame, panes[0], app, &rows, view);
+        draw_job_detail(frame, panes[1], app, &rows, view);
     }
+    let record = rows.get(view.selected).map(|row| row.record);
+    let live = rows
+        .get(view.selected)
+        .is_some_and(|row| row.section != JobSection::Finished);
+    let hints = jobs_hint_pairs(record, view.focus, live, view.follow);
+    frame.render_widget(
+        Paragraph::new(keycap_pairs_line(&hints, app, usize::from(inner.width))),
+        sections[1],
+    );
 }
 
 fn draw_job_list(
@@ -1420,7 +1462,7 @@ fn draw_job_list(
         }
         let (glyph, color) = record_status(row.record);
         items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(color)),
+            Span::styled(format!(" {glyph} "), Style::default().fg(color)),
             Span::styled(
                 job_row_text(row.record, width.saturating_sub(2)),
                 Style::default().fg(Color::Reset),
@@ -1430,29 +1472,32 @@ fn draw_job_list(
     let mut state = ListState::default();
     state.select(selected_item);
     let title = if view.focus == JobsFocus::List {
-        "jobs — ↑↓ select · Tab detail"
+        "› job queue"
     } else {
-        "jobs"
+        "job queue"
     };
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block(title, app))
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("›"),
-        area,
-        &mut state,
-    );
+    let list = List::new(items)
+        .block(pane_block(title, app, view.focus == JobsFocus::List))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("›");
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// One row per job: `✓ #2  Apex tests  sf apex …   7s  4/4 ✓`.
 fn job_row_text(record: &crate::app::OutputRecord, width: usize) -> String {
     let elapsed = record.elapsed_label(std::time::Instant::now());
     let summary = record.outcome_summary();
-    let head = format!("#{:<3} {:<11} ", record.id, record.task.label());
     let tail = if summary.is_empty() {
         elapsed
     } else {
         format!("{elapsed}  {summary}")
     };
+    let head = format!("#{:<3} {:<11} ", record.id, record.task.label());
     let budget = width.saturating_sub(head.chars().count() + tail.chars().count() + 2);
     let command = truncated(&record.display_command(), budget.max(1));
     truncated(&format!("{head}{command}  {tail}"), width)
@@ -1467,7 +1512,8 @@ fn draw_job_detail(
 ) {
     let Some(row) = rows.get(view.selected) else {
         frame.render_widget(
-            Paragraph::new(Line::from(faint("No job selected"))).block(block("detail", app)),
+            Paragraph::new(Line::from(faint("No job selected")))
+                .block(pane_block("result", app, false)),
             area,
         );
         return;
@@ -1479,13 +1525,17 @@ fn draw_job_detail(
         .filter(|row| row.section == JobSection::Queued)
         .position(|row| row.record.id == record.id)
         .map(|index| index + 1);
-    let outer = block("detail", app);
+    let title = if live {
+        format!("live output — #{} {}", record.id, record.task.label())
+    } else {
+        format!("result — #{} {}", record.id, record.task.label())
+    };
+    let outer = pane_block(&title, app, view.focus == JobsFocus::Detail);
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
-    let sections = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    app.jobs_detail_height.set(sections[0].height);
-    let lines = job_detail_lines(app, record, queued_position, usize::from(sections[0].width));
-    let max_scroll = lines.len().saturating_sub(usize::from(sections[0].height));
+    app.jobs_detail_height.set(inner.height);
+    let lines = job_detail_lines(app, record, queued_position, usize::from(inner.width));
+    let max_scroll = lines.len().saturating_sub(usize::from(inner.height));
     let top = if live && view.follow {
         max_scroll
     } else {
@@ -1493,40 +1543,50 @@ fn draw_job_detail(
     };
     frame.render_widget(
         Paragraph::new(Text::from(lines)).scroll((top.min(u16::MAX as usize) as u16, 0)),
-        sections[0],
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(faint(job_hints(
-            record,
-            view.focus,
-            live,
-            view.follow,
-        )))),
-        sections[1],
+        inner,
     );
 }
 
-fn job_hints(
-    record: &crate::app::OutputRecord,
+/// Context-sensitive keycaps for the Jobs window, most useful key first.
+fn jobs_hint_pairs(
+    record: Option<&crate::app::OutputRecord>,
     focus: JobsFocus,
     live: bool,
     follow: bool,
-) -> String {
+) -> Vec<(&'static str, &'static str)> {
     if focus == JobsFocus::List {
-        return "↑↓ select · Tab detail · x cancel · c clear · Esc close".to_owned();
+        let mut hints = vec![
+            ("↑↓", "select"),
+            ("Enter", "open"),
+            ("Esc", "close"),
+            ("Tab", "detail"),
+            ("x", "cancel"),
+            ("c", "clear finished"),
+        ];
+        if record.is_some_and(|record| record.queued) {
+            hints[3] = ("x", "dequeue");
+        }
+        return hints;
     }
     if live {
-        return if follow {
-            "● live — following · PgUp/PgDn scroll · Tab list · Esc back".to_owned()
+        let mut hints = vec![("Tab", "list"), ("Esc", "back"), ("PgUp/PgDn", "scroll")];
+        if follow {
+            hints.push(("↑", "pause follow"));
         } else {
-            "paused — End to follow · PgUp/PgDn scroll · Tab list · Esc back".to_owned()
-        };
+            hints.push(("End", "follow"));
+        }
+        if record.is_some_and(crate::app::OutputRecord::is_running) {
+            hints.push(("x", "cancel"));
+        }
+        return hints;
     }
-    if record.finished {
-        "j/k/PgUp/PgDn scroll · End · o raw · z JSON · Tab list · Esc back".to_owned()
-    } else {
-        "Tab list · Esc back".to_owned()
-    }
+    vec![
+        ("Tab", "list"),
+        ("Esc", "back"),
+        ("j/k", "scroll"),
+        ("o", "raw output"),
+        ("z", "JSON"),
+    ]
 }
 
 fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
@@ -1880,8 +1940,9 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("F2", "open the jobs window from any screen"),
     (
         "F2 (jobs)",
-        "↑↓ select · Tab detail · x cancel · c clear finished",
+        "↑↓ select · Enter open · Tab move focus · Esc back",
     ),
+    ("x / c (jobs)", "cancel running or queued · clear finished"),
     ("o / z (jobs)", "raw output · JSON for a finished job"),
     (
         "Space (search/confirm)",

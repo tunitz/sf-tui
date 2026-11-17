@@ -43,7 +43,7 @@ if "%*"=="apex run test --result-format json --code-coverage --class-names DemoT
   exit /b 0
 )
 if "%*"=="apex get test --test-run-id 08N000000000001 --result-format json --code-coverage --target-org test-scratch --json" (
-  echo {"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"81%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"codecoverage":[{"name":"Demo","percentage":"81%","numLinesCovered":17,"numLinesUncovered":4},{"name":"DemoHelper","percentage":"44%","numLinesCovered":4,"numLinesUncovered":5}]}}
+  echo {"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"60%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"coverage":{"coverage":[{"name":"DemoService","totalLines":20,"totalCovered":8,"coveredPercent":40},{"name":"DemoHelper","totalLines":10,"totalCovered":10,"coveredPercent":100}],"records":[],"summary":{"totalLines":30,"coveredLines":18,"testRunCoverage":"60%"}}}}
   exit /b 0
 )
 if "%*"=="project deploy report --job-id 0Af000000000001 --json" (

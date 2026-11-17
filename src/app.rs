@@ -226,6 +226,8 @@ struct TestReport {
     poll_after: Instant,
     attempts: u32,
     failures: u32,
+    /// Extra polls spent waiting for per-class coverage after a terminal outcome.
+    coverage_polls: u32,
 }
 
 /// Which pane of the Tests screen receives navigation.
@@ -1234,6 +1236,7 @@ impl App {
                                 poll_after: Instant::now() + Duration::from_secs(3),
                                 attempts: 0,
                                 failures: 0,
+                                coverage_polls: 0,
                             },
                         );
                         self.notice(format!(
@@ -1279,7 +1282,10 @@ impl App {
             return;
         }
         let run = test_results::parse(value, "");
-        if test_results::is_terminal_outcome(&run.outcome) {
+        let terminal = test_results::is_terminal_outcome(&run.outcome);
+        let coverage_pending = run.coverages.is_empty() && !run.coverage.is_empty();
+        let coverage_polls = report.coverage_polls;
+        if terminal && (!coverage_pending || coverage_polls >= 3) {
             let view = apex_result(&run);
             if let Some(record) = self.output_state.find_mut(record_id) {
                 record.result = Some(view);
@@ -1293,19 +1299,27 @@ impl App {
         }
         if let Some(report) = self.test_reports.get_mut(&record_id) {
             report.failures = 0;
+            if terminal {
+                report.coverage_polls = report.coverage_polls.saturating_add(1);
+                report.poll_after = Instant::now() + Duration::from_secs(2);
+            }
         }
         // Show progress in the running job while the org keeps working.
         if let Some(record) = self.output_state.find_mut(record_id)
             && let Some(view) = record.result.as_mut()
         {
-            view.summary = format!(
-                "test run {run_id} {}",
-                if run.outcome.is_empty() {
-                    "running"
-                } else {
-                    run.outcome.as_str()
-                }
-            );
+            view.summary = if terminal {
+                format!("test run {run_id} passed — collecting coverage")
+            } else {
+                format!(
+                    "test run {run_id} {}",
+                    if run.outcome.is_empty() {
+                        "running"
+                    } else {
+                        run.outcome.as_str()
+                    }
+                )
+            };
         }
     }
 
@@ -2988,7 +3002,17 @@ impl App {
                         JobsFocus::Detail => JobsFocus::List,
                     };
                 }
-                KeyCode::Enter => focus = JobsFocus::Detail,
+                KeyCode::Enter => {
+                    // Enter opens the selected job: focus its content and start at the top,
+                    // or at the live tail for a running job. Tab only moves focus.
+                    if focus == JobsFocus::List {
+                        focus = JobsFocus::Detail;
+                        reset_view = true;
+                        if live {
+                            follow = true;
+                        }
+                    }
+                }
                 KeyCode::Esc => {
                     if focus == JobsFocus::Detail {
                         focus = JobsFocus::List;
@@ -3542,7 +3566,10 @@ enum ApexReportAction {
 }
 
 fn apex_report_action(run: &test_results::TestRun) -> ApexReportAction {
-    if test_results::is_terminal_outcome(&run.outcome) || run.id.is_empty() {
+    // A terminal summary can arrive before the org finishes aggregating per-class coverage.
+    // Keep polling when the CLI reported a total but no class rows yet.
+    let coverage_pending = run.coverages.is_empty() && !run.coverage.is_empty();
+    if run.id.is_empty() || (test_results::is_terminal_outcome(&run.outcome) && !coverage_pending) {
         ApexReportAction::Final
     } else {
         ApexReportAction::Poll {
@@ -4223,6 +4250,7 @@ mod tests {
                 poll_after: Instant::now(),
                 attempts: 1,
                 failures: 0,
+                coverage_polls: 0,
             },
         );
         assert!(app.cancel_job(4));

@@ -24,7 +24,7 @@ case "$*" in
     printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Processing","testsRan":0,"passing":0,"failing":0,"skipped":0}}}'
     ;;
   "apex get test --test-run-id 08N000000000001 --result-format json --code-coverage --target-org test-scratch --json")
-    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"81%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"codecoverage":[{"name":"Demo","percentage":"81%","numLinesCovered":17,"numLinesUncovered":4},{"name":"DemoHelper","percentage":"44%","numLinesCovered":4,"numLinesUncovered":5}]}}'
+    printf '%s\n' '{"status":0,"result":{"testRunId":"08N000000000001","summary":{"outcome":"Passed","testsRan":2,"passing":2,"failing":0,"skipped":0,"testRunCoverage":"60%"},"tests":[{"fullName":"DemoTest.ok","outcome":"Pass"},{"fullName":"DemoTest.alsoOk","outcome":"Pass"}],"coverage":{"coverage":[{"name":"DemoService","totalLines":20,"totalCovered":8,"coveredPercent":40},{"name":"DemoHelper","totalLines":10,"totalCovered":10,"coveredPercent":100}],"records":[],"summary":{"totalLines":30,"coveredLines":18,"testRunCoverage":"60%"}}}}'
     ;;
   "project deploy report --job-id 0Af000000000001 --json" | "project deploy report --job-id 0Af000000000001 --target-org test-scratch --json")
     printf '%s\n' '{"status":0,"result":{"id":"0Af000000000001","status":"Succeeded","components":{"total":2,"successes":2,"failed":0}}}'

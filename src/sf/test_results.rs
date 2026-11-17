@@ -121,12 +121,159 @@ fn is_failure(outcome: &str) -> bool {
 
 fn collect_coverages(result: &Value) -> Vec<Coverage> {
     let mut coverages = Vec::new();
-    for key in ["codecoverage", "codeCoverage", "coverages", "coverage"] {
+    for key in ["codecoverage", "codeCoverage", "coverages"] {
         if let Some(items) = result.get(key).and_then(Value::as_array) {
             extend_coverages(&mut coverages, items);
         }
     }
+    // Newer CLI builds nest the per-class table under `coverage`:
+    //   "coverage": { "coverage": [ {name, totalLines, totalCovered, coveredPercent} ],
+    //                 "records": [ {ApexClassOrTrigger: {Name}, Coverage: {coveredLines, uncoveredLines}} ],
+    //                 "summary": {...} }
+    if let Some(coverage) = result.get("coverage") {
+        if let Some(items) = coverage.as_array() {
+            extend_coverages(&mut coverages, items);
+        } else {
+            if let Some(items) = coverage.get("coverage").and_then(Value::as_array) {
+                extend_class_coverages(&mut coverages, items);
+            }
+            if coverages.is_empty()
+                && let Some(records) = coverage.get("records").and_then(Value::as_array)
+            {
+                extend_record_coverages(&mut coverages, records);
+            }
+        }
+    }
     coverages
+}
+
+/// Class-level rows from `result.coverage.coverage`.
+fn extend_class_coverages(coverages: &mut Vec<Coverage>, items: &[Value]) {
+    for item in items {
+        let name = string_field(item, "name")
+            .or_else(|| string_field(item, "Name"))
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let (mut covered, mut total) = item
+            .get("lines")
+            .and_then(Value::as_object)
+            .map(|lines| {
+                let covered = lines
+                    .values()
+                    .filter(|hits| hits.as_u64().unwrap_or(0) > 0)
+                    .count();
+                (covered, lines.len())
+            })
+            .unwrap_or((0, 0));
+        if covered == 0 {
+            covered = count(
+                item.get("totalCovered")
+                    .or_else(|| item.get("numLinesCovered")),
+            );
+        }
+        if total == 0 {
+            total = count(item.get("totalLines"));
+        }
+        if total == 0 {
+            total = covered
+                + count(
+                    item.get("numLinesUncovered")
+                        .or_else(|| item.get("totalUncovered")),
+                );
+        }
+        let percent = coverage_percent_text(item)
+            .or_else(|| percent_from_counts(covered, total))
+            .unwrap_or_default();
+        push_coverage(
+            coverages,
+            Coverage {
+                name,
+                percent,
+                covered,
+                total,
+            },
+        );
+    }
+}
+
+/// Fallback: union the covered/uncovered line numbers of every test-method record per class.
+fn extend_record_coverages(coverages: &mut Vec<Coverage>, records: &[Value]) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut classes: BTreeMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = BTreeMap::new();
+    for record in records {
+        let name = record
+            .get("ApexClassOrTrigger")
+            .and_then(|value| string_field(value, "Name").or_else(|| string_field(value, "name")))
+            .or_else(|| string_field(record, "apexClassOrTriggerName"))
+            .unwrap_or_default();
+        if name.is_empty() {
+            continue;
+        }
+        let entry = classes.entry(name).or_default();
+        if let Some(coverage) = record.get("Coverage") {
+            for key in ["coveredLines", "CoveredLines"] {
+                if let Some(lines) = coverage.get(key).and_then(Value::as_array) {
+                    entry.0.extend(lines.iter().filter_map(Value::as_u64));
+                }
+            }
+            for key in ["uncoveredLines", "UncoveredLines"] {
+                if let Some(lines) = coverage.get(key).and_then(Value::as_array) {
+                    entry.1.extend(lines.iter().filter_map(Value::as_u64));
+                }
+            }
+        }
+    }
+    for (name, (covered_lines, uncovered_lines)) in classes {
+        let covered = covered_lines.len();
+        let total = covered + uncovered_lines.len();
+        let percent = percent_from_counts(covered, total).unwrap_or_default();
+        push_coverage(
+            coverages,
+            Coverage {
+                name,
+                percent,
+                covered,
+                total,
+            },
+        );
+    }
+}
+
+fn coverage_percent_text(item: &Value) -> Option<String> {
+    string_field(item, "percentage")
+        .or_else(|| string_field(item, "percent"))
+        .or_else(|| {
+            item.get("coveredPercent")
+                .or_else(|| item.get("percentage"))
+                .and_then(Value::as_f64)
+                .map(format_percent)
+        })
+        .or_else(|| {
+            string_field(item, "coveredPercent")
+                .and_then(|text| text.parse::<f64>().ok())
+                .map(format_percent)
+        })
+}
+
+fn format_percent(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{value:.0}%")
+    } else {
+        format!("{value:.1}%")
+    }
+}
+
+fn percent_from_counts(covered: usize, total: usize) -> Option<String> {
+    (total > 0).then(|| format_percent(covered as f64 * 100.0 / total as f64))
+}
+
+fn push_coverage(coverages: &mut Vec<Coverage>, entry: Coverage) {
+    if !coverages.iter().any(|existing| existing.name == entry.name) {
+        coverages.push(entry);
+    }
 }
 
 fn extend_coverages(coverages: &mut Vec<Coverage>, items: &[Value]) {
@@ -155,20 +302,18 @@ fn extend_coverages(coverages: &mut Vec<Coverage>, items: &[Value]) {
         if uncovered == 0 {
             uncovered = count(nested.and_then(|value| value.get("uncoveredLines")));
         }
-        let percent = string_field(item, "percentage")
-            .or_else(|| string_field(item, "percent"))
-            .or_else(|| item.get("percentage").map(Value::to_string))
-            .or_else(|| item.get("percent").map(Value::to_string))
+        let percent = coverage_percent_text(item)
+            .or_else(|| percent_from_counts(covered, covered + uncovered))
             .unwrap_or_default();
-        let entry = Coverage {
-            name,
-            percent,
-            covered,
-            total: covered + uncovered,
-        };
-        if !coverages.iter().any(|existing| existing.name == entry.name) {
-            coverages.push(entry);
-        }
+        push_coverage(
+            coverages,
+            Coverage {
+                name,
+                percent,
+                covered,
+                total: covered + uncovered,
+            },
+        );
     }
 }
 
@@ -246,6 +391,60 @@ mod tests {
         assert_eq!(run.failures.len(), 1);
         assert_eq!(run.coverages[0].name, "Demo");
         assert_eq!(run.coverages[0].total, 10);
+    }
+
+    #[test]
+    fn parses_the_cli_coverage_object_with_all_classes() {
+        let value = serde_json::json!({
+          "status": 0,
+          "result": {
+            "summary": {"outcome": "Passed", "testsRan": 1, "passing": 1, "failing": 0,
+                        "testRunCoverage": "60%", "orgWideCoverage": "62%"},
+            "tests": [{"FullName": "ContactTest.test1", "Outcome": "Pass"}],
+            "coverage": {
+              "coverage": [
+                {"id": "01p1", "name": "ContactService", "totalLines": 20, "totalCovered": 8, "coveredPercent": 40},
+                {"id": "01p2", "name": "ContactHelper", "totalLines": 10, "totalCovered": 10, "coveredPercent": 100}
+              ],
+              "records": [],
+              "summary": {"totalLines": 30, "coveredLines": 18, "orgWideCoverage": "62%", "testRunCoverage": "60%"}
+            }
+          }
+        });
+        let run = parse(&value, "sf apex get test");
+        assert_eq!(run.coverages.len(), 2);
+        let service = run
+            .coverages
+            .iter()
+            .find(|coverage| coverage.name == "ContactService")
+            .expect("service coverage");
+        assert_eq!(service.covered, 8);
+        assert_eq!(service.total, 20);
+        assert_eq!(service.percent, "40%");
+        assert_eq!(run.coverage, "60%");
+    }
+
+    #[test]
+    fn falls_back_to_unioning_test_method_coverage_records() {
+        let value = serde_json::json!({
+          "status": 0,
+          "result": {
+            "summary": {"outcome": "Passed", "testsRan": 2, "passing": 2, "failing": 0},
+            "coverage": {
+              "records": [
+                {"ApexClassOrTrigger": {"Name": "Svc"},
+                 "Coverage": {"coveredLines": [1, 2], "uncoveredLines": [3]}},
+                {"ApexClassOrTrigger": {"Name": "Svc"},
+                 "Coverage": {"coveredLines": [2], "uncoveredLines": [3, 4]}}
+              ]
+            }
+          }
+        });
+        let run = parse(&value, "sf apex get test");
+        assert_eq!(run.coverages.len(), 1);
+        assert_eq!(run.coverages[0].covered, 2);
+        assert_eq!(run.coverages[0].total, 4);
+        assert_eq!(run.coverages[0].percent, "50%");
     }
 
     #[test]
