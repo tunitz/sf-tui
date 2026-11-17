@@ -4,6 +4,7 @@
 //! thread-local matcher instead of allocating a matcher on every keystroke or frame.
 
 use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -52,26 +53,99 @@ impl SuggestionItem {
     }
 }
 
+/// Below this many candidates a linear substring scan is cheaper than building and probing an
+/// index, so the index stays inactive and `filter` behaves exactly as before.
+const INDEX_THRESHOLD: usize = 2_000;
+
+/// Bigram posting lists over the lowercase name/value/path of every candidate. A query of at
+/// least two bytes that occurs in any field must contain the query's first two bytes in that
+/// field, so its posting list is a superset of the real substring matches; the exact `contains`
+/// checks in `score_substring` still decide the final set and ranking.
+#[derive(Debug, Clone, Default)]
+struct SubstringIndex {
+    bigrams: HashMap<u16, Vec<u32>>,
+    active: bool,
+}
+
+impl SubstringIndex {
+    fn build(items: &[SuggestionItem]) -> Self {
+        if items.len() < INDEX_THRESHOLD {
+            return Self::default();
+        }
+        let mut bigrams: HashMap<u16, Vec<u32>> = HashMap::new();
+        let mut seen: HashSet<u16> = HashSet::new();
+        for (index, item) in items.iter().enumerate() {
+            seen.clear();
+            for field in [&item.name_lower, &item.value_lower, &item.path_lower] {
+                let bytes = field.as_bytes();
+                if bytes.len() < 2 {
+                    continue;
+                }
+                for pair in bytes.windows(2) {
+                    let key = u16::from(pair[0]) << 8 | u16::from(pair[1]);
+                    if seen.insert(key) {
+                        bigrams.entry(key).or_default().push(index as u32);
+                    }
+                }
+            }
+        }
+        Self {
+            bigrams,
+            active: true,
+        }
+    }
+
+    /// A sorted, deduplicated superset of indices that can match `query_lower`, or `None` when the
+    /// index is inactive (small set) or the query is too short to have a bigram.
+    fn candidates(&self, query_lower: &str) -> Option<Vec<u32>> {
+        if !self.active {
+            return None;
+        }
+        let bytes = query_lower.as_bytes();
+        if bytes.len() < 2 {
+            return None;
+        }
+        let key = u16::from(bytes[0]) << 8 | u16::from(bytes[1]);
+        let mut indices = self.bigrams.get(&key)?.clone();
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    }
+}
+
 /// A bounded, precomputed set of completion candidates.
 #[derive(Debug, Clone)]
 pub struct SuggestionSet {
     pub kind: SuggestionKind,
     pub items: Vec<SuggestionItem>,
+    index: SubstringIndex,
 }
 
 impl SuggestionSet {
     pub fn new(kind: SuggestionKind, values: Vec<String>) -> Self {
-        Self {
+        Self::with_items(
             kind,
-            items: values
+            values
                 .into_iter()
                 .map(|value| SuggestionItem::new(value, String::new()))
                 .collect(),
-        }
+        )
+    }
+
+    /// Build a set and its substring index together so the index always matches `items`.
+    fn with_items(kind: SuggestionKind, items: Vec<SuggestionItem>) -> Self {
+        let index = SubstringIndex::build(&items);
+        Self { kind, items, index }
     }
 
     /// Fast substring ranking first; fuzzy matching only fills remaining slots.
     pub fn filter(&self, query: &str, limit: usize) -> Vec<SuggestionItem> {
+        self.filter_with(query, limit, true)
+    }
+
+    /// `use_index = false` is the brute-force reference used by tests to prove the index returns
+    /// exactly the same items in exactly the same order.
+    fn filter_with(&self, query: &str, limit: usize, use_index: bool) -> Vec<SuggestionItem> {
         let query_lower = query.trim().to_ascii_lowercase();
         if query_lower.is_empty() {
             return self
@@ -83,28 +157,28 @@ impl SuggestionSet {
                 .collect();
         }
         let mut scored: Vec<(usize, i64)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for (index, item) in self.items.iter().enumerate() {
-            let mut score = if item.name_lower == query_lower {
-                100_000
-            } else if item.name_lower.contains(&query_lower) {
-                50_000
-            } else if item.value_lower.contains(&query_lower) {
-                20_000
-            } else if item.path_lower.contains(&query_lower) {
-                5_000
-            } else {
-                continue;
-            };
-            // A bare metadata type means "everything of this kind", which is far slower and
-            // broader than the concrete component the user is usually after. Keep exact type
-            // names at the top, but rank partial type matches below real components.
-            if item.path == "type" && item.name_lower != query_lower {
-                score -= 45_000;
-            }
-            if seen.insert(item.value.as_str()) {
-                scored.push((index, score));
-            }
+        let mut seen = HashSet::new();
+        let candidates = if use_index {
+            self.index.candidates(&query_lower)
+        } else {
+            None
+        };
+        if let Some(indices) = candidates {
+            self.score_substring(
+                indices
+                    .into_iter()
+                    .map(|index| (index as usize, &self.items[index as usize])),
+                &query_lower,
+                &mut scored,
+                &mut seen,
+            );
+        } else {
+            self.score_substring(
+                self.items.iter().enumerate(),
+                &query_lower,
+                &mut scored,
+                &mut seen,
+            );
         }
         if scored.len() < limit {
             let tokens: Vec<&str> = query_lower.split_whitespace().collect();
@@ -148,15 +222,48 @@ impl SuggestionSet {
             .map(|(index, _)| self.items[index].clone())
             .collect()
     }
+
+    /// Apply the exact substring tiers and dedup to the supplied item order. Callers pass either
+    /// the index's candidate superset (ascending index order) or every item; the result is the
+    /// same because both contain all real matches in original order.
+    fn score_substring<'a>(
+        &self,
+        items: impl Iterator<Item = (usize, &'a SuggestionItem)>,
+        query_lower: &str,
+        scored: &mut Vec<(usize, i64)>,
+        seen: &mut HashSet<&'a str>,
+    ) {
+        for (index, item) in items {
+            let mut score = if item.name_lower == query_lower {
+                100_000
+            } else if item.name_lower.contains(query_lower) {
+                50_000
+            } else if item.value_lower.contains(query_lower) {
+                20_000
+            } else if item.path_lower.contains(query_lower) {
+                5_000
+            } else {
+                continue;
+            };
+            // A bare metadata type means "everything of this kind", which is far slower and
+            // broader than the concrete component the user is usually after. Keep exact type
+            // names at the top, but rank partial type matches below real components.
+            if item.path == "type" && item.name_lower != query_lower {
+                score -= 45_000;
+            }
+            if seen.insert(item.value.as_str()) {
+                scored.push((index, score));
+            }
+        }
+    }
 }
 
 /// Apex classes from the project index, used by the test-run search screen.
 pub fn test_suggestions(all: &SuggestionSet, project: Option<&SfProject>) -> SuggestionSet {
     let mut remaining_bytes: u64 = 8 * 1024 * 1024;
-    SuggestionSet {
-        kind: SuggestionKind::Transfer,
-        items: all
-            .items
+    SuggestionSet::with_items(
+        SuggestionKind::Transfer,
+        all.items
             .iter()
             .filter(|item| {
                 let Some(name) = item.value.strip_prefix("ApexClass:") else {
@@ -183,7 +290,7 @@ pub fn test_suggestions(all: &SuggestionSet, project: Option<&SfProject>) -> Sug
             })
             .cloned()
             .collect(),
-    }
+    )
 }
 
 /// A scaffold command supported by the Create metadata shortcut.
@@ -279,15 +386,15 @@ pub fn create_template_for(label: &str) -> Option<&'static CreateTemplate> {
 }
 
 pub fn create_suggestions() -> SuggestionSet {
-    SuggestionSet {
-        kind: SuggestionKind::Create,
-        items: CREATE_TEMPLATES
+    SuggestionSet::with_items(
+        SuggestionKind::Create,
+        CREATE_TEMPLATES
             .iter()
             .map(|template| {
                 SuggestionItem::new(template.label, format!("sf {}", template.command.join(" ")))
             })
             .collect(),
-    }
+    )
 }
 
 const COMMON_METADATA_TYPES: &[&str] = &[
@@ -329,10 +436,7 @@ pub fn transfer_suggestions(project: Option<&SfProject>) -> SuggestionSet {
     let mut seen = std::collections::HashSet::new();
     items.retain(|item| seen.insert(item.value.clone()));
     items.sort_by(|left, right| left.value.cmp(&right.value));
-    SuggestionSet {
-        kind: SuggestionKind::Transfer,
-        items,
-    }
+    SuggestionSet::with_items(SuggestionKind::Transfer, items)
 }
 
 fn component_from_path(path: &str) -> Option<(String, String)> {
@@ -384,13 +488,13 @@ mod tests {
 
     #[test]
     fn project_components_out_rank_type_only_matches_and_keep_paths() {
-        let set = SuggestionSet {
-            kind: SuggestionKind::Transfer,
-            items: vec![
+        let set = SuggestionSet::with_items(
+            SuggestionKind::Transfer,
+            vec![
                 SuggestionItem::new("ApexClass", "type"),
                 SuggestionItem::new("ApexClass:Demo", "force-app/main/default/classes/Demo.cls"),
             ],
-        };
+        );
         let hits = set.filter("Demo", 5);
         assert_eq!(hits[0].value, "ApexClass:Demo");
         assert!(hits[0].path.ends_with("Demo.cls"));
@@ -399,13 +503,13 @@ mod tests {
 
     #[test]
     fn partial_type_matches_rank_below_concrete_components() {
-        let set = SuggestionSet {
-            kind: SuggestionKind::Transfer,
-            items: vec![
+        let set = SuggestionSet::with_items(
+            SuggestionKind::Transfer,
+            vec![
                 SuggestionItem::new("ApexClass", "type"),
                 SuggestionItem::new("ApexClass:Demo", "force-app/main/default/classes/Demo.cls"),
             ],
-        };
+        );
         let hits = set.filter("apex", 5);
         assert_eq!(hits[0].value, "ApexClass:Demo");
         // Typing the complete type name still offers the whole type first.
@@ -501,10 +605,10 @@ mod tests {
         let path = dir.path().join(relative);
         std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
         std::fs::write(&path, "@IsTest private class Helper {}").expect("write class");
-        let all = SuggestionSet {
-            kind: SuggestionKind::Transfer,
-            items: vec![SuggestionItem::new("ApexClass:Helper", relative)],
-        };
+        let all = SuggestionSet::with_items(
+            SuggestionKind::Transfer,
+            vec![SuggestionItem::new("ApexClass:Helper", relative)],
+        );
         let project = SfProject {
             root: dir.path().to_path_buf(),
             package_directories: Vec::new(),
@@ -514,6 +618,59 @@ mod tests {
         };
         let tests = test_suggestions(&all, Some(&project));
         assert_eq!(tests.items.len(), 1);
+    }
+
+    #[test]
+    fn indexed_filter_matches_full_scan_exactly() {
+        let mut items: Vec<SuggestionItem> = Vec::new();
+        // Well above INDEX_THRESHOLD so the index is active, with duplicates, a type-only entry,
+        // UTF-8 and short names to exercise the fallback and dedup paths.
+        for index in 0..(INDEX_THRESHOLD + 400) {
+            let kind = ["ApexClass", "Flow", "CustomObject"][index % 3];
+            let name = format!("DemoController{index}");
+            items.push(SuggestionItem::new(
+                format!("{kind}:{name}"),
+                format!("force-app/main/default/classes/{name}.cls"),
+            ));
+            if index % 7 == 0 {
+                items.push(SuggestionItem::new(kind, "type"));
+            }
+        }
+        items.push(SuggestionItem::new(
+            "ApexClass:Café",
+            "force-app/classes/Café.cls",
+        ));
+        items.push(SuggestionItem::new(
+            "ApexClass:A",
+            "force-app/classes/A.cls",
+        ));
+        let set = SuggestionSet::with_items(SuggestionKind::Transfer, items);
+        assert!(set.index.active, "test set must be large enough to index");
+
+        for query in [
+            "Demo",
+            "apex",
+            "ApexClass",
+            "Flow",
+            "Controller",
+            "test",
+            "a",
+            "Café",
+            "zzzz",
+            "Demo Controller",
+            "  DEMO  ",
+            "",
+            "A",
+        ] {
+            for limit in [1, 5, 20, 200] {
+                let indexed = set.filter(query, limit);
+                let scanned = set.filter_with(query, limit, false);
+                assert_eq!(
+                    indexed, scanned,
+                    "indexed result diverged for query {query:?} limit {limit}"
+                );
+            }
+        }
     }
 
     #[test]

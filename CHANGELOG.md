@@ -4,6 +4,26 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.19] - 2026-11-17
+
+### Added
+
+- Rendered result and job-detail lines are memoized with a bounded cache, and component-lookup and suggestion-filtering use indexes, so large outputs and large projects stay responsive.
+- Visible notices when streamed output or JSON rows are dropped by the retention caps.
+
+### Changed
+
+- The UI event channel is bounded and streamed CLI lines are batched at the sender, replacing unbounded per-line events with backpressure.
+- Footer keycaps and the `?` help now come from one keymap table; `Enter` shows a single, state-aware hint (`search` or `confirm`).
+- Notices and errors expire after five seconds, so key hints return in narrow terminals.
+- Truncation widths now follow the terminal width. Chip colors come from structured result state rather than label text, and `red`/`yellow` are no longer selectable accents (they fall back to cyan).
+- The Tests screen guarantees the test list a usable minimum and only shows coverage when there is room.
+
+### Fixed
+
+- Shutdown closes the event channel before joining jobs, preventing a full channel from deadlocking exit.
+- `active_job_label` prefers a running user job instead of an arbitrary highest-id job.
+
 ## [0.1.18] - 2026-11-17
 
 ### Added

@@ -63,7 +63,7 @@ async fn stub_version_probe_returns_synthetic_version() {
 #[tokio::test]
 async fn runner_streams_stdout_and_reports_completion() {
     assert_synthetic_environment();
-    let (tx, mut rx) = mpsc::unbounded_channel::<SfEvent>();
+    let (tx, mut rx) = mpsc::channel::<SfEvent>(16);
     let argv = vec!["org".to_owned(), "list".to_owned(), "--json".to_owned()];
     let job = runner::spawn_sf(&stub_installation(), &argv, 42, tx).expect("spawn");
     let mut finished = None;
@@ -72,7 +72,12 @@ async fn runner_streams_stdout_and_reports_completion() {
         while let Some(event) = rx.recv().await {
             match event {
                 SfEvent::Line(line) if line.stream == OutputStream::Stdout => {
-                    saw_stdout_line = line.text.contains("test-scratch");
+                    saw_stdout_line |= line.text.contains("test-scratch");
+                }
+                SfEvent::Lines(lines) => {
+                    saw_stdout_line |= lines.iter().any(|line| {
+                        line.stream == OutputStream::Stdout && line.text.contains("test-scratch")
+                    });
                 }
                 SfEvent::Finished { job_id, outcome } => {
                     finished = Some((job_id, outcome));
@@ -201,6 +206,8 @@ fn every_screen_renders_without_panicking() {
         json: Some(serde_json::json!({"result":{"status":"ok"}})),
         result: None,
         pending_report: false,
+        render_revision: 0,
+        lines_truncated: false,
     });
     app.output_state.records.push(OutputRecord {
         id: 2,
@@ -235,6 +242,8 @@ fn every_screen_renders_without_panicking() {
             sections: Vec::new(),
         }),
         pending_report: false,
+        render_revision: 0,
+        lines_truncated: false,
     });
     for (width, height) in [(120, 40), (80, 24), (60, 16), (48, 12)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -344,4 +353,124 @@ fn prompt_overlay_renders_with_a_cursor() {
         .map(|cell| cell.symbol())
         .collect::<String>();
     assert!(rendered.contains("test-scratch"));
+}
+
+#[test]
+fn narrow_terminal_truncates_long_org_names_without_panicking() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup {
+            installation: None,
+            version: None,
+            current_org: None,
+            notices: Vec::new(),
+        },
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.org_state.orgs.push(sftui::sf::org::OrgSummary {
+        username: "a-very-long-username-that-exceeds-the-narrow-pane@example.com".to_owned(),
+        aliases: vec!["an-extremely-long-alias-that-will-not-fit".to_owned()],
+        org_id: "00D000000000000".to_owned(),
+        is_default: false,
+        is_devhub: false,
+        connected_status: String::new(),
+        instance_url: String::new(),
+        scratch: true,
+    });
+    app.modal = Some(sftui::app::Modal::SwitchOrg { selected: 0 });
+    let mut terminal = Terminal::new(TestBackend::new(48, 12)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        rendered.contains('…'),
+        "truncation marker missing: {rendered}"
+    );
+}
+
+#[test]
+fn tests_screen_with_coverage_renders_at_small_and_roomy_sizes() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup {
+            installation: None,
+            version: None,
+            current_org: None,
+            notices: Vec::new(),
+        },
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.tab = sftui::app::Tab::Tests;
+    app.test_search
+        .results
+        .push(sftui::sf::metadata::SuggestionItem::new(
+            "VisibleTestClass",
+            "VisibleTestClass.cls",
+        ));
+    app.output_state.records.push(OutputRecord {
+        id: 1,
+        command: "sf apex run test --json".to_owned(),
+        purpose: "apex tests".to_owned(),
+        task: sftui::app::TaskKind::Tests,
+        executable: "sf".into(),
+        argv: vec!["apex".to_owned()],
+        lines: Vec::new(),
+        line_bytes: 0,
+        exit_code: Some(0),
+        finished: true,
+        queued: false,
+        started_at: Some(Instant::now()),
+        ended_at: Some(Instant::now()),
+        json: None,
+        result: Some(sftui::app::ResultView {
+            kind: sftui::app::ResultKind::ApexTests,
+            title: "Apex tests".to_owned(),
+            status: "Passed".to_owned(),
+            ok: true,
+            summary: "2 run · 2 passed · 0 failed · coverage 81%".to_owned(),
+            items: Vec::new(),
+            coverage: (0..8usize)
+                .map(|index| sftui::app::ResultItem {
+                    ok: true,
+                    label: format!("Demo{index}"),
+                    detail: format!("{}% · {}/10 lines", 40 + index * 5, 4 + index),
+                    progress: Some((4 + index, 10)),
+                })
+                .collect(),
+            sections: Vec::new(),
+        }),
+        pending_report: false,
+        render_revision: 0,
+        lines_truncated: false,
+    });
+    for (width, height) in [(48, 12), (80, 24)] {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            rendered.to_lowercase().contains("coverage"),
+            "coverage pane missing at {width}x{height}"
+        );
+        assert!(
+            rendered.contains("VisibleTestClass"),
+            "test list has no usable rows at {width}x{height}"
+        );
+    }
 }

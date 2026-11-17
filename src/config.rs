@@ -37,7 +37,8 @@ const CONFIG_FILE: &str = "config.toml";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Theme {
-    /// Name of the accent color: cyan, green, yellow, blue, magenta or red.
+    /// Accent color: cyan (default), green, blue or magenta. Red/yellow fall back to cyan so they
+    /// stay reserved for error/warning status.
     pub accent: String,
 }
 

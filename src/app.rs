@@ -1,6 +1,6 @@
 //! Application state, key dispatch and ownership of background SF jobs.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use serde_json::Value;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::JoinHandle;
 
 use crate::clipboard;
@@ -21,6 +21,7 @@ use crate::sf::project::{self, SfProject};
 use crate::sf::runner::{JobLine, ProcessOutcome, RunningJob, SfEvent};
 use crate::sf::test_results;
 use crate::sf::{self, Startup};
+use crate::ui::RenderCache;
 use crate::view::{apex_result, generic_result, transfer_result};
 
 /// Screens shown in the tab bar. Setup is added only when no CLI was found.
@@ -383,9 +384,24 @@ pub struct OutputRecord {
     pub json: Option<Value>,
     pub result: Option<ResultView>,
     pub pending_report: bool,
+    /// Incremented whenever rendered content (lines, result or JSON) changes so the UI can cache
+    /// its built line vectors without ever showing stale output.
+    pub render_revision: u64,
+    /// Set when streamed lines were dropped by the retention caps; the UI shows a faint notice.
+    pub lines_truncated: bool,
 }
 
 impl OutputRecord {
+    /// Mark rendered content as changed so cached line vectors are rebuilt on the next draw.
+    pub(crate) fn bump_render_revision(&mut self) {
+        self.render_revision = self.render_revision.wrapping_add(1);
+    }
+
+    /// Whether streamed output was dropped by the per-record retention caps.
+    pub fn lines_truncated(&self) -> bool {
+        self.lines_truncated
+    }
+
     pub fn label(&self) -> String {
         let state = if self.queued {
             "queued".to_owned()
@@ -524,6 +540,8 @@ impl OutputState {
             json: None,
             result: None,
             pending_report: false,
+            render_revision: 0,
+            lines_truncated: false,
         });
         if self.records.len() > MAX_RECORDS {
             self.records.remove(0);
@@ -706,6 +724,12 @@ struct PendingJob {
 }
 
 const MAX_PARALLEL_JOBS: usize = 4;
+/// Bounded capacity for the UI event channel. More than enough to absorb a burst of batched
+/// stream events while giving the producer backpressure instead of unbounded memory growth.
+const EVENT_CHANNEL_CAPACITY: usize = 1_024;
+
+/// How long a notice or error stays visible before the footer returns to its key hints.
+const STATUS_TTL: Duration = Duration::from_secs(5);
 
 /// Root application state.
 pub struct App {
@@ -718,6 +742,8 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub status_error: bool,
+    /// When `status` was last set, so notices and errors expire back to the key hints.
+    status_set_at: Option<Instant>,
     pub org_state: OrgState,
     pub deploy_state: DeployState,
     pub transfer_search: TransferSearchState,
@@ -736,8 +762,8 @@ pub struct App {
     search_task: Option<JoinHandle<()>>,
     transfer_search_generation: u64,
     test_search_generation: u64,
-    event_tx: UnboundedSender<AppEvent>,
-    event_rx: UnboundedReceiver<AppEvent>,
+    event_tx: Sender<AppEvent>,
+    event_rx: Receiver<AppEvent>,
     jobs: HashMap<u64, JobEntry>,
     pending_jobs: VecDeque<PendingJob>,
     deploy_reports: HashMap<u64, DeployReport>,
@@ -747,11 +773,26 @@ pub struct App {
     pub(crate) jobs_detail_height: Cell<u16>,
     /// Coverage rows visible at the last Tests draw, used to clamp table scrolling.
     pub(crate) tests_coverage_rows: Cell<usize>,
+    /// Memoized result/detail line vectors, keyed by record revision, width and render flags.
+    pub(crate) render_cache: RefCell<RenderCache>,
+}
+
+/// Send a UI event from any context without blocking the UI thread. In a runtime the send is
+/// awaited on a short-lived task so backpressure is respected; outside one (unit tests) the
+/// bounded channel has ample room and `blocking_send` cannot stall an async worker.
+fn emit_event(tx: Sender<AppEvent>, event: AppEvent) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _ = tx.send(event).await;
+        });
+    } else {
+        let _ = tx.blocking_send(event);
+    }
 }
 
 impl App {
     pub fn new(startup: Startup, config: Config, config_dir: PathBuf) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let mut app = Self {
             startup,
             config,
@@ -766,6 +807,7 @@ impl App {
             should_quit: false,
             status: String::new(),
             status_error: false,
+            status_set_at: None,
             org_state: OrgState::default(),
             deploy_state: DeployState::default(),
             transfer_search: TransferSearchState::new(false),
@@ -793,9 +835,10 @@ impl App {
             next_job_id: 1,
             jobs_detail_height: Cell::new(10),
             tests_coverage_rows: Cell::new(6),
+            render_cache: RefCell::new(RenderCache::default()),
         };
         app.start_project_scan();
-        app.status = "Starting sftui — the interface is ready while sf is probed".to_owned();
+        app.notice("Starting sftui — the interface is ready while sf is probed");
         app.start_probe();
         app
     }
@@ -807,7 +850,7 @@ impl App {
             let (probe_tx, mut probe_rx) = mpsc::unbounded_channel::<sf::StartupEvent>();
             let probe = tokio::spawn(sf::probe(config_dir, probe_tx));
             while let Some(event) = probe_rx.recv().await {
-                if app_tx.send(AppEvent::Startup(event)).is_err() {
+                if app_tx.send(AppEvent::Startup(event)).await.is_err() {
                     break;
                 }
             }
@@ -826,12 +869,12 @@ impl App {
 
     pub fn accent(&self) -> ratatui::style::Color {
         use ratatui::style::Color;
+        // Red and yellow are reserved for error/warning status, so a configured red or yellow
+        // accent falls back to cyan to keep those signals unambiguous.
         match self.config.theme.accent.to_ascii_lowercase().as_str() {
             "green" => Color::Green,
-            "yellow" => Color::Yellow,
             "blue" => Color::Blue,
             "magenta" => Color::Magenta,
-            "red" => Color::Red,
             _ => Color::Cyan,
         }
     }
@@ -839,11 +882,27 @@ impl App {
     pub fn notice(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.status_error = false;
+        self.status_set_at = Some(Instant::now());
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
         self.status = text.into();
         self.status_error = true;
+        self.status_set_at = Some(Instant::now());
+    }
+
+    /// Clear an expired status so the footer key hints reappear (notably in Tiny density, where
+    /// the single footer row is replaced by status while one is active).
+    fn expire_status(&mut self, now: Instant) {
+        if !self.status.is_empty()
+            && self
+                .status_set_at
+                .is_some_and(|set_at| now.saturating_duration_since(set_at) >= STATUS_TTL)
+        {
+            self.status.clear();
+            self.status_error = false;
+            self.status_set_at = None;
+        }
     }
 
     /// Discover and enumerate the project without blocking the first frame.
@@ -874,7 +933,7 @@ impl App {
                     error: Some(format!("project scan failed: {error}")),
                 },
             };
-            let _ = tx.send(event);
+            let _ = tx.send(event).await;
         });
     }
 
@@ -1009,23 +1068,44 @@ impl App {
                     self.notice(text);
                 }
             }
-            AppEvent::Sf(SfEvent::Line(line)) => {
-                if let Some(record) = self.output_state.find_mut(line.job_id)
-                    && record.lines.len() < MAX_LINES_PER_RECORD
-                    && record.line_bytes.saturating_add(line.text.len()) <= MAX_RECORD_BYTES
-                    && !is_secret_command(&record.command)
-                {
-                    record.line_bytes = record.line_bytes.saturating_add(line.text.len());
-                    record.lines.push(line);
-                }
-            }
+            AppEvent::Sf(SfEvent::Line(line)) => self.append_stream_lines(std::iter::once(line)),
+            AppEvent::Sf(SfEvent::Lines(lines)) => self.append_stream_lines(lines),
             AppEvent::Sf(SfEvent::Finished { job_id, outcome }) => {
                 self.finish_job(job_id, outcome);
             }
         }
     }
 
+    /// Append streamed lines to each job's record, applying the same per-line caps regardless of
+    /// whether the sender delivered one line or a coalesced batch.
+    fn append_stream_lines(&mut self, lines: impl IntoIterator<Item = JobLine>) {
+        for line in lines {
+            let Some(record) = self.output_state.find_mut(line.job_id) else {
+                continue;
+            };
+            if is_secret_command(&record.command) {
+                // Redacted by design, not truncation: never show a retention notice for it.
+                continue;
+            }
+            if record.lines.len() >= MAX_LINES_PER_RECORD
+                || record.line_bytes.saturating_add(line.text.len()) > MAX_RECORD_BYTES
+            {
+                if !record.lines_truncated {
+                    record.lines_truncated = true;
+                    record.bump_render_revision();
+                }
+                continue;
+            }
+            record.line_bytes = record.line_bytes.saturating_add(line.text.len());
+            record.lines.push(line);
+            record.bump_render_revision();
+        }
+    }
+
     fn finish_job(&mut self, job_id: u64, outcome: ProcessOutcome) {
+        if let Some(record) = self.output_state.find_mut(job_id) {
+            record.bump_render_revision();
+        }
         let Some(purpose) = self.jobs.get(&job_id).map(|entry| entry.purpose.clone()) else {
             // The job was cancelled and removed from the map. Keep its cancellation status on
             // the output row instead of letting a late completion reclassify it.
@@ -1196,6 +1276,7 @@ impl App {
                 let view =
                     transfer_result(false, &report, Some(&report.id), &options.metadata_names);
                 if let Some(record) = self.output_state.find_mut(transfer_job) {
+                    record.bump_render_revision();
                     record.result = Some(view);
                 }
                 if complete {
@@ -1276,6 +1357,9 @@ impl App {
 
     /// Apply one polled `apex get test` response: finish the record or keep polling.
     fn apply_test_report(&mut self, record_id: u64, value: &Value, succeeded: bool) {
+        if let Some(record) = self.output_state.find_mut(record_id) {
+            record.bump_render_revision();
+        }
         let Some(report) = self.test_reports.get(&record_id) else {
             return;
         };
@@ -1340,6 +1424,9 @@ impl App {
 
     /// Stop polling a started test run and mark its row as failed rather than a false success.
     fn abandon_test_report(&mut self, record_id: u64, reason: &str) {
+        if let Some(record) = self.output_state.find_mut(record_id) {
+            record.bump_render_revision();
+        }
         self.test_reports.remove(&record_id);
         if let Some(record) = self.output_state.find_mut(record_id) {
             record.pending_report = false;
@@ -1362,6 +1449,7 @@ impl App {
 
     pub async fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
+        self.expire_status(Instant::now());
         if self
             .search_task
             .as_ref()
@@ -1419,6 +1507,7 @@ impl App {
             if report.attempts >= 150 {
                 self.deploy_reports.remove(&record_id);
                 if let Some(record) = self.output_state.find_mut(record_id) {
+                    record.bump_render_revision();
                     record.exit_code = Some(1);
                     record.ended_at = Some(Instant::now());
                     if let Some(view) = record.result.as_mut() {
@@ -1527,6 +1616,8 @@ impl App {
                 executable.clone(),
                 argv.clone(),
             );
+            // A recycled record id must not pick up a stale cached line vector.
+            self.render_cache.borrow_mut().clear();
         }
 
         if is_user_purpose(&purpose) && self.running_user_jobs() >= MAX_PARALLEL_JOBS {
@@ -1546,6 +1637,7 @@ impl App {
 
     fn start_job(&mut self, id: u64, executable: PathBuf, argv: Vec<String>, purpose: JobPurpose) {
         if let Some(record) = self.output_state.find_mut(id) {
+            record.bump_render_revision();
             record.queued = false;
             record.started_at = Some(Instant::now());
         }
@@ -1621,6 +1713,9 @@ impl App {
     }
 
     fn cancel_job(&mut self, id: u64) -> bool {
+        if let Some(record) = self.output_state.find_mut(id) {
+            record.bump_render_revision();
+        }
         let queued = self
             .pending_jobs
             .iter()
@@ -1683,6 +1778,11 @@ impl App {
 
     /// Cancel every tracked job. Used during shutdown and by the quit confirmation.
     pub async fn shutdown(&mut self) {
+        // Closing the receiver makes any in-flight bounded-channel sends fail immediately with a
+        // SendError instead of blocking forever while we await the jobs that are sending them.
+        // Dropping their final events during exit is correct; without this, a full channel can
+        // deadlock shutdown because the loop no longer drains `event_rx`.
+        self.event_rx.close();
         self.pending_jobs.clear();
         let jobs = std::mem::take(&mut self.jobs);
         for (_, entry) in jobs {
@@ -1705,13 +1805,17 @@ impl App {
     }
 
     pub fn active_job_label(&self) -> Option<String> {
-        if self.jobs.is_empty() {
-            return self.pending_jobs.front().map(|_| "queued".to_owned());
-        }
-        self.jobs
-            .iter()
-            .max_by_key(|(id, _)| **id)
-            .map(|(_, entry)| entry.purpose.label().to_owned())
+        choose_active_job(
+            self.jobs.iter().map(|(id, entry)| {
+                (
+                    *id,
+                    entry.purpose.label(),
+                    !entry.job.is_finished(),
+                    is_user_purpose(&entry.purpose),
+                )
+            }),
+            !self.pending_jobs.is_empty(),
+        )
     }
 
     /// Handle one key press. Returns true when the application should exit.
@@ -1823,6 +1927,7 @@ impl App {
         self.tab = tab;
         // Key hints live in the footer; navigation itself needs no status text.
         self.status.clear();
+        self.status_set_at = None;
     }
 
     fn go_home(&mut self) {
@@ -1885,7 +1990,7 @@ impl App {
                     error: true,
                 },
             };
-            let _ = tx.send(event);
+            emit_event(tx, event);
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn_blocking(move || send_result(clipboard::copy(&text)));
@@ -2006,13 +2111,15 @@ impl App {
             let results = tokio::task::spawn_blocking(move || set.filter(&filter_query, 20))
                 .await
                 .unwrap_or_default();
-            let _ = tx.send(AppEvent::TransferResults {
-                kind,
-                retrieve,
-                query,
-                results,
-                generation,
-            });
+            let _ = tx
+                .send(AppEvent::TransferResults {
+                    kind,
+                    retrieve,
+                    query,
+                    results,
+                    generation,
+                })
+                .await;
         }));
         self.notice("Searching…");
     }
@@ -2132,17 +2239,21 @@ impl App {
             let built = tokio::task::spawn_blocking(move || build_suggestion_sets(project)).await;
             match built {
                 Ok((all, tests)) => {
-                    let _ = tx.send(AppEvent::Suggestions {
-                        root: cache_root,
-                        all,
-                        tests,
-                    });
+                    let _ = tx
+                        .send(AppEvent::Suggestions {
+                            root: cache_root,
+                            all,
+                            tests,
+                        })
+                        .await;
                 }
                 Err(_) => {
-                    let _ = tx.send(AppEvent::Notice {
-                        text: "Could not build the component index".to_owned(),
-                        error: true,
-                    });
+                    let _ = tx
+                        .send(AppEvent::Notice {
+                            text: "Could not build the component index".to_owned(),
+                            error: true,
+                        })
+                        .await;
                 }
             }
         });
@@ -3683,6 +3794,42 @@ fn task_for_purpose(purpose: &JobPurpose) -> Option<TaskKind> {
     }
 }
 
+/// Pick the job whose label best describes current activity: a running user job first, then any
+/// running job, then a queued job, then the newest finished job. Poll/report jobs must not steal
+/// the label from the user command that is actually running.
+fn choose_active_job(
+    jobs: impl Iterator<Item = (u64, &'static str, bool, bool)>,
+    queued: bool,
+) -> Option<String> {
+    let entries: Vec<(u64, &'static str, bool, bool)> = jobs.collect();
+    let newest = |candidates: &[(u64, &'static str, bool, bool)]| {
+        candidates
+            .iter()
+            .max_by_key(|(id, _, _, _)| *id)
+            .map(|(_, label, _, _)| (*label).to_owned())
+    };
+    let running_user: Vec<_> = entries
+        .iter()
+        .copied()
+        .filter(|(_, _, running, user)| *running && *user)
+        .collect();
+    if let Some(label) = newest(&running_user) {
+        return Some(label);
+    }
+    let running: Vec<_> = entries
+        .iter()
+        .copied()
+        .filter(|(_, _, running, _)| *running)
+        .collect();
+    if let Some(label) = newest(&running) {
+        return Some(label);
+    }
+    if queued {
+        return Some("queued".to_owned());
+    }
+    newest(&entries)
+}
+
 fn is_user_purpose(purpose: &JobPurpose) -> bool {
     matches!(
         purpose,
@@ -3827,6 +3974,71 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    #[tokio::test]
+    async fn shutdown_closes_the_event_channel() {
+        let mut app = App::new(
+            Startup {
+                installation: None,
+                version: None,
+                current_org: None,
+                notices: Vec::new(),
+            },
+            Config::default(),
+            std::path::PathBuf::from("/tmp/sftui-shutdown-test"),
+        );
+        assert!(!app.event_rx.is_closed());
+        app.shutdown().await;
+        assert!(app.event_rx.is_closed());
+        // A send after shutdown must fail immediately instead of blocking on a full channel,
+        // which is what used to deadlock when the process tasks were being joined.
+        let late = app.event_tx.send(AppEvent::Notice {
+            text: "late".to_owned(),
+            error: false,
+        });
+        let result = tokio::time::timeout(Duration::from_secs(1), late).await;
+        assert!(matches!(result, Ok(Err(_))));
+    }
+
+    #[test]
+    fn status_expires_after_its_time_to_live() {
+        let mut app = test_app();
+        app.notice("transient note");
+        assert_eq!(app.status, "transient note");
+        assert!(!app.status_error);
+
+        // Before the TTL elapses the notice is still visible.
+        app.expire_status(Instant::now() + STATUS_TTL - Duration::from_millis(1));
+        assert_eq!(app.status, "transient note");
+
+        // At the TTL it clears, so the footer key hints reappear.
+        app.expire_status(Instant::now() + STATUS_TTL);
+        assert!(app.status.is_empty());
+    }
+
+    #[test]
+    fn accent_never_collides_with_error_or_warning_colours() {
+        use ratatui::style::Color;
+        let mut app = test_app();
+        for value in ["red", "RED", "yellow", "Yellow", "unknown"] {
+            app.config.theme.accent = value.to_owned();
+            assert_eq!(app.accent(), Color::Cyan, "accent {value} must fall back");
+        }
+        app.config.theme.accent = "green".to_owned();
+        assert_eq!(app.accent(), Color::Green);
+        app.config.theme.accent = "magenta".to_owned();
+        assert_eq!(app.accent(), Color::Magenta);
+    }
+
+    #[test]
+    fn set_tab_clears_status_and_its_timestamp() {
+        let mut app = test_app();
+        app.error("a failure");
+        assert!(app.status_error);
+        app.set_tab(Tab::Tests);
+        assert!(app.status.is_empty());
+        assert!(app.status_set_at.is_none());
+    }
+
     #[test]
     fn menu_keys_open_screens_and_escape_returns_to_previous() {
         let mut app = test_app();
@@ -3890,7 +4102,71 @@ mod tests {
             json: None,
             result: None,
             pending_report: false,
+            render_revision: 0,
+            lines_truncated: false,
         }
+    }
+
+    #[test]
+    fn active_job_label_prefers_a_running_user_job() {
+        // (id, label, running, is_user_purpose)
+        let jobs = [
+            (1, "transfer", true, true),
+            (2, "apex report", false, false), // newest id, but a finished poll job
+            (3, "orgs", true, false),         // running, but not a user command
+        ];
+        assert_eq!(
+            choose_active_job(jobs.into_iter(), false).as_deref(),
+            Some("transfer")
+        );
+        // Without a running user job, any running job wins.
+        assert_eq!(
+            choose_active_job(
+                [(1, "transfer", false, true), (2, "orgs", true, false)].into_iter(),
+                false
+            )
+            .as_deref(),
+            Some("orgs")
+        );
+        // A queued job outranks finished ones; otherwise the newest finished job is shown.
+        assert_eq!(
+            choose_active_job([(1, "transfer", false, true)].into_iter(), true).as_deref(),
+            Some("queued")
+        );
+        assert_eq!(
+            choose_active_job(
+                [(1, "transfer", false, true), (2, "orgs", false, false)].into_iter(),
+                false
+            )
+            .as_deref(),
+            Some("orgs")
+        );
+        assert_eq!(choose_active_job([].into_iter(), false), None);
+    }
+
+    #[test]
+    fn streamed_lines_beyond_the_byte_cap_are_flagged_as_truncated() {
+        let mut app = test_app();
+        app.output_state.begin(
+            1,
+            "sf test".to_owned(),
+            "tests",
+            TaskKind::Tests,
+            PathBuf::from("sf"),
+            Vec::new(),
+        );
+        if let Some(record) = app.output_state.find_mut(1) {
+            record.line_bytes = MAX_RECORD_BYTES;
+        }
+        let before = app.output_state.records[0].render_revision;
+        app.append_stream_lines(std::iter::once(JobLine {
+            job_id: 1,
+            stream: crate::sf::runner::OutputStream::Stdout,
+            text: "overflow".to_owned(),
+        }));
+        assert!(app.output_state.records[0].lines_truncated());
+        assert!(app.output_state.records[0].lines.is_empty());
+        assert!(app.output_state.records[0].render_revision > before);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -31,7 +31,10 @@ pub struct JobLine {
 /// Everything a background process reports to the application.
 #[derive(Debug)]
 pub enum SfEvent {
+    /// A single streamed line (kept for callers that do not batch).
     Line(JobLine),
+    /// Several streamed lines coalesced into one event to spare the event loop.
+    Lines(Vec<JobLine>),
     Finished {
         job_id: u64,
         outcome: ProcessOutcome,
@@ -41,6 +44,10 @@ pub enum SfEvent {
 /// Upper bound for retained stdout/stderr per process. The UI also caps streamed lines.
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_LINE_CHARS: usize = 4_000;
+/// Flush a partially filled line batch when it reaches this size or this long has elapsed, so
+/// many CLI lines become one event without making live output wait for the process to end.
+const LINE_BATCH_SIZE: usize = 64;
+const LINE_BATCH_INTERVAL: Duration = Duration::from_millis(40);
 
 /// Captured result of a finished process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +132,7 @@ pub fn spawn_sf(
     installation: &SfInstallation,
     argv: &[String],
     job_id: u64,
-    events: UnboundedSender<SfEvent>,
+    events: Sender<SfEvent>,
 ) -> Result<RunningJob, RunnerError> {
     spawn_sf_mapped(installation, argv, job_id, events, std::convert::identity)
 }
@@ -135,7 +142,7 @@ pub fn spawn_sf_mapped<E, F>(
     installation: &SfInstallation,
     argv: &[String],
     job_id: u64,
-    events: UnboundedSender<E>,
+    events: Sender<E>,
     map: F,
 ) -> Result<RunningJob, RunnerError>
 where
@@ -158,7 +165,7 @@ pub fn spawn<E, F>(
     executable: &Path,
     argv: &[String],
     job_id: u64,
-    events: UnboundedSender<E>,
+    events: Sender<E>,
     map: F,
 ) -> Result<RunningJob, RunnerError>
 where
@@ -172,7 +179,7 @@ pub fn spawn_with_env<E, F>(
     executable: &Path,
     argv: &[String],
     job_id: u64,
-    events: UnboundedSender<E>,
+    events: Sender<E>,
     map: F,
     env: &[(&str, &str)],
 ) -> Result<RunningJob, RunnerError>
@@ -229,10 +236,12 @@ where
             stdout: out,
             stderr: err,
         };
-        let _ = events.send(map(SfEvent::Finished {
-            job_id,
-            outcome: outcome.clone(),
-        }));
+        let _ = events
+            .send(map(SfEvent::Finished {
+                job_id,
+                outcome: outcome.clone(),
+            }))
+            .await;
         outcome
     });
     Ok(RunningJob {
@@ -253,7 +262,7 @@ async fn read_stream<R, E, F>(
     pipe: R,
     job_id: u64,
     stream: OutputStream,
-    events: UnboundedSender<E>,
+    events: Sender<E>,
     map: F,
 ) -> String
 where
@@ -263,23 +272,50 @@ where
 {
     let mut captured = String::new();
     let mut lines = BufReader::new(pipe).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if captured.len() < MAX_CAPTURE_BYTES {
-            captured.push_str(&line);
-            captured.push('\n');
+    let mut batch: Vec<JobLine> = Vec::with_capacity(LINE_BATCH_SIZE);
+    let mut flush = tokio::time::interval(LINE_BATCH_INTERVAL);
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first interval tick completes immediately; consume it before entering the loop.
+    flush.tick().await;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Ok(Some(line)) = line else {
+                    break;
+                };
+                if captured.len() < MAX_CAPTURE_BYTES {
+                    captured.push_str(&line);
+                    captured.push('\n');
+                }
+                let text = if line.chars().count() > MAX_STREAM_LINE_CHARS {
+                    let mut shortened: String = line.chars().take(MAX_STREAM_LINE_CHARS).collect();
+                    shortened.push('…');
+                    shortened
+                } else {
+                    line
+                };
+                batch.push(JobLine {
+                    job_id,
+                    stream,
+                    text,
+                });
+                if batch.len() >= LINE_BATCH_SIZE {
+                    let full = std::mem::replace(&mut batch, Vec::with_capacity(LINE_BATCH_SIZE));
+                    if events.send(map(SfEvent::Lines(full))).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            _ = flush.tick() => {
+                if !batch.is_empty() && events.send(map(SfEvent::Lines(std::mem::take(&mut batch)))).await.is_err() {
+                    break;
+                }
+            }
         }
-        let text = if line.chars().count() > MAX_STREAM_LINE_CHARS {
-            let mut shortened: String = line.chars().take(MAX_STREAM_LINE_CHARS).collect();
-            shortened.push('…');
-            shortened
-        } else {
-            line
-        };
-        let _ = events.send(map(SfEvent::Line(JobLine {
-            job_id,
-            stream,
-            text,
-        })));
+    }
+    // Do not lose the trailing partial batch on a clean stream end.
+    if !batch.is_empty() {
+        let _ = events.send(map(SfEvent::Lines(batch))).await;
     }
     captured
 }
@@ -392,6 +428,32 @@ mod tests {
     #[test]
     fn json_document_ignores_text_without_json() {
         assert!(parse_json_document("no json here").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_lines_are_batched_in_order_without_loss() {
+        let input = b"alpha\nbeta\ngamma\n".to_vec();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SfEvent>(8);
+        let captured = read_stream(
+            std::io::Cursor::new(input),
+            7,
+            OutputStream::Stdout,
+            tx,
+            std::convert::identity,
+        )
+        .await;
+        assert_eq!(captured, "alpha\nbeta\ngamma\n");
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                SfEvent::Lines(lines) => {
+                    assert!(lines.iter().all(|line| line.job_id == 7));
+                    texts.extend(lines.into_iter().map(|line| line.text));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(texts, vec!["alpha", "beta", "gamma"]);
     }
 
     #[test]

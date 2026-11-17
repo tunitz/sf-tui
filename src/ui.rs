@@ -15,6 +15,48 @@ fn accent(app: &App) -> Color {
     app.accent()
 }
 
+/// Bounded memoization of the expensive result/detail line vectors. A job that appends output or
+/// finishes bumps the record revision; the elapsed label and render flags are part of the key so a
+/// cached vector can never show stale content.
+const DETAIL_CACHE_CAPACITY: usize = 8;
+
+#[derive(Clone, PartialEq, Eq)]
+struct DetailCacheKey {
+    record_id: u64,
+    revision: u64,
+    width: usize,
+    show_details: bool,
+    show_json: bool,
+    queued_position: Option<usize>,
+    accent: Color,
+    elapsed: String,
+}
+
+#[derive(Default)]
+pub(crate) struct RenderCache {
+    details: Vec<(DetailCacheKey, Vec<Line<'static>>)>,
+}
+
+impl RenderCache {
+    fn get(&self, key: &DetailCacheKey) -> Option<&Vec<Line<'static>>> {
+        self.details
+            .iter()
+            .find(|(cached_key, _)| cached_key == key)
+            .map(|(_, lines)| lines)
+    }
+
+    fn put(&mut self, key: DetailCacheKey, lines: Vec<Line<'static>>) {
+        if self.details.len() >= DETAIL_CACHE_CAPACITY {
+            self.details.remove(0);
+        }
+        self.details.push((key, lines));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.details.clear();
+    }
+}
+
 /// Layout density for embedded terminals (VS Code, Zed, split panes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Density {
@@ -31,6 +73,27 @@ fn density(area: Rect) -> Density {
     } else {
         Density::Roomy
     }
+}
+
+/// Split the Tests body between the test list and the coverage table. The list always keeps a
+/// usable minimum; when there is not enough room the coverage pane is hidden entirely.
+fn tests_pane_heights(body_height: u16, density: Density) -> Option<(u16, u16)> {
+    let min_list: u16 = match density {
+        Density::Tiny => 3,
+        Density::Compact => 4,
+        Density::Roomy => 6,
+    };
+    let min_coverage: u16 = match density {
+        Density::Tiny => 4,
+        Density::Compact => 5,
+        Density::Roomy => 6,
+    };
+    if body_height < min_list.saturating_add(min_coverage) {
+        return None;
+    }
+    let desired = ((u32::from(body_height) * 40 / 100) as u16).clamp(min_coverage, 14);
+    let coverage = desired.min(body_height - min_list);
+    Some((body_height - coverage, coverage))
 }
 
 fn block(title: impl Into<String>, app: &App) -> Block<'static> {
@@ -65,6 +128,13 @@ fn pane_block(title: impl Into<String>, app: &App, focused: bool) -> Block<'stat
 
 fn faint(text: impl Into<String>) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(Color::DarkGray))
+}
+
+/// Faint notice shown when streamed output was dropped by the record retention caps.
+const OUTPUT_TRUNCATED_NOTICE: &str = "… streamed output truncated";
+
+fn output_truncated_notice() -> Line<'static> {
+    Line::from(faint(OUTPUT_TRUNCATED_NOTICE))
 }
 
 fn strong(text: impl Into<String>, color: Color) -> Span<'static> {
@@ -145,14 +215,30 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(modal) = &app.modal {
         draw_modal(frame, modal, app);
     }
-    if std::env::var_os("NO_COLOR").is_some() {
-        for cell in &mut frame.buffer_mut().content {
-            let was_cursor = cell.fg == Color::Black && cell.bg != Color::Reset;
-            cell.fg = Color::Reset;
-            cell.bg = Color::Reset;
-            if was_cursor {
-                cell.modifier.insert(Modifier::REVERSED);
-            }
+    if no_color_enabled() {
+        strip_colors(&mut frame.buffer_mut().content);
+    }
+}
+
+/// `NO_COLOR` is process-wide and never changes at runtime, so check it once instead of on every
+/// frame.
+fn no_color_enabled() -> bool {
+    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_some())
+}
+
+/// Remove every color from a rendered frame, keeping the reversed marker on the cursor cell.
+/// Cells already fully reset are skipped so the common case writes nothing.
+fn strip_colors(cells: &mut [ratatui::buffer::Cell]) {
+    for cell in cells {
+        if cell.fg == Color::Reset && cell.bg == Color::Reset {
+            continue;
+        }
+        let was_cursor = cell.fg == Color::Black && cell.bg != Color::Reset;
+        cell.fg = Color::Reset;
+        cell.bg = Color::Reset;
+        if was_cursor {
+            cell.modifier.insert(Modifier::REVERSED);
         }
     }
 }
@@ -260,70 +346,327 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
     );
 }
 
-/// At most five keycaps for the current screen; trailing pairs are dropped, never wrapped.
-fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+/// Footer context for a screen. Tests has sub-states whose keycaps change with focus and
+/// coverage availability, so they are distinct contexts here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HintContext {
+    Home,
+    Transfer,
+    TestsSearch,
+    TestsCoverage,
+    TestsPlain,
+    Orgs,
+    Setup,
+}
+
+/// One key binding. Both the footer keycaps and the `?` help modal are derived from `KEYMAP`, so a
+/// key cannot appear in one and silently drift from the other. `order` drives footer ordering only;
+/// the table's own order drives the help modal.
+struct KeyBinding {
+    /// Keycap shown in the footer; empty for help-only rows.
+    cap: &'static str,
+    /// Short footer labels, one per context in which the key is shown.
+    hints: &'static [(HintContext, &'static str)],
+    /// Sort order within a footer.
+    order: u8,
+    /// Left column and description in the help modal.
+    help_key: &'static str,
+    help: &'static str,
+}
+
+/// Single source of truth for key hints and help. Help-only rows have no `hints`.
+const KEYMAP: &[KeyBinding] = &[
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "Menu r/d/c/t/o/e",
+        help: "retrieve · deploy · create · tests · organization · run command",
+    },
+    KeyBinding {
+        cap: "d",
+        hints: &[(HintContext::Orgs, "default")],
+        order: 6,
+        help_key: "d (Orgs)",
+        help: "make the selected org the default",
+    },
+    KeyBinding {
+        cap: "Enter",
+        hints: &[
+            (HintContext::Home, "open"),
+            (HintContext::Transfer, "confirm"),
+            (HintContext::TestsSearch, "confirm"),
+            (HintContext::TestsPlain, "confirm"),
+            (HintContext::Orgs, "details"),
+            (HintContext::Setup, "run"),
+        ],
+        order: 2,
+        help_key: "Enter",
+        help: "activate the highlighted entry; search, then confirm where needed",
+    },
+    KeyBinding {
+        cap: "?",
+        hints: &[(HintContext::Home, "help"), (HintContext::Setup, "help")],
+        order: 11,
+        help_key: "?",
+        help: "show this help; any key closes it",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "h",
+        help: "go to the Menu from any screen",
+    },
+    KeyBinding {
+        cap: "Esc",
+        hints: &[
+            (HintContext::Transfer, "back"),
+            (HintContext::TestsSearch, "back"),
+            (HintContext::TestsCoverage, "back"),
+            (HintContext::TestsPlain, "back"),
+            (HintContext::Orgs, "back"),
+            (HintContext::Setup, "back"),
+        ],
+        order: 12,
+        help_key: "Esc",
+        help: "back to the previous screen; jobs keep running",
+    },
+    KeyBinding {
+        cap: "q",
+        hints: &[(HintContext::Home, "quit")],
+        order: 14,
+        help_key: "q",
+        help: "quit from the Menu; confirms first while a job runs",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "Ctrl+X / Ctrl+C",
+        help: "cancel the newest job; Ctrl+C also quits when no job runs",
+    },
+    KeyBinding {
+        cap: "x",
+        hints: &[(HintContext::Orgs, "logout")],
+        order: 13,
+        help_key: "x (Orgs)",
+        help: "log out of an org",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "y",
+        help: "copy the current command/selection",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "Ctrl+Y",
+        help: "copy while typing in a search field",
+    },
+    KeyBinding {
+        cap: "F5",
+        hints: &[(HintContext::Orgs, "refresh")],
+        order: 15,
+        help_key: "F5",
+        help: "refresh orgs or component search",
+    },
+    KeyBinding {
+        cap: "r",
+        hints: &[(HintContext::Setup, "re-probe")],
+        order: 7,
+        help_key: "r (Setup)",
+        help: "re-probe the Salesforce CLI",
+    },
+    KeyBinding {
+        cap: "F2",
+        hints: &[
+            (HintContext::Home, "jobs"),
+            (HintContext::Transfer, "jobs"),
+            (HintContext::TestsSearch, "jobs"),
+            (HintContext::TestsCoverage, "jobs"),
+            (HintContext::TestsPlain, "jobs"),
+            (HintContext::Setup, "jobs"),
+        ],
+        order: 8,
+        help_key: "F2",
+        help: "open the jobs window from any screen",
+    },
+    KeyBinding {
+        cap: "F4",
+        hints: &[
+            (HintContext::Home, "org"),
+            (HintContext::Orgs, "switch org"),
+        ],
+        order: 9,
+        help_key: "F4",
+        help: "switch the default org from any screen",
+    },
+    KeyBinding {
+        cap: "l",
+        hints: &[(HintContext::Orgs, "login")],
+        order: 10,
+        help_key: "l (Orgs)",
+        help: "log in to an org",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "F2 (jobs)",
+        help: "↑↓ select · Enter open · Tab move focus · Esc back",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "x / c (jobs)",
+        help: "cancel running or queued · clear finished",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "o / z (jobs)",
+        help: "raw output · JSON for a finished job",
+    },
+    KeyBinding {
+        cap: "Space",
+        hints: &[
+            (HintContext::Transfer, "select"),
+            (HintContext::TestsSearch, "select"),
+            (HintContext::TestsPlain, "select"),
+        ],
+        order: 3,
+        help_key: "Space (search/confirm)",
+        help: "select a component, test class or row",
+    },
+    KeyBinding {
+        cap: "Tab",
+        hints: &[
+            (HintContext::TestsSearch, "coverage"),
+            (HintContext::TestsCoverage, "search"),
+        ],
+        order: 5,
+        help_key: "Tab (Tests)",
+        help: "toggle the per-class coverage table",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "c (confirm)",
+        help: "show the exact command that will run",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "g (confirm)",
+        help: "cycle the target org",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "v/t/w (Deploy confirm)",
+        help: "validate / test level / ignore warnings",
+    },
+    KeyBinding {
+        cap: "↑↓",
+        hints: &[
+            (HintContext::Home, "move"),
+            (HintContext::TestsCoverage, "scroll"),
+        ],
+        order: 1,
+        help_key: "↑↓ PgUp/PgDn",
+        help: "move or scroll lists and results",
+    },
+    KeyBinding {
+        cap: "PgUp/PgDn",
+        hints: &[(HintContext::TestsCoverage, "page")],
+        order: 4,
+        help_key: "↑↓ PgUp/PgDn",
+        help: "move or scroll lists and results",
+    },
+];
+
+fn hint_context(app: &App) -> HintContext {
     match app.tab {
-        Tab::Home => vec![
-            ("↑↓", "move"),
-            ("Enter", "open"),
-            ("F2", "jobs"),
-            ("F4", "org"),
-            ("?", "help"),
-            ("q", "quit"),
-        ],
-        Tab::Retrieve | Tab::Deploy => vec![
-            ("Enter", "search"),
-            ("Space", "select"),
-            ("Enter", "confirm"),
-            ("F2", "jobs"),
-            ("Esc", "back"),
-        ],
+        Tab::Home => HintContext::Home,
+        Tab::Retrieve | Tab::Deploy => HintContext::Transfer,
+        Tab::Orgs => HintContext::Orgs,
+        Tab::Setup => HintContext::Setup,
         Tab::Tests => {
             let has_coverage = app
                 .latest_result(crate::app::TaskKind::Tests)
                 .is_some_and(|result| !result.coverage.is_empty());
-            if has_coverage && app.tests_focus == TestsFocus::Coverage {
-                vec![
-                    ("↑↓", "scroll"),
-                    ("PgUp/PgDn", "page"),
-                    ("Tab", "search"),
-                    ("F2", "jobs"),
-                    ("Esc", "back"),
-                ]
-            } else if has_coverage {
-                vec![
-                    ("Enter", "search"),
-                    ("Space", "select"),
-                    ("Tab", "coverage"),
-                    ("F2", "jobs"),
-                    ("Esc", "back"),
-                ]
+            if !has_coverage {
+                HintContext::TestsPlain
+            } else if app.tests_focus == TestsFocus::Coverage {
+                HintContext::TestsCoverage
             } else {
-                vec![
-                    ("Enter", "search"),
-                    ("Space", "select"),
-                    ("F2", "jobs"),
-                    ("Esc", "back"),
-                ]
+                HintContext::TestsSearch
             }
         }
-        Tab::Orgs => vec![
-            ("Enter", "details"),
-            ("d", "default"),
-            ("F4", "switch org"),
-            ("l", "login"),
-            ("Esc", "back"),
-            ("x", "logout"),
-            ("F5", "refresh"),
-        ],
-        Tab::Setup => vec![
-            ("Enter", "run"),
-            ("r", "re-probe"),
-            ("F2", "jobs"),
-            ("?", "help"),
-            ("Esc", "back"),
-        ],
     }
+}
+
+/// Footer keycaps for a context. Enter shows a single keycap whose label reflects reality:
+/// `search` while the query is dirty, otherwise `confirm`/`run`.
+fn hint_pairs(ctx: HintContext, search_dirty: bool) -> Vec<(&'static str, &'static str)> {
+    let mut pairs: Vec<(u8, &'static str, &'static str)> = KEYMAP
+        .iter()
+        .filter_map(|binding| {
+            binding
+                .hints
+                .iter()
+                .find(|(context, _)| *context == ctx)
+                .map(|(_, label)| {
+                    let can_search = matches!(
+                        ctx,
+                        HintContext::Transfer | HintContext::TestsSearch | HintContext::TestsPlain
+                    );
+                    let label = if binding.cap == "Enter" && can_search && search_dirty {
+                        "search"
+                    } else {
+                        *label
+                    };
+                    (binding.order, binding.cap, label)
+                })
+        })
+        .collect();
+    pairs.sort_by_key(|(order, _, _)| *order);
+    pairs
+        .into_iter()
+        .map(|(_, cap, label)| (cap, label))
+        .collect()
+}
+
+fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
+    let ctx = hint_context(app);
+    let search_dirty = match ctx {
+        HintContext::Transfer => app.transfer_search.needs_search(),
+        HintContext::TestsSearch | HintContext::TestsPlain => app.test_search.needs_search(),
+        _ => false,
+    };
+    hint_pairs(ctx, search_dirty)
+}
+
+fn help_rows() -> Vec<(&'static str, &'static str)> {
+    let mut seen: Vec<&'static str> = Vec::new();
+    let mut rows = Vec::new();
+    for binding in KEYMAP {
+        if binding.help.is_empty() || seen.contains(&binding.help_key) {
+            continue;
+        }
+        seen.push(binding.help_key);
+        rows.push((binding.help_key, binding.help));
+    }
+    rows
 }
 
 fn keycap_line(app: &App, width: usize) -> Line<'static> {
@@ -447,16 +790,19 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
 
     if has_coverage && let Some(result) = latest {
         let body = sections[2];
-        let bottom = ((u32::from(body.height) * 40 / 100) as u16)
-            .clamp(6, 14)
-            .min(body.height);
-        let rows = Layout::vertical([
-            Constraint::Length(body.height.saturating_sub(bottom)),
-            Constraint::Length(bottom),
-        ])
-        .split(body);
-        render_test_list(frame, rows[0], app, state);
-        draw_test_coverage(frame, rows[1], app, result);
+        if let Some((list_height, coverage_height)) = tests_pane_heights(body.height, density(area))
+        {
+            let rows = Layout::vertical([
+                Constraint::Length(list_height),
+                Constraint::Length(coverage_height),
+            ])
+            .split(body);
+            render_test_list(frame, rows[0], app, state);
+            draw_test_coverage(frame, rows[1], app, result);
+        } else {
+            // Too small for both panes: give the whole body to the test list.
+            render_test_list(frame, body, app, state);
+        }
     } else {
         let latest_lines = latest_result_lines(app, crate::app::TaskKind::Tests);
         let rows = Layout::vertical([
@@ -788,6 +1134,9 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("›");
     frame.render_stateful_widget(table, columns[0], &mut state);
 
+    let detail_width = usize::from(columns[1].width).saturating_sub(2); // block borders
+    let key_width = detail_width.saturating_sub(20).clamp(8, 22);
+    let value_width = detail_width.saturating_sub(key_width + 2).max(1);
     let mut lines = vec![strong_line("ORG DETAIL", accent(app))];
     let detail_matches = app
         .selected_org()
@@ -799,8 +1148,14 @@ fn draw_orgs(frame: &mut Frame, area: Rect, app: &App) {
         ))));
         for (key, value) in detail.fields.iter().take(24) {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {key:22}"), Style::default().fg(Color::DarkGray)),
-                Span::styled(truncated(value, 40), Style::default().fg(Color::Reset)),
+                Span::styled(
+                    format!("  {:<key_width$}", truncated(key, key_width)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    truncated(value, value_width),
+                    Style::default().fg(Color::Reset),
+                ),
             ]));
         }
     } else {
@@ -945,9 +1300,14 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn summary_chips(summary: &str) -> Line<'static> {
+fn summary_chips(result: &crate::app::ResultView) -> Line<'static> {
     let mut spans = Vec::new();
-    for (index, part) in summary
+    // Severity comes from structured result state, not from the chip text: a label that merely
+    // contains "fail" must not look like an error when the result actually succeeded.
+    let failed_items = result.items.iter().filter(|item| !item.ok).count();
+    let has_failure = !result.ok || failed_items > 0;
+    for (index, part) in result
+        .summary
         .split('·')
         .map(str::trim)
         .filter(|part| !part.is_empty())
@@ -956,16 +1316,20 @@ fn summary_chips(summary: &str) -> Line<'static> {
         if index > 0 {
             spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
         }
-        let lower = part.to_ascii_lowercase();
-        let is_zero = part
+        let count = part
             .split_whitespace()
             .next()
             .and_then(|token| token.trim_end_matches('%').parse::<f64>().ok())
-            .is_some_and(|value| value == 0.0);
-        let color = if (lower.contains("fail") || lower.contains("error")) && !is_zero {
-            Color::Red
-        } else if (lower.contains("pass") || lower.contains("succeed")) && !is_zero {
-            Color::Green
+            .unwrap_or(1.0);
+        let lower = part.to_ascii_lowercase();
+        let color = if (lower.contains("fail") || lower.contains("error")) && has_failure {
+            if count > 0.0 { Color::Red } else { Color::Gray }
+        } else if lower.contains("pass") || lower.contains("succeed") {
+            if count > 0.0 {
+                Color::Green
+            } else {
+                Color::Gray
+            }
         } else if lower.contains("coverage") || lower.contains('%') {
             Color::Yellow
         } else {
@@ -1034,7 +1398,7 @@ fn result_lines(
             "─".repeat(width.saturating_sub(2)),
             Style::default().fg(Color::DarkGray),
         )),
-        summary_chips(&result.summary),
+        summary_chips(result),
         Line::from(" "),
     ];
     for item in result.items.iter().take(200) {
@@ -1079,6 +1443,12 @@ fn result_lines(
             for row in view.rows.iter().take(500) {
                 lines.push(Line::from(faint(row.join(" | "))));
             }
+            if view.rows.len() > 500 {
+                lines.push(Line::from(faint(format!(
+                    "… {} more JSON rows",
+                    view.rows.len() - 500
+                ))));
+            }
         } else {
             lines.push(strong_line("RAW OUTPUT", accent(app)));
             for line in &record.lines {
@@ -1089,6 +1459,9 @@ fn result_lines(
             }
             if record.lines.is_empty() {
                 lines.push(Line::from(faint("No streamed output retained.")));
+            }
+            if record.lines_truncated() {
+                lines.push(output_truncated_notice());
             }
         }
     }
@@ -1115,8 +1488,39 @@ fn job_detail_lines(
     queued_position: Option<usize>,
     width: usize,
 ) -> Vec<Line<'static>> {
+    let now = std::time::Instant::now();
+    let key = DetailCacheKey {
+        record_id: record.id,
+        revision: record.render_revision,
+        width,
+        show_details: app.output_state.show_details,
+        show_json: app.output_state.show_json,
+        queued_position,
+        accent: accent(app),
+        // The elapsed label is part of the drawn header; keying on it keeps the clock accurate
+        // without rebuilding the whole detail pane on every animation frame.
+        elapsed: record.elapsed_label(now),
+    };
+    {
+        let cache = app.render_cache.borrow();
+        if let Some(lines) = cache.get(&key) {
+            return lines.clone();
+        }
+    }
+    let lines = build_job_detail_lines(app, record, queued_position, width, now);
+    app.render_cache.borrow_mut().put(key, lines.clone());
+    lines
+}
+
+fn build_job_detail_lines(
+    app: &App,
+    record: &crate::app::OutputRecord,
+    queued_position: Option<usize>,
+    width: usize,
+    now: std::time::Instant,
+) -> Vec<Line<'static>> {
     let (glyph, color) = record_status(record);
-    let elapsed = record.elapsed_label(std::time::Instant::now());
+    let elapsed = record.elapsed_label(now);
     let mut lines = vec![
         Line::from(vec![
             Span::styled(format!("{glyph} "), Style::default().fg(color)),
@@ -1151,6 +1555,12 @@ fn job_detail_lines(
             for row in view.rows.iter().take(500) {
                 lines.push(Line::from(faint(row.join(" | "))));
             }
+            if view.rows.len() > 500 {
+                lines.push(Line::from(faint(format!(
+                    "… {} more JSON rows",
+                    view.rows.len() - 500
+                ))));
+            }
         } else {
             lines.push(Line::from(faint("No JSON captured.")));
         }
@@ -1173,6 +1583,9 @@ fn job_detail_lines(
                 }),
             )));
         }
+        if record.lines_truncated() {
+            lines.push(output_truncated_notice());
+        }
     }
     lines
 }
@@ -1194,6 +1607,7 @@ fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(Line::from(strong("Setup", accent(app)))),
             sections[0],
         );
+        let command_width = usize::from(sections[1].width).saturating_sub(6).max(1);
         let items: Vec<ListItem> = crate::sf::install_instructions()
             .iter()
             .enumerate()
@@ -1201,7 +1615,7 @@ fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
                 ListItem::new(Line::from(vec![
                     strong(format!("{} ", index + 1), accent(app)),
                     Span::styled((*name).to_owned(), Style::default().fg(Color::Reset)),
-                    faint(truncated(&format!("  {command}"), 40)),
+                    faint(truncated(&format!("  {command}"), command_width)),
                 ]))
             })
             .collect();
@@ -1544,7 +1958,8 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
         Modal::Help { scroll } => {
             let area = centered(frame.area(), 86, frame.area().height.min(24));
             frame.render_widget(Clear, area);
-            let lines: Vec<Line> = HELP_ROWS
+            let help = help_rows();
+            let lines: Vec<Line> = help
                 .iter()
                 .map(|(keys, description)| {
                     Line::from(vec![
@@ -1613,6 +2028,9 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             let inner = outer.inner(area);
             let sections =
                 Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+            let row_width = usize::from(sections[0].width).saturating_sub(1); // highlight symbol
+            let label_width = row_width.saturating_sub(20).clamp(8, 24);
+            let username_width = row_width.saturating_sub(label_width + 6).clamp(8, 30);
             if app.org_state.orgs.is_empty() {
                 let text = if app.org_state.loading {
                     "Loading orgs…"
@@ -1637,14 +2055,17 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                                 }),
                             ),
                             Span::styled(
-                                truncated(&org.label(), 24),
+                                truncated(&org.label(), label_width),
                                 Style::default()
                                     .fg(Color::Reset)
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ];
                         if org.label() != org.username {
-                            spans.push(faint(format!("  {}", truncated(&org.username, 30))));
+                            spans.push(faint(format!(
+                                "  {}",
+                                truncated(&org.username, username_width)
+                            )));
                         }
                         if !org.connected_status.is_empty() {
                             spans.push(faint(format!("  {}", org.connected_status)));
@@ -1694,6 +2115,8 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             show_command,
             org,
         } => {
+            let modal_width = 90u16.min(frame.area().width);
+            let path_width = usize::from(modal_width).saturating_sub(6).max(1);
             let mut lines = vec![
                 Line::from(strong(
                     format!(
@@ -1732,7 +2155,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                         }),
                 )));
                 lines.push(Line::from(Span::styled(
-                    format!("    {}", truncated(&entry.item.path, 60)),
+                    format!("    {}", truncated(&entry.item.path, path_width)),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -1754,7 +2177,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             }
             lines.push(Line::from(" "));
             let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
-            let area = centered(frame.area(), 90, height);
+            let area = centered(frame.area(), modal_width, height);
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block("Confirm tests", app)),
@@ -1768,6 +2191,8 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             show_command,
             options,
         } => {
+            let modal_width = 90u16.min(frame.area().width);
+            let path_width = usize::from(modal_width).saturating_sub(6).max(1);
             let mut lines = vec![
                 Line::from(strong(
                     format!(
@@ -1809,7 +2234,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                         }),
                 )));
                 lines.push(Line::from(Span::styled(
-                    format!("    {}", truncated(&entry.item.path, 60)),
+                    format!("    {}", truncated(&entry.item.path, path_width)),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -1829,7 +2254,7 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             }
             lines.push(Line::from(faint("[g] org")));
             let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
-            let area = centered(frame.area(), 90, height);
+            let area = centered(frame.area(), modal_width, height);
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block("Confirm", app)),
@@ -1953,48 +2378,63 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
     }
 }
 
-const HELP_ROWS: &[(&str, &str)] = &[
-    (
-        "Menu r/d/c/t/o/e",
-        "retrieve · deploy · create · tests · organization · run command",
-    ),
-    ("Enter", "the highlighted menu entry"),
-    ("?", "show this help; any key closes it"),
-    ("h", "go to the Menu from any screen"),
-    ("Esc", "back to the previous screen; jobs keep running"),
-    ("q", "quit; asks first while a job is running"),
-    (
-        "Ctrl+X / Ctrl+C",
-        "cancel the newest job; Ctrl+C quits when idle",
-    ),
-    ("y", "copy the current command/selection"),
-    ("Ctrl+Y", "copy while typing in a search field"),
-    ("F5", "refresh orgs or component search"),
-    ("F2", "open the jobs window from any screen"),
-    ("F4", "switch the default org from any screen"),
-    (
-        "F2 (jobs)",
-        "↑↓ select · Enter open · Tab move focus · Esc back",
-    ),
-    ("x / c (jobs)", "cancel running or queued · clear finished"),
-    ("o / z (jobs)", "raw output · JSON for a finished job"),
-    (
-        "Space (search/confirm)",
-        "select a component, test class or row",
-    ),
-    ("Tab (Tests)", "focus the per-class coverage table"),
-    ("c (confirm)", "show the exact command that will run"),
-    ("g (confirm)", "cycle the target org"),
-    (
-        "v/t/w (Deploy confirm)",
-        "validate / test level / ignore warnings",
-    ),
-    ("↑↓ PgUp/PgDn", "move or scroll lists and results"),
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_colors_clears_colors_and_keeps_the_cursor_marker() {
+        use ratatui::buffer::Cell;
+        let mut cells = vec![Cell::default(); 3];
+        cells[0].fg = Color::Red;
+        cells[0].bg = Color::Blue;
+        // Already reset: must be left untouched (including modifiers).
+        cells[1].fg = Color::Reset;
+        cells[1].bg = Color::Reset;
+        cells[1].modifier.insert(Modifier::BOLD);
+        // The cursor is encoded as black-on-colored.
+        cells[2].fg = Color::Black;
+        cells[2].bg = Color::White;
+
+        strip_colors(&mut cells);
+
+        assert_eq!(cells[0].fg, Color::Reset);
+        assert_eq!(cells[0].bg, Color::Reset);
+        assert!(!cells[0].modifier.contains(Modifier::REVERSED));
+        assert_eq!(cells[1].fg, Color::Reset);
+        assert_eq!(cells[1].bg, Color::Reset);
+        assert!(cells[1].modifier.contains(Modifier::BOLD));
+        assert_eq!(cells[2].fg, Color::Reset);
+        assert_eq!(cells[2].bg, Color::Reset);
+        assert!(cells[2].modifier.contains(Modifier::REVERSED));
+    }
+
+    #[test]
+    fn render_cache_is_bounded_and_keyed_on_revision() {
+        let key = |record_id: u64, revision: u64| DetailCacheKey {
+            record_id,
+            revision,
+            width: 80,
+            show_details: false,
+            show_json: false,
+            queued_position: None,
+            accent: Color::Reset,
+            elapsed: "0s".to_owned(),
+        };
+        let mut cache = RenderCache::default();
+        for id in 0..(DETAIL_CACHE_CAPACITY as u64 + 3) {
+            cache.put(key(id, 0), vec![Line::from(format!("line {id}"))]);
+        }
+        assert_eq!(cache.details.len(), DETAIL_CACHE_CAPACITY);
+        // The oldest entry was evicted and the newest is still present.
+        assert!(cache.get(&key(0, 0)).is_none());
+        let newest = DETAIL_CACHE_CAPACITY as u64 + 2;
+        assert!(cache.get(&key(newest, 0)).is_some());
+        // A revision bump invalidates the entry for that record.
+        assert!(cache.get(&key(newest, 1)).is_none());
+        cache.clear();
+        assert!(cache.get(&key(newest, 0)).is_none());
+    }
 
     #[test]
     fn centered_overlay_fits_the_screen() {
@@ -2003,6 +2443,171 @@ mod tests {
         assert!(modal.width <= area.width);
         assert!(modal.height <= area.height);
         assert!(modal.x >= area.x && modal.y >= area.y);
+    }
+
+    const ALL_CONTEXTS: [HintContext; 7] = [
+        HintContext::Home,
+        HintContext::Transfer,
+        HintContext::TestsSearch,
+        HintContext::TestsCoverage,
+        HintContext::TestsPlain,
+        HintContext::Orgs,
+        HintContext::Setup,
+    ];
+
+    #[test]
+    fn footer_hints_have_unique_keys() {
+        for ctx in ALL_CONTEXTS {
+            for dirty in [false, true] {
+                let pairs = hint_pairs(ctx, dirty);
+                let mut keys: Vec<&str> = pairs.iter().map(|(key, _)| *key).collect();
+                let count = keys.len();
+                keys.sort_unstable();
+                keys.dedup();
+                assert_eq!(keys.len(), count, "duplicate footer key in {ctx:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_enter_hint_tracks_search_state() {
+        let dirty = hint_pairs(HintContext::Transfer, true);
+        let enters: Vec<(&str, &str)> = dirty
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key == "Enter")
+            .collect();
+        assert_eq!(enters, vec![("Enter", "search")]);
+        let searched = hint_pairs(HintContext::Transfer, false);
+        let enters: Vec<(&str, &str)> = searched
+            .iter()
+            .copied()
+            .filter(|(key, _)| *key == "Enter")
+            .collect();
+        assert_eq!(enters, vec![("Enter", "confirm")]);
+    }
+
+    #[test]
+    fn quit_hint_and_help_agree_with_key_handling() {
+        let help = help_rows();
+        let quit = help
+            .iter()
+            .find(|(key, _)| *key == "q")
+            .map(|(_, text)| *text);
+        assert_eq!(
+            quit,
+            Some("quit from the Menu; confirms first while a job runs")
+        );
+        let cancel = help
+            .iter()
+            .find(|(key, _)| *key == "Ctrl+X / Ctrl+C")
+            .map(|(_, text)| *text);
+        assert!(
+            cancel.is_some_and(|text| text.contains("cancel") && text.contains("quits")),
+            "Ctrl keys must describe cancel and idle quit"
+        );
+        let home_quit: Vec<(&str, &str)> = hint_pairs(HintContext::Home, false)
+            .into_iter()
+            .filter(|(key, _)| *key == "q")
+            .collect();
+        assert_eq!(home_quit, vec![("q", "quit")]);
+    }
+
+    #[test]
+    fn every_footer_key_is_documented_in_help() {
+        let help_text: String = help_rows()
+            .iter()
+            .map(|(key, description)| format!("{key} {description} "))
+            .collect();
+        for ctx in ALL_CONTEXTS {
+            for dirty in [false, true] {
+                for (cap, _) in hint_pairs(ctx, dirty) {
+                    assert!(
+                        help_text.contains(cap),
+                        "footer key {cap} in {ctx:?} is missing from help"
+                    );
+                }
+            }
+        }
+    }
+
+    fn summary_result(summary: &str, ok: bool, failed: usize) -> crate::app::ResultView {
+        let items = (0..failed)
+            .map(|index| ResultItem {
+                ok: false,
+                label: format!("Failed{index}"),
+                detail: String::new(),
+                progress: None,
+            })
+            .collect();
+        crate::app::ResultView {
+            kind: crate::app::ResultKind::ApexTests,
+            title: "Tests".to_owned(),
+            status: if ok { "Passed" } else { "Failed" }.to_owned(),
+            ok,
+            summary: summary.to_owned(),
+            items,
+            coverage: Vec::new(),
+            sections: Vec::new(),
+        }
+    }
+
+    fn red_chip_text(line: &Line<'_>) -> Vec<String> {
+        line.spans
+            .iter()
+            .filter(|span| span.style.fg == Some(Color::Red))
+            .map(|span| span.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn zero_failure_summary_has_no_red_chip() {
+        let result = summary_result("2 run · 2 passed · 0 failed", true, 0);
+        let line = summary_chips(&result);
+        assert!(red_chip_text(&line).is_empty());
+        let text = line_text(&line);
+        assert_eq!(text, "2 run │ 2 passed │ 0 failed");
+    }
+
+    #[test]
+    fn real_failure_colours_only_the_failure_chip_red() {
+        let result = summary_result("2 run · 1 passed · 1 failed", false, 1);
+        let line = summary_chips(&result);
+        let red = red_chip_text(&line);
+        assert_eq!(red, vec!["1 failed".to_owned()]);
+    }
+
+    #[test]
+    fn failed_named_chip_is_not_red_when_the_result_succeeded() {
+        let result = summary_result("FailedLoginTests 2 · 2 passed", true, 0);
+        let line = summary_chips(&result);
+        assert!(red_chip_text(&line).is_empty());
+    }
+
+    #[test]
+    fn tests_layout_keeps_a_usable_list_at_small_sizes() {
+        let (list, coverage) = tests_pane_heights(7, Density::Tiny).expect("tiny split");
+        assert!(list >= 3, "tiny list too short: {list}");
+        assert!(coverage >= 4, "tiny coverage too short: {coverage}");
+        let (list, coverage) = tests_pane_heights(18, Density::Compact).expect("compact split");
+        assert!(list >= 4, "compact list too short: {list}");
+        assert!(coverage >= 5, "compact coverage too short: {coverage}");
+        let (list, coverage) = tests_pane_heights(30, Density::Roomy).expect("roomy split");
+        assert!(list >= 6 && coverage >= 6);
+    }
+
+    #[test]
+    fn tests_layout_hides_coverage_only_without_room() {
+        assert!(tests_pane_heights(4, Density::Tiny).is_none());
+        assert!(tests_pane_heights(0, Density::Roomy).is_none());
+    }
+
+    #[test]
+    fn truncation_notice_is_visible() {
+        assert_eq!(
+            line_text(&output_truncated_notice()),
+            OUTPUT_TRUNCATED_NOTICE
+        );
     }
 
     #[test]

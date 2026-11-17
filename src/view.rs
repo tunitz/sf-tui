@@ -3,6 +3,8 @@
 //! Keeping this out of `app.rs` makes the presentation rules unit-testable without a terminal or
 //! an `App` instance.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::app::{ResultItem, ResultKind, ResultSection, ResultView};
@@ -118,21 +120,26 @@ pub fn transfer_result(
     };
 
     let items = if !requested.is_empty() {
+        // Index both the "Type:Name" and bare-name forms to the first matching component.
+        // `or_insert` keeps the earliest index so this has the same first-match-wins result as
+        // the old linear `.find()` while making each lookup O(1).
+        let mut by_key: HashMap<String, usize> =
+            HashMap::with_capacity(report.components.len().saturating_mul(2));
+        for (index, component) in report.components.iter().enumerate() {
+            let full = if component.component_type.is_empty() {
+                component.name.clone()
+            } else {
+                format!("{}:{}", component.component_type, component.name)
+            };
+            by_key.entry(full).or_insert(index);
+            by_key.entry(component.name.clone()).or_insert(index);
+        }
         requested
             .iter()
             .map(|name| {
-                report
-                    .components
-                    .iter()
-                    .find(|component| {
-                        let full = if component.component_type.is_empty() {
-                            component.name.clone()
-                        } else {
-                            format!("{}:{}", component.component_type, component.name)
-                        };
-                        &full == name || &component.name == name
-                    })
-                    .map(component_row)
+                by_key
+                    .get(name.as_str())
+                    .map(|&index| component_row(&report.components[index]))
                     .unwrap_or_else(|| ResultItem {
                         ok,
                         label: name.clone(),
@@ -349,6 +356,92 @@ mod tests {
         assert_eq!(view.items.len(), 3);
         assert!(view.items.iter().all(|item| item.ok));
         assert_eq!(view.summary, "3 total · 3 succeeded · 0 failed");
+    }
+
+    #[test]
+    fn transfer_result_lookup_matches_linear_scan_with_duplicate_names() {
+        use crate::sf::deploy::ComponentResult;
+        let component = |kind: &str, name: &str, status: &str, problem: &str| ComponentResult {
+            name: name.to_owned(),
+            component_type: kind.to_owned(),
+            status: status.to_owned(),
+            problem: problem.to_owned(),
+        };
+        let report = TransferReport {
+            status: "Failed".to_owned(),
+            total: 5,
+            succeeded: 3,
+            failed: 2,
+            components: vec![
+                component("ApexClass", "Demo", "Failed", "compile error"),
+                component("", "ApexClass:Demo", "Succeeded", ""),
+                component("ApexClass", "Demo", "Succeeded", ""),
+                component("Flow", "Demo", "Failed", "flow error"),
+                component("", "Solo", "Succeeded", ""),
+            ],
+            ..TransferReport::default()
+        };
+        let requested = vec![
+            "ApexClass:Demo".to_owned(),
+            "Demo".to_owned(),
+            "Flow:Demo".to_owned(),
+            "Solo".to_owned(),
+            "Missing".to_owned(),
+        ];
+
+        // Reproduce the original linear `.find()` semantics as a reference.
+        let ok = !report.status.eq_ignore_ascii_case("failed")
+            && !report.status.eq_ignore_ascii_case("error")
+            && report.failed == 0;
+        let expected: Vec<(bool, String, String)> = requested
+            .iter()
+            .map(|name| {
+                report
+                    .components
+                    .iter()
+                    .find(|component| {
+                        let full = if component.component_type.is_empty() {
+                            component.name.clone()
+                        } else {
+                            format!("{}:{}", component.component_type, component.name)
+                        };
+                        &full == name || &component.name == name
+                    })
+                    .map(|component| {
+                        let failed = matches!(
+                            component.status.to_ascii_lowercase().as_str(),
+                            "failed" | "error" | "failure"
+                        );
+                        let label = if component.component_type.is_empty() {
+                            component.name.clone()
+                        } else {
+                            format!("{}:{}", component.component_type, component.name)
+                        };
+                        let detail = if component.problem.is_empty() {
+                            component.status.clone()
+                        } else {
+                            format!("{} — {}", component.status, component.problem)
+                        };
+                        (!failed && component.problem.is_empty(), label, detail)
+                    })
+                    .unwrap_or_else(|| {
+                        let detail = if report.status.is_empty() {
+                            if ok { "Succeeded" } else { "Failed" }.to_owned()
+                        } else {
+                            report.status.clone()
+                        };
+                        (ok, name.clone(), detail)
+                    })
+            })
+            .collect();
+
+        let view = transfer_result(false, &report, None, &requested);
+        let actual: Vec<(bool, String, String)> = view
+            .items
+            .into_iter()
+            .map(|item| (item.ok, item.label, item.detail))
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]
