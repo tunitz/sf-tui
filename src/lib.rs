@@ -55,6 +55,7 @@ mod layering_tests {
             include_str!("sf/org.rs"),
             include_str!("sf/project.rs"),
             include_str!("sf/runner.rs"),
+            include_str!("sf/test_results.rs"),
         ];
         for source in sources {
             assert!(

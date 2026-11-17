@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.2.0] - 2026-11-17
+
+### Added
+
+- Apex Tests screen searches only real test classes (`*Test.cls` or `@IsTest`) with checkbox
+  multi-select and a confirmation dialog.
+- Apex test runs are saved locally (`test-runs.json`, last 50 runs) and viewable with `v` on the
+  result screen.
+- Apex test results are formatted with highlights first — outcome, failures, coverage — followed
+  by per-class coverage.
+- Org menu on Home: check current org, switch org, login, delete/logout, reauth.
+
+### Removed
+
+- Get test results shortcut; past runs are now available from Apex Tests results via `v`.
+
+[0.2.0]: https://github.com/tunitz/sf-tui/releases/tag/v0.2.0
+
 ## [0.1.9] - 2026-11-17
 
 ### Fixed

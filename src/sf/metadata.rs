@@ -137,13 +137,27 @@ impl SuggestionSet {
 }
 
 /// Apex classes from the project index, used by the test-run search screen.
-pub fn test_suggestions(all: &SuggestionSet) -> SuggestionSet {
+pub fn test_suggestions(all: &SuggestionSet, project: Option<&SfProject>) -> SuggestionSet {
     SuggestionSet {
         kind: SuggestionKind::Transfer,
         items: all
             .items
             .iter()
-            .filter(|item| item.value.starts_with("ApexClass:"))
+            .filter(|item| {
+                let Some(name) = item.value.strip_prefix("ApexClass:") else {
+                    return false;
+                };
+                if name.to_ascii_lowercase().ends_with("test") {
+                    return true;
+                }
+                let Some(project) = project else {
+                    return false;
+                };
+                let Ok(source) = std::fs::read_to_string(project.root.join(&item.path)) else {
+                    return false;
+                };
+                source.to_ascii_lowercase().contains("@istest")
+            })
             .cloned()
             .collect(),
     }
@@ -430,14 +444,37 @@ mod tests {
                 "ApexClass:Helper".to_owned(),
             ],
         );
-        let tests = test_suggestions(&all);
-        assert_eq!(tests.items.len(), 2);
+        let tests = test_suggestions(&all, None);
+        assert_eq!(tests.items.len(), 1);
+        assert_eq!(tests.items[0].value, "ApexClass:DemoTest");
         assert!(
             tests
                 .items
                 .iter()
                 .all(|item| item.value.starts_with("ApexClass:"))
         );
+    }
+
+    #[test]
+    fn test_suggestions_include_is_test_annotated_classes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let relative = "force-app/classes/Helper.cls";
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        std::fs::write(&path, "@IsTest private class Helper {}").expect("write class");
+        let all = SuggestionSet {
+            kind: SuggestionKind::Transfer,
+            items: vec![SuggestionItem::new("ApexClass:Helper", relative)],
+        };
+        let project = SfProject {
+            root: dir.path().to_path_buf(),
+            package_directories: Vec::new(),
+            source_api_version: None,
+            manifests: Vec::new(),
+            source_files: vec![relative.to_owned()],
+        };
+        let tests = test_suggestions(&all, Some(&project));
+        assert_eq!(tests.items.len(), 1);
     }
 
     #[test]

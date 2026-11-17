@@ -58,13 +58,16 @@ Home is just the menu:
 
 ```text
 [1] Retrieve        [2] Deploy        [3] Run tests
-[4] Test results    [5] Create metadata    [6] Log in
+[4] Org
 ```
 
 Global: `Tab` next screen · `h` Home · `Backspace` back · `?` help · `q` quit.
 
-The Tests screen follows the same pattern: type to find Apex test classes, `Space` check/uncheck,
-`Enter` confirm, then run the generated `sf apex run test` command from the confirmation dialog.
+Apex Tests follows the same pattern: type to find real test classes (`*Test.cls` or `@IsTest`),
+`Space` check/uncheck, `Enter` confirm. Results are saved locally (last 50 runs) and shown with
+highlights first — outcome, failures, coverage — then per-class coverage. Press `v` on the result
+screen to view previous runs. The Org menu replaces the old login shortcut: check current org,
+switch, login, delete/logout or reauth.
 
 On the Retrieve/Deploy screens, type to search, `↑↓` move, `Space` check/uncheck, `Enter`
 confirm, `Esc` back. The search is async and debounced; selected components keep their source

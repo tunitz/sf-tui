@@ -19,6 +19,7 @@ use crate::sf::metadata::{SuggestionItem, SuggestionSet};
 use crate::sf::org::{OrgDetail, OrgSummary};
 use crate::sf::project::{self, SfProject};
 use crate::sf::runner::{JobLine, ProcessOutcome, RunningJob, SfEvent};
+use crate::sf::test_results::{self, TestRun};
 use crate::sf::{self, Startup};
 
 /// Screens shown in the tab bar. Setup is added only when no CLI was found.
@@ -63,6 +64,7 @@ pub enum JobPurpose {
     Transfer { options: TransferOptions },
     Report { options: TransferOptions },
     Installer { command: String },
+    ApexTests { command: String },
 }
 
 impl JobPurpose {
@@ -77,6 +79,7 @@ impl JobPurpose {
             Self::Transfer { .. } => "transfer",
             Self::Report { .. } => "report",
             Self::Installer { .. } => "installer",
+            Self::ApexTests { .. } => "apex tests",
         }
     }
 }
@@ -115,6 +118,14 @@ pub enum CatalogRow {
     },
 }
 
+pub const ORG_MENU: &[&str] = &[
+    "Check current org",
+    "Switch org",
+    "Login org",
+    "Delete org",
+    "Reauth org",
+];
+
 const POPULAR_COMMAND_IDS: &[&str] = &[
     "org login web",
     "project retrieve start",
@@ -147,26 +158,14 @@ pub const QUICK_ACTIONS: &[QuickAction] = &[
     },
     QuickAction {
         key: 't',
-        label: "Run Apex tests",
+        label: "Apex Tests",
         command: "sf apex run test",
         hint: "",
     },
     QuickAction {
-        key: 'g',
-        label: "Get test results",
-        command: "sf logic get test",
-        hint: "test run id",
-    },
-    QuickAction {
-        key: 'c',
-        label: "Create metadata",
-        command: "sf template generate",
-        hint: "template",
-    },
-    QuickAction {
-        key: 'a',
-        label: "Log in to an org",
-        command: "sf org login web",
+        key: 'o',
+        label: "Org",
+        command: "sf org",
         hint: "",
     },
 ];
@@ -449,13 +448,13 @@ pub enum PromptKind {
     QuickRetrieve,
     QuickDeploy,
     RunApexTests,
-    GetTestResults,
     CreateMetadata,
     MetadataNames,
     EditPreset { id: String },
     LoginWeb,
     CreateScratch,
     TargetOrg,
+    SwitchOrg,
     Tests,
 }
 
@@ -483,6 +482,13 @@ pub enum Modal {
         title: String,
         message: String,
         action: PendingAction,
+    },
+    OrgMenu {
+        selected: usize,
+    },
+    TestHistory {
+        runs: Vec<TestRun>,
+        selected: usize,
     },
     TestConfirm {
         entries: Vec<TransferSelection>,
@@ -529,6 +535,8 @@ pub struct App {
     pub transfer_search: TransferSearchState,
     pub test_search: TransferSearchState,
     pub output_state: OutputState,
+    pub latest_test_run: Option<TestRun>,
+    pub test_runs: Vec<TestRun>,
     pub modal: Option<Modal>,
     pub setup_selected: usize,
     tab_history: Vec<Tab>,
@@ -575,6 +583,8 @@ impl App {
             transfer_search: TransferSearchState::new(false),
             test_search: TransferSearchState::new(false),
             output_state: OutputState::default(),
+            latest_test_run: None,
+            test_runs: Vec::new(),
             modal: None,
             setup_selected: 0,
             tab_history: Vec::new(),
@@ -589,6 +599,7 @@ impl App {
             next_job_id: 1,
         };
         app.reload_project();
+        app.test_runs = test_results::load(&app.config_dir);
         app.status = "Starting sftui — the interface is ready while sf is probed".to_owned();
         app.start_probe();
         app
@@ -791,6 +802,7 @@ impl App {
                 | JobPurpose::Transfer { .. }
                 | JobPurpose::OrgAction { .. }
                 | JobPurpose::Installer { .. }
+                | JobPurpose::ApexTests { .. }
         );
         let succeeded = outcome.succeeded();
         match (purpose, parsed) {
@@ -859,6 +871,12 @@ impl App {
             (JobPurpose::OrgAction { description }, _) => {
                 self.notice(format!("{description} finished"));
                 self.refresh_orgs();
+            }
+            (JobPurpose::ApexTests { command }, Some(value)) => {
+                let run = test_results::parse(&value, &command);
+                self.test_runs = test_results::record(&self.config_dir, run.clone());
+                self.latest_test_run = Some(run);
+                self.notice("Apex test results saved");
             }
             _ => {}
         }
@@ -1367,7 +1385,10 @@ impl App {
             let all = Arc::new(crate::sf::metadata::transfer_suggestions(
                 self.deploy_state.project.as_ref(),
             ));
-            let tests = Arc::new(crate::sf::metadata::test_suggestions(&all));
+            let tests = Arc::new(crate::sf::metadata::test_suggestions(
+                &all,
+                self.deploy_state.project.as_ref(),
+            ));
             self.suggestion_cache = Some((root.clone(), all));
             self.test_suggestion_cache = Some((root, tests));
         }
@@ -1462,15 +1483,8 @@ impl App {
                     ],
                 );
             }
-            "sf logic get test" => {
-                self.open_prompt(
-                    "Test results",
-                    PromptKind::GetTestResults,
-                    vec![
-                        PromptField::new("Test run id", ""),
-                        PromptField::new("Org", target),
-                    ],
-                );
+            "sf org" => {
+                self.modal = Some(Modal::OrgMenu { selected: 0 });
             }
             _ => {}
         }
@@ -1842,6 +1856,16 @@ impl App {
     fn output_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('o') => self.output_state.show_details = !self.output_state.show_details,
+            KeyCode::Char('v') => {
+                if self.test_runs.is_empty() {
+                    self.notice("No saved Apex test runs yet");
+                } else {
+                    self.modal = Some(Modal::TestHistory {
+                        runs: self.test_runs.clone(),
+                        selected: 0,
+                    });
+                }
+            }
             KeyCode::Char('z') => {
                 self.output_state.show_details = true;
                 self.output_state.show_json = !self.output_state.show_json;
@@ -1895,6 +1919,87 @@ impl App {
             Modal::Confirm { action, .. } => match key.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => self.execute(action),
                 _ => self.notice("Cancelled"),
+            },
+            Modal::OrgMenu { mut selected } => match key.code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    self.modal = Some(Modal::OrgMenu { selected });
+                }
+                KeyCode::Down => {
+                    selected = (selected + 1).min(ORG_MENU.len() - 1);
+                    self.modal = Some(Modal::OrgMenu { selected });
+                }
+                KeyCode::Esc => self.notice("Closed org menu"),
+                KeyCode::Enter => {
+                    let current = self.org_target_hint();
+                    match selected {
+                        0 => {
+                            let argv =
+                                vec!["org".to_owned(), "display".to_owned(), "--json".to_owned()];
+                            let display = "sf org display --json".to_owned();
+                            self.spawn(
+                                argv,
+                                JobPurpose::Command {
+                                    id: "org display".to_owned(),
+                                    command: display,
+                                },
+                            );
+                            self.tab = Tab::Output;
+                        }
+                        1 => self.open_prompt(
+                            "Switch org",
+                            PromptKind::SwitchOrg,
+                            vec![PromptField::new("Org alias", current)],
+                        ),
+                        2 => self.open_prompt(
+                            "Login org",
+                            PromptKind::LoginWeb,
+                            vec![PromptField::new("Alias", String::new())],
+                        ),
+                        3 => {
+                            if current.is_empty() {
+                                self.error("No current org to delete");
+                            } else {
+                                self.modal = Some(Modal::Confirm {
+                                    title: "Delete org?".to_owned(),
+                                    message: format!(
+                                        "Log out and remove local auth for {current}?"
+                                    ),
+                                    action: PendingAction::Logout { username: current },
+                                });
+                            }
+                        }
+                        4 => self.open_prompt(
+                            "Reauth org",
+                            PromptKind::LoginWeb,
+                            vec![PromptField::new("Alias", current)],
+                        ),
+                        _ => {}
+                    }
+                }
+                _ => self.modal = Some(Modal::OrgMenu { selected }),
+            },
+            Modal::TestHistory { runs, mut selected } => match key.code {
+                KeyCode::Up => {
+                    selected = selected.saturating_sub(1);
+                    self.modal = Some(Modal::TestHistory { runs, selected });
+                }
+                KeyCode::Down => {
+                    if !runs.is_empty() {
+                        selected = (selected + 1).min(runs.len() - 1);
+                    }
+                    self.modal = Some(Modal::TestHistory { runs, selected });
+                }
+                KeyCode::Enter => {
+                    if let Some(run) = runs.get(selected) {
+                        self.latest_test_run = Some(run.clone());
+                        self.output_state.show_details = true;
+                    }
+                    self.modal = None;
+                    self.tab = Tab::Output;
+                }
+                KeyCode::Esc => self.modal = None,
+                _ => self.modal = Some(Modal::TestHistory { runs, selected }),
             },
             Modal::TestConfirm {
                 mut entries,
@@ -1960,7 +2065,7 @@ impl App {
                         "run".to_owned(),
                         "test".to_owned(),
                         "--result-format".to_owned(),
-                        "human".to_owned(),
+                        "json".to_owned(),
                         "--wait".to_owned(),
                         "10".to_owned(),
                     ];
@@ -1974,13 +2079,7 @@ impl App {
                     }
                     argv.push("--json".to_owned());
                     let display = format!("sf {}", argv.join(" "));
-                    self.spawn(
-                        argv,
-                        JobPurpose::Command {
-                            id: "apex run test".to_owned(),
-                            command: display,
-                        },
-                    );
+                    self.spawn(argv, JobPurpose::ApexTests { command: display });
                     self.tab = Tab::Output;
                 }
                 KeyCode::Esc => {
@@ -2442,28 +2541,22 @@ impl App {
                     },
                 );
             }
-            PromptKind::GetTestResults => {
-                let Some(run_id) = values.first().filter(|id| !id.is_empty()) else {
-                    self.error("A test run id is required");
+            PromptKind::SwitchOrg => {
+                let org = values.first().map(String::as_str).unwrap_or("").trim();
+                if org.is_empty() {
+                    self.error("Enter an org alias");
                     return;
-                };
-                let mut argv = vec![
-                    "logic".to_owned(),
-                    "get".to_owned(),
-                    "test".to_owned(),
-                    "--test-run-id".to_owned(),
-                    run_id.clone(),
-                ];
-                if let Some(org) = values.get(1).filter(|org| !org.is_empty()) {
-                    argv.push("--target-org".to_owned());
-                    argv.push(org.clone());
                 }
-                argv.push("--json".to_owned());
+                let argv = vec![
+                    "config".to_owned(),
+                    "set".to_owned(),
+                    format!("target-org={org}"),
+                ];
                 let display = format!("sf {}", argv.join(" "));
                 self.spawn(
                     argv,
                     JobPurpose::Command {
-                        id: "logic get test".to_owned(),
+                        id: "config set".to_owned(),
                         command: display,
                     },
                 );
@@ -2913,7 +3006,8 @@ mod tests {
     fn home_shortcuts_put_retrieve_deploy_first_and_offer_suggestions() {
         assert_eq!(QUICK_ACTIONS[0].key, 'r');
         assert_eq!(QUICK_ACTIONS[1].key, 'd');
-        assert_eq!(QUICK_ACTIONS[5].key, 'a');
+        assert_eq!(QUICK_ACTIONS[3].key, 'o');
+        assert_eq!(QUICK_ACTIONS.len(), 4);
         let mut app = test_app();
         app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('r')));
@@ -2923,14 +3017,8 @@ mod tests {
         app.handle_key(key(KeyCode::Char('d')));
         assert_eq!(app.tab, Tab::Deploy);
         app.tab = Tab::Home;
-        app.handle_key(key(KeyCode::Char('g')));
-        assert!(matches!(
-            app.modal.as_ref(),
-            Some(Modal::Prompt {
-                kind: PromptKind::GetTestResults,
-                ..
-            })
-        ));
+        app.handle_key(key(KeyCode::Char('o')));
+        assert!(matches!(app.modal.as_ref(), Some(Modal::OrgMenu { .. })));
     }
 
     #[test]

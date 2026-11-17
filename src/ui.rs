@@ -1049,6 +1049,69 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn test_run_lines(
+    app: &App,
+    run: &crate::sf::test_results::TestRun,
+    expanded: bool,
+) -> Vec<Line<'static>> {
+    let passed =
+        run.outcome.eq_ignore_ascii_case("Passed") || run.outcome.eq_ignore_ascii_case("Pass");
+    let mut lines = vec![
+        strong("APEX TESTS", accent(app))
+            + Span::styled(" — ", Style::default().fg(Color::DarkGray))
+            + strong(
+                if passed { "PASS" } else { "FAILED" },
+                if passed { Color::Green } else { Color::Red },
+            ),
+        Line::from(faint(&run.command)),
+        Line::from(faint(format!(
+            "{} · {} run · {} passed · {} failed · {} skipped · coverage {}",
+            run.outcome, run.tests_run, run.passing, run.failing, run.skipped, run.coverage
+        ))),
+        Line::from(" "),
+        Line::from(faint(
+            "[o] details   [v] history   [h] Home   [Esc] Back   [r] Rerun",
+        )),
+    ];
+    if expanded {
+        lines.push(Line::from(" "));
+        lines.push(strong_line("HIGHLIGHTS", accent(app)));
+        lines.push(Line::from(faint(format!("Outcome: {}", run.outcome))));
+        lines.push(Line::from(faint(format!(
+            "Failures: {}",
+            run.failures.len()
+        ))));
+        lines.push(Line::from(faint(format!("Coverage: {}", run.coverage))));
+        if !run.failures.is_empty() {
+            lines.push(Line::from(" "));
+            lines.push(strong_line("ERRORS", Color::Red));
+            for failure in run.failures.iter().take(8) {
+                lines.push(Line::from(Span::styled(
+                    truncated(&format!("{}: {}", failure.name, failure.message), 100),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+        lines.push(Line::from(" "));
+        lines.push(strong_line("APEX CLASS COVERAGE", accent(app)));
+        if run.coverages.is_empty() {
+            lines.push(Line::from(faint("No coverage data returned.")));
+        }
+        for coverage in run.coverages.iter().take(20) {
+            lines.push(Line::from(faint(format!(
+                "{:<32} {:>6}  ({}/{})",
+                truncated(&coverage.name, 32),
+                coverage.percent,
+                coverage.covered,
+                coverage.total
+            ))));
+        }
+        lines.push(Line::from(" "));
+        lines.push(Line::from(faint("[z] raw output / JSON")));
+    }
+    lines
+}
+
 fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
     let Some(record) = app.output_state.records.get(app.output_state.selected) else {
         frame.render_widget(
@@ -1057,6 +1120,19 @@ fn draw_output(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
+    if record.purpose == "apex tests" {
+        let run = app.latest_test_run.clone().or_else(|| {
+            record
+                .json
+                .as_ref()
+                .map(|value| crate::sf::test_results::parse(value, &record.command))
+        });
+        if let Some(run) = run {
+            let lines = test_run_lines(app, &run, app.output_state.show_details);
+            frame.render_widget(Paragraph::new(Text::from(lines)), area);
+            return;
+        }
+    }
     let succeeded = record
         .status
         .as_ref()
@@ -1255,6 +1331,71 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             ];
             frame.render_widget(
                 Paragraph::new(Text::from(lines)).block(block(title.clone(), app)),
+                area,
+            );
+        }
+        Modal::OrgMenu { selected } => {
+            let items = crate::app::ORG_MENU;
+            let lines: Vec<Line> = items
+                .iter()
+                .enumerate()
+                .map(|(index, label)| {
+                    Line::from(Span::styled(
+                        format!(
+                            "{} [{}] {}",
+                            if index == *selected { ">" } else { " " },
+                            index + 1,
+                            label
+                        ),
+                        Style::default().fg(if index == *selected {
+                            accent(app)
+                        } else {
+                            Color::White
+                        }),
+                    ))
+                })
+                .chain(std::iter::once(Line::from(faint(
+                    "↑↓ move   Enter select   Esc close",
+                ))))
+                .collect();
+            let area = centered(frame.area(), 52, lines.len() as u16 + 2);
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(block("Org", app)),
+                area,
+            );
+        }
+        Modal::TestHistory { runs, selected } => {
+            let mut lines = vec![strong_line("SAVED APEX TEST RUNS", accent(app))];
+            for (index, run) in runs.iter().take(12).enumerate() {
+                let passed = run.outcome.eq_ignore_ascii_case("Passed")
+                    || run.outcome.eq_ignore_ascii_case("Pass");
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} {} {} · {} run · {} failed · coverage {}",
+                        if index == *selected { ">" } else { " " },
+                        if passed { "PASS" } else { "FAIL" },
+                        run.at,
+                        run.tests_run,
+                        run.failing,
+                        run.coverage
+                    ),
+                    Style::default().fg(if index == *selected {
+                        accent(app)
+                    } else {
+                        Color::Gray
+                    }),
+                )));
+            }
+            lines.push(Line::from(faint("↑↓ move   Enter open   Esc close")));
+            let area = centered(
+                frame.area(),
+                82,
+                (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2)),
+            );
+            frame.render_widget(Clear, area);
+            frame.render_widget(
+                Paragraph::new(Text::from(lines)).block(block("History", app)),
                 area,
             );
         }

@@ -19,7 +19,7 @@ data/commands.json     bundled command catalog snapshot; cached refresh lives be
 src/sf/metadata.rs     component/template suggestion candidates (fuzzy completion)
 src/json_view.rs       JSON-to-table rendering
 src/clipboard.rs       OS clipboard helpers
-src/sf/                CLI detection, process runner, command catalog, org/project/deploy parsing
+src/sf/                CLI detection, process runner, catalog, org/project/deploy/test-result parsing
 tests/                 integration tests and synthetic CLI stub fixtures
 .github/workflows/     CI and release automation
 install.sh/.ps1        user-level installers (no admin rights)

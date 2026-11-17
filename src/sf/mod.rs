@@ -7,6 +7,7 @@ pub mod metadata;
 pub mod org;
 pub mod project;
 pub mod runner;
+pub mod test_results;
 
 use std::time::Duration;
 
