@@ -55,7 +55,9 @@ For a nonstandard location, set `SFTUI_SF_PATH` to the full path of the executab
 ## Keybindings
 
 Every screen shows a compact **Actions** bar with keys and labels. `Tab` cycles screens, digits
-`1`–`7` jump directly, `?` opens the full key map and `q` quits.
+`1`–`7` jump directly, `h` returns Home, `Backspace` goes back to the previous screen, `?` opens
+the full key map and `q` quits. After a successful command the status bar reminds you of `h` and
+`Backspace`.
 
 The layout adapts to the terminal: below 105 columns or 30 rows it collapses side-by-side panes
 and trims the header; below 72 columns or 20 rows it becomes a single column with a one-line
@@ -69,7 +71,7 @@ header and status bar, aimed at VS Code and Zed terminal panels. Rendering is te
 | Favorites | `Enter` run · `Ctrl+↑↓` reorder · `e` preset flags · `x` remove |
 | Orgs | `↑↓` move · `Enter` details · `o` open browser · `d` project default · `D` dev hub · `x` logout · `l` login · `c` scratch org |
 | Deploy/Retrieve | `Space` select · `m` payload mode · `v` validate · `t` test level · `w` ignore warnings · `o` target org · `r` toggle retrieve · `Enter` run |
-| Output | `↑↓` history · `j`/`k` scroll · `z` JSON table · `y` copy command · `Y` copy output |
+| Output | `h` home · `Backspace` back · `↑↓` history · `j`/`k` scroll · `z` JSON table · `y` copy command |
 | Setup | `↑↓` installer · `Enter` run · `r` re-probe |
 
 ## Walkthroughs

@@ -3,6 +3,28 @@
 All notable changes to this project are documented here. Versions follow `0.x.y` semantics:
 `0.x.y` for fixes, `0.x.0` for features and `1.0.0` only when stability is promised.
 
+## [0.1.3] - 2026-11-16
+
+### Added
+
+- `h` returns Home and `Backspace` returns to the previous screen from anywhere; successful
+  commands show those keys in the status bar.
+- Fuzzy suggestions now show the source path beneath each item in muted color, so matching an Apex
+  class by name shows `force-app/.../classes/Name.cls` with it.
+- The chosen component is preselected on the transfer screen; its heading reads
+  `Selected: ApexClass:Name — Enter runs` instead of a generic picker label.
+
+### Changed
+
+- Removed the “Most used …” and other explanatory labels; prompts and headers now use short names
+  such as `Retrieve metadata`, `Component` and `Org`.
+- Component ranking prefers Apex classes and other real project components over generic metadata
+  types when a name is typed.
+- Suggestion results and catalog fuzzy matching are cached/reuse a single matcher, and the render
+  ticker was reduced from 100 ms to 250 ms, fixing paste lag in the search input.
+
+[0.1.3]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.3
+
 ## [0.1.1] - 2026-11-16
 
 ### Added

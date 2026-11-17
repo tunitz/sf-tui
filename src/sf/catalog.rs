@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::cell::RefCell;
+
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::{Deserialize, Serialize};
@@ -427,9 +429,12 @@ pub struct SearchHit<'a> {
     pub matched: Option<Vec<usize>>,
 }
 
+thread_local! {
+    static MATCHER: RefCell<SkimMatcherV2> = RefCell::new(SkimMatcherV2::default().ignore_case());
+}
+
 /// Rank commands by fuzzy score over id and summary.
 pub fn search<'a>(commands: &'a [CommandSpec], query: &str, limit: usize) -> Vec<SearchHit<'a>> {
-    let matcher = SkimMatcherV2::default().ignore_case();
     let query = query.trim();
     let mut hits: Vec<SearchHit<'a>> = commands
         .iter()
@@ -442,7 +447,8 @@ pub fn search<'a>(commands: &'a [CommandSpec], query: &str, limit: usize) -> Vec
                 });
             }
             let haystack = format!("{} {}", command.id, command.summary);
-            let (score, indices) = matcher.fuzzy_indices(&haystack, query)?;
+            let (score, indices) =
+                MATCHER.with(|matcher| matcher.borrow().fuzzy_indices(&haystack, query))?;
             let matched = if indices.iter().all(|&index| index < command.id.len()) {
                 Some(indices)
             } else {

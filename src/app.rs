@@ -14,6 +14,7 @@ use crate::clipboard;
 use crate::config::Config;
 use crate::sf::catalog::{self, Catalog, CatalogSource, CommandSpec, Flag};
 use crate::sf::deploy::{PayloadMode, TestLevel, TransferOptions, TransferReport};
+use crate::sf::metadata::{SuggestionItem, SuggestionSet};
 use crate::sf::org::{OrgDetail, OrgSummary};
 use crate::sf::project::{self, SfProject};
 use crate::sf::runner::{JobLine, ProcessOutcome, RunningJob, SfEvent};
@@ -117,37 +118,37 @@ pub const QUICK_ACTIONS: &[QuickAction] = &[
         key: 'r',
         label: "Retrieve metadata",
         command: "sf project retrieve start",
-        hint: "Most used — type a component name and pick from fuzzy matches",
+        hint: "",
     },
     QuickAction {
         key: 'd',
         label: "Deploy metadata",
         command: "sf project deploy start",
-        hint: "Most used — type a component name and pick from fuzzy matches",
+        hint: "",
     },
     QuickAction {
         key: 't',
         label: "Run Apex tests",
         command: "sf apex run test",
-        hint: "Second most used — default org is used when left blank",
+        hint: "",
     },
     QuickAction {
         key: 'g',
         label: "Get test results",
         command: "sf logic get test",
-        hint: "Second most used — enter a test run id",
+        hint: "test run id",
     },
     QuickAction {
         key: 'c',
         label: "Create metadata",
         command: "sf template generate",
-        hint: "Third — fuzzy-pick a template, then name the component",
+        hint: "template",
     },
     QuickAction {
         key: 'a',
         label: "Log in to an org",
         command: "sf org login web",
-        hint: "Infrequent — browser login, usually once every couple of months",
+        hint: "",
     },
 ];
 
@@ -204,6 +205,7 @@ pub struct DeployState {
     pub report: Option<TransferReport>,
     pub poll_after: Option<Instant>,
     pub manifest_members: Vec<String>,
+    pub selected_component: Option<String>,
 }
 
 /// A single recorded command invocation and its streamed output.
@@ -269,8 +271,10 @@ pub struct PromptField {
     pub label: String,
     pub value: String,
     pub cursor: usize,
-    pub suggestion_set: Option<crate::sf::metadata::SuggestionSet>,
+    pub suggestion_set: Option<SuggestionSet>,
     pub suggestion_index: Option<usize>,
+    cached_query: String,
+    cached_suggestions: Vec<SuggestionItem>,
 }
 
 impl PromptField {
@@ -283,12 +287,33 @@ impl PromptField {
             cursor,
             suggestion_set: None,
             suggestion_index: None,
+            cached_query: String::new(),
+            cached_suggestions: Vec::new(),
         }
     }
 
-    pub fn with_suggestions(mut self, suggestion_set: crate::sf::metadata::SuggestionSet) -> Self {
+    pub fn with_suggestions(mut self, suggestion_set: SuggestionSet) -> Self {
         self.suggestion_set = Some(suggestion_set);
+        self.refresh_suggestions();
         self
+    }
+
+    /// Recompute suggestions only after the text actually changes, not on every frame.
+    pub fn refresh_suggestions(&mut self) {
+        self.suggestion_index = None;
+        let Some(set) = &self.suggestion_set else {
+            self.cached_suggestions.clear();
+            return;
+        };
+        if self.cached_query == self.value && !self.cached_suggestions.is_empty() {
+            return;
+        }
+        self.cached_query = self.value.clone();
+        self.cached_suggestions = set.filter(&self.value, 5);
+    }
+
+    pub fn cached_suggestions(&self) -> &[SuggestionItem] {
+        &self.cached_suggestions
     }
 }
 
@@ -364,6 +389,7 @@ pub struct App {
     pub output_state: OutputState,
     pub modal: Option<Modal>,
     pub setup_selected: usize,
+    tab_history: Vec<Tab>,
     ticks: usize,
     probe_task: Option<JoinHandle<()>>,
     event_tx: UnboundedSender<AppEvent>,
@@ -404,6 +430,7 @@ impl App {
             output_state: OutputState::default(),
             modal: None,
             setup_selected: 0,
+            tab_history: Vec::new(),
             ticks: 0,
             probe_task: None,
             event_tx,
@@ -584,6 +611,14 @@ impl App {
                 truncate(detail, 160)
             ));
         }
+        let user_command = matches!(
+            purpose,
+            JobPurpose::Command { .. }
+                | JobPurpose::Transfer { .. }
+                | JobPurpose::OrgAction { .. }
+                | JobPurpose::Installer { .. }
+        );
+        let succeeded = outcome.succeeded();
         match (purpose, parsed) {
             (JobPurpose::OrgList, Some(value)) => {
                 self.org_state.orgs = sf::org::parse_org_list(&value);
@@ -641,7 +676,7 @@ impl App {
                 if complete {
                     self.deploy_state.job_id = None;
                     self.deploy_state.poll_after = None;
-                    self.notice("Transfer finished");
+                    self.notice("Done — h home · Backspace back");
                 }
             }
             (JobPurpose::Command { command, .. }, _) => {
@@ -652,6 +687,9 @@ impl App {
                 self.refresh_orgs();
             }
             _ => {}
+        }
+        if succeeded && user_command {
+            self.notice("Done — h home · Backspace back");
         }
     }
 
@@ -838,7 +876,8 @@ impl App {
                     self.status.clear();
                 }
             }
-            KeyCode::Backspace if self.tab == Tab::Home => self.tab = Tab::Catalog,
+            KeyCode::Backspace if !self.catalog_state.search_focused => self.go_back(),
+            KeyCode::Char('h') if !self.catalog_state.search_focused => self.go_home(),
             KeyCode::Char('y') => self.copy_context(),
             _ => match self.tab {
                 Tab::Home => self.home_key(key),
@@ -856,8 +895,32 @@ impl App {
         let tabs = self.tabs();
         let current = tabs.iter().position(|tab| *tab == self.tab).unwrap_or(0) as isize;
         let index = (current + delta).rem_euclid(tabs.len() as isize) as usize;
-        self.tab = tabs[index];
+        self.set_tab(tabs[index]);
+    }
+
+    fn set_tab(&mut self, tab: Tab) {
+        if tab != self.tab {
+            self.tab_history.push(self.tab);
+            if self.tab_history.len() > 16 {
+                self.tab_history.remove(0);
+            }
+        }
+        self.tab = tab;
         self.notice(format!("{} — {}", self.tab.label(), self.tab_action_hint()));
+    }
+
+    fn go_home(&mut self) {
+        self.set_tab(Tab::Home);
+    }
+
+    fn go_back(&mut self) {
+        let previous = self.tab_history.pop().unwrap_or(Tab::Home);
+        self.tab = previous;
+        self.notice(format!(
+            "Back to {} — {}",
+            self.tab.label(),
+            self.tab_action_hint()
+        ));
     }
 
     fn tab_action_hint(&self) -> &'static str {
@@ -867,7 +930,7 @@ impl App {
             Tab::Favorites => "Enter run · e preset · x remove",
             Tab::Orgs => "Enter details · o open · l login",
             Tab::Deploy => "Space select · m payload · Enter run",
-            Tab::Output => "j/k scroll · z JSON · Y copy",
+            Tab::Output => "h home · Backspace back · j/k scroll · z JSON",
             Tab::Setup => "Enter installer · r re-probe",
         }
     }
@@ -943,9 +1006,9 @@ impl App {
         match action.command {
             "sf org login web" => {
                 self.open_prompt(
-                    "Log in to an org (web)",
+                    "Log in",
                     PromptKind::LoginWeb,
-                    vec![PromptField::new("Alias (optional)", "")],
+                    vec![PromptField::new("Alias", "")],
                 );
             }
             "sf project retrieve start" | "sf project deploy start" => {
@@ -954,9 +1017,9 @@ impl App {
                     crate::sf::metadata::transfer_suggestions(self.deploy_state.project.as_ref());
                 self.open_prompt(
                     if retrieve {
-                        "Retrieve — type a component name, fuzzy search suggests the rest"
+                        "Retrieve metadata"
                     } else {
-                        "Deploy — type a component name, fuzzy search suggests the rest"
+                        "Deploy metadata"
                     },
                     if retrieve {
                         PromptKind::QuickRetrieve
@@ -964,42 +1027,41 @@ impl App {
                         PromptKind::QuickDeploy
                     },
                     vec![
-                        PromptField::new("Component (fuzzy, e.g. apex demo)", "")
-                            .with_suggestions(suggestions),
-                        PromptField::new("Target org (blank = sf default)", target),
+                        PromptField::new("Component", "").with_suggestions(suggestions),
+                        PromptField::new("Org", target),
                     ],
                 );
             }
             "sf apex run test" => {
                 self.open_prompt(
-                    "Run Apex tests",
+                    "Run tests",
                     PromptKind::RunApexTests,
                     vec![
-                        PromptField::new("Target org", target),
-                        PromptField::new("Test classes (optional)", ""),
-                        PromptField::new("Result format (human/json)", "human"),
+                        PromptField::new("Org", target),
+                        PromptField::new("Classes", ""),
+                        PromptField::new("Format", "human"),
                     ],
                 );
             }
             "sf template generate" => {
                 self.open_prompt(
-                    "Create metadata — fuzzy-pick a template, then name it",
+                    "Create metadata",
                     PromptKind::CreateMetadata,
                     vec![
-                        PromptField::new("Template (fuzzy)", "")
+                        PromptField::new("Template", "")
                             .with_suggestions(crate::sf::metadata::create_suggestions()),
-                        PromptField::new("Component name", ""),
-                        PromptField::new("Target org (blank = sf default)", target),
+                        PromptField::new("Name", ""),
+                        PromptField::new("Org", target),
                     ],
                 );
             }
             "sf logic get test" => {
                 self.open_prompt(
-                    "Get test results",
+                    "Test results",
                     PromptKind::GetTestResults,
                     vec![
                         PromptField::new("Test run id", ""),
-                        PromptField::new("Target org", target),
+                        PromptField::new("Org", target),
                     ],
                 );
             }
@@ -1343,9 +1405,9 @@ impl App {
             }
             KeyCode::Char('l') => {
                 self.open_prompt(
-                    "Log in to an org (web)",
+                    "Log in",
                     PromptKind::LoginWeb,
-                    vec![PromptField::new("Alias (optional)", "")],
+                    vec![PromptField::new("Alias", "")],
                 );
             }
             KeyCode::Char('c') => {
@@ -1473,7 +1535,17 @@ impl App {
             PayloadMode::Manifest => {
                 options.manifest = Some(item.path);
             }
-            PayloadMode::Metadata => {}
+            PayloadMode::Metadata => {
+                if let Some(position) = options
+                    .metadata_names
+                    .iter()
+                    .position(|name| *name == item.path)
+                {
+                    options.metadata_names.remove(position);
+                } else {
+                    options.metadata_names.push(item.path);
+                }
+            }
         }
     }
 
@@ -1639,7 +1711,7 @@ impl App {
                             .unwrap_or(0);
                         field.value.replace_range(previous..field.cursor, "");
                         field.cursor = previous;
-                        field.suggestion_index = None;
+                        field.refresh_suggestions();
                     }
                     self.modal = Some(Modal::Prompt {
                         title,
@@ -1674,7 +1746,7 @@ impl App {
                     if let Some(field) = fields.get_mut(focus) {
                         field.value.insert(field.cursor, character);
                         field.cursor += character.len_utf8();
-                        field.suggestion_index = None;
+                        field.refresh_suggestions();
                     }
                     self.modal = Some(Modal::Prompt {
                         title,
@@ -1727,6 +1799,7 @@ impl App {
                 } else {
                     (PayloadMode::Source, split_names(component), Vec::new())
                 };
+                self.deploy_state.selected_component = metadata.first().cloned();
                 {
                     let options = &mut self.deploy_state.options;
                     options.retrieve = retrieve;
@@ -1735,12 +1808,8 @@ impl App {
                     options.paths = paths;
                     options.metadata_names = metadata;
                 }
-                self.tab = Tab::Deploy;
-                self.notice(format!(
-                    "{} ready — {} preset; press Enter on Deploy to run",
-                    if retrieve { "Retrieve" } else { "Deploy" },
-                    mode.label()
-                ));
+                self.set_tab(Tab::Deploy);
+                self.notice("Ready — Enter runs");
             }
             PromptKind::CreateMetadata => {
                 let template_input = values.first().map(String::as_str).unwrap_or("");
@@ -1750,7 +1819,7 @@ impl App {
                             .filter(template_input, 1)
                             .into_iter()
                             .next()?;
-                        crate::sf::metadata::create_template_for(&hit)
+                        crate::sf::metadata::create_template_for(&hit.value)
                     });
                 let Some(template) = template else {
                     self.error(
@@ -2062,15 +2131,20 @@ fn build_pick_items(project: &SfProject) -> Vec<PickItem> {
             kind: "source",
         });
     }
+    for component in crate::sf::metadata::transfer_suggestions(Some(project)).items {
+        if component.value.contains(':') {
+            items.push(PickItem {
+                path: component.value,
+                label: component.path,
+                kind: "metadata",
+            });
+        }
+    }
     items
 }
 
-pub fn suggestions_for(field: &PromptField) -> Vec<String> {
-    field
-        .suggestion_set
-        .as_ref()
-        .map(|set| set.filter(&field.value, 4))
-        .unwrap_or_default()
+pub fn suggestions_for(field: &PromptField) -> Vec<SuggestionItem> {
+    field.cached_suggestions().to_vec()
 }
 
 fn focus_has_suggestions(fields: &[PromptField], focus: usize) -> bool {
@@ -2079,7 +2153,7 @@ fn focus_has_suggestions(fields: &[PromptField], focus: usize) -> bool {
         .is_some_and(|field| field.suggestion_set.is_some())
 }
 
-fn accept_suggestion(field: Option<&mut PromptField>, suggestions: &[String]) {
+fn accept_suggestion(field: Option<&mut PromptField>, suggestions: &[SuggestionItem]) {
     let Some(field) = field else {
         return;
     };
@@ -2088,9 +2162,9 @@ fn accept_suggestion(field: Option<&mut PromptField>, suggestions: &[String]) {
         .unwrap_or(0)
         .min(suggestions.len().saturating_sub(1));
     if let Some(suggestion) = suggestions.get(index) {
-        field.value = suggestion.clone();
+        field.value = suggestion.value.clone();
         field.cursor = field.value.len();
-        field.suggestion_index = None;
+        field.refresh_suggestions();
     }
 }
 
@@ -2147,7 +2221,7 @@ pub async fn run(
     config_dir: PathBuf,
 ) -> anyhow::Result<()> {
     let mut app = App::new(startup, config, config_dir);
-    let mut ticker = tokio::time::interval(Duration::from_millis(100));
+    let mut ticker = tokio::time::interval(Duration::from_millis(250));
     while !app.should_quit {
         tokio::select! {
             _ = ticker.tick() => {}
@@ -2301,6 +2375,52 @@ mod tests {
         assert_eq!(app.deploy_state.options.mode, PayloadMode::Metadata);
         assert!(!app.deploy_state.options.metadata_names.is_empty());
         assert!(app.deploy_state.options.metadata_names[0].contains("Apex"));
+    }
+
+    #[test]
+    fn home_key_and_backspace_navigate_between_screens() {
+        let mut app = test_app();
+        app.tab = Tab::Orgs;
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.tab, Tab::Home);
+        app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(app.tab, Tab::Orgs);
+    }
+
+    #[test]
+    fn quick_transfer_preselects_the_chosen_component() {
+        let mut app = test_app();
+        app.submit_prompt(
+            &PromptKind::QuickRetrieve,
+            &[
+                PromptField::new("Component", "ApexClass:Demo"),
+                PromptField::new("Org", String::new()),
+            ],
+        );
+        assert_eq!(
+            app.deploy_state.selected_component.as_deref(),
+            Some("ApexClass:Demo")
+        );
+        assert!(
+            app.deploy_state
+                .options
+                .metadata_names
+                .contains(&"ApexClass:Demo".to_owned())
+        );
+    }
+
+    #[test]
+    fn prompt_suggestions_are_cached_until_text_changes() {
+        let mut field = PromptField::new("Component", "Demo").with_suggestions(
+            crate::sf::metadata::SuggestionSet::new(
+                crate::sf::metadata::SuggestionKind::Transfer,
+                vec!["ApexClass:Demo".to_owned(), "Flow:Other".to_owned()],
+            ),
+        );
+        assert_eq!(field.cached_suggestions().len(), 1);
+        field.value = "Other".to_owned();
+        field.refresh_suggestions();
+        assert_eq!(field.cached_suggestions()[0].value, "Flow:Other");
     }
 
     #[test]

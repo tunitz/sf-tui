@@ -1,9 +1,19 @@
 //! Fuzzy component/template suggestions for the quick retrieve, deploy and create flows.
+//!
+//! Suggestions are built once per prompt and cached on the prompt field. Ranking uses one
+//! thread-local matcher instead of allocating a matcher on every keystroke or frame.
+
+use std::cell::RefCell;
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 
 use super::project::SfProject;
+
+thread_local! {
+    static MATCHER: RefCell<SkimMatcherV2> =
+        RefCell::new(SkimMatcherV2::default().ignore_case());
+}
 
 /// Which list a prompt field should complete from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,43 +22,85 @@ pub enum SuggestionKind {
     Create,
 }
 
+/// One ranked candidate: the value inserted on accept and the muted source line shown below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuggestionItem {
+    pub value: String,
+    pub path: String,
+}
+
+impl SuggestionItem {
+    pub fn new(value: impl Into<String>, path: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            path: path.into(),
+        }
+    }
+}
+
 /// A bounded, precomputed set of completion candidates.
 #[derive(Debug, Clone)]
 pub struct SuggestionSet {
     pub kind: SuggestionKind,
-    pub items: Vec<String>,
+    pub items: Vec<SuggestionItem>,
 }
 
 impl SuggestionSet {
-    pub fn new(kind: SuggestionKind, items: Vec<String>) -> Self {
-        Self { kind, items }
+    pub fn new(kind: SuggestionKind, values: Vec<String>) -> Self {
+        Self {
+            kind,
+            items: values
+                .into_iter()
+                .map(|value| SuggestionItem::new(value, String::new()))
+                .collect(),
+        }
     }
 
-    /// Rank candidates by fuzzy score against the current input.
-    pub fn filter(&self, query: &str, limit: usize) -> Vec<String> {
-        let mut scored: Vec<(String, i64)> = self
+    /// Rank candidates by fuzzy score, preferring real project components and name matches.
+    pub fn filter(&self, query: &str, limit: usize) -> Vec<SuggestionItem> {
+        let tokens: Vec<&str> = query.split_whitespace().collect();
+        let query_lower = query.trim().to_ascii_lowercase();
+        let mut scored: Vec<(SuggestionItem, i64)> = self
             .items
             .iter()
             .filter_map(|item| {
-                let tokens: Vec<&str> = query.split_whitespace().collect();
-                if tokens.is_empty() {
-                    return Some((item.clone(), 0));
-                }
                 let mut total = 0i64;
-                for token in tokens {
-                    total = total.checked_add(matcher().fuzzy_match(item, token)?)?;
+                for token in &tokens {
+                    let score =
+                        MATCHER.with(|matcher| matcher.borrow().fuzzy_match(&item.value, token))?;
+                    total = total.checked_add(score)?;
+                }
+                if !query_lower.is_empty() {
+                    let value_lower = item.value.to_ascii_lowercase();
+                    let name = item
+                        .value
+                        .split_once(':')
+                        .map_or(item.value.as_str(), |(_, name)| name);
+                    let name_lower = name.to_ascii_lowercase();
+                    if name_lower == query_lower {
+                        total += 5_000;
+                    } else if name_lower.contains(&query_lower) {
+                        total += 2_500;
+                    } else if value_lower.contains(&query_lower) {
+                        total += 1_000;
+                    }
+                    if item.path.to_ascii_lowercase().contains(&query_lower) {
+                        total += 250;
+                    }
                 }
                 Some((item.clone(), total))
             })
             .collect();
-        scored.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .cmp(&left.1)
+                .then_with(|| left.0.path.is_empty().cmp(&right.0.path.is_empty()))
+                .then_with(|| left.0.value.cmp(&right.0.value))
+        });
         scored.truncate(limit);
         scored.into_iter().map(|(item, _)| item).collect()
     }
-}
-
-fn matcher() -> SkimMatcherV2 {
-    SkimMatcherV2::default().ignore_case()
 }
 
 /// A scaffold command supported by the Create metadata shortcut.
@@ -144,13 +196,15 @@ pub fn create_template_for(label: &str) -> Option<&'static CreateTemplate> {
 }
 
 pub fn create_suggestions() -> SuggestionSet {
-    SuggestionSet::new(
-        SuggestionKind::Create,
-        CREATE_TEMPLATES
+    SuggestionSet {
+        kind: SuggestionKind::Create,
+        items: CREATE_TEMPLATES
             .iter()
-            .map(|template| template.label.to_owned())
+            .map(|template| {
+                SuggestionItem::new(template.label, format!("sf {}", template.command.join(" ")))
+            })
             .collect(),
-    )
+    }
 }
 
 const COMMON_METADATA_TYPES: &[&str] = &[
@@ -168,40 +222,46 @@ const COMMON_METADATA_TYPES: &[&str] = &[
     "ValidationRule",
 ];
 
-/// Build completion candidates from the project's source files, manifests and common types.
+/// Build completion candidates from every source file, manifest and common metadata type.
 pub fn transfer_suggestions(project: Option<&SfProject>) -> SuggestionSet {
-    let mut items: Vec<String> = COMMON_METADATA_TYPES
+    let mut items: Vec<SuggestionItem> = COMMON_METADATA_TYPES
         .iter()
-        .map(|item| (*item).to_owned())
+        .map(|kind| SuggestionItem::new(*kind, "type"))
         .collect();
     if let Some(project) = project {
         for file in &project.source_files {
-            if let Some(component) = component_from_path(file) {
-                items.push(component);
+            if let Some((component, path)) = component_from_path(file) {
+                items.push(SuggestionItem::new(component, path));
             }
         }
         for manifest in &project.manifests {
             let Ok(xml) = std::fs::read_to_string(project.root.join(manifest)) else {
                 continue;
             };
-            items.extend(super::project::parse_manifest_components(&xml));
+            for component in super::project::parse_manifest_components(&xml) {
+                items.push(SuggestionItem::new(component, manifest.clone()));
+            }
         }
     }
-    items.sort();
-    items.dedup();
-    SuggestionSet::new(SuggestionKind::Transfer, items)
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|item| seen.insert(item.value.clone()));
+    items.sort_by(|left, right| left.value.cmp(&right.value));
+    SuggestionSet {
+        kind: SuggestionKind::Transfer,
+        items,
+    }
 }
 
-fn component_from_path(path: &str) -> Option<String> {
+fn component_from_path(path: &str) -> Option<(String, String)> {
     let parts: Vec<&str> = path.split('/').collect();
-    let file = parts.last()?;
+    let file = *parts.last()?;
     let folder = if parts.len() > 1 {
         parts[parts.len() - 2]
     } else {
         ""
     };
     let stem = file.split('.').next()?;
-    if stem.is_empty() || file.ends_with("-meta.xml") && stem.is_empty() {
+    if stem.is_empty() {
         return None;
     }
     let kind = match folder {
@@ -220,13 +280,12 @@ fn component_from_path(path: &str) -> Option<String> {
         "flexipages" => "FlexiPage",
         _ => return None,
     };
-    // For nested object fields, use the object name as the component qualifier.
     let name = if kind == "CustomField" && parts.len() > 3 {
         parts[parts.len() - 3]
     } else {
         stem
     };
-    Some(format!("{kind}:{name}"))
+    Some((format!("{kind}:{name}"), path.to_owned()))
 }
 
 #[cfg(test)]
@@ -234,31 +293,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transfer_suggestions_fuzzy_rank_and_dedupe() {
-        let set = SuggestionSet::new(
-            SuggestionKind::Transfer,
-            vec![
-                "ApexClass:Demo".to_owned(),
-                "Flow:Demo".to_owned(),
-                "Layout:Account".to_owned(),
+    fn project_components_out_rank_type_only_matches_and_keep_paths() {
+        let set = SuggestionSet {
+            kind: SuggestionKind::Transfer,
+            items: vec![
+                SuggestionItem::new("ApexClass", "type"),
+                SuggestionItem::new("ApexClass:Demo", "force-app/main/default/classes/Demo.cls"),
             ],
-        );
-        let hits = set.filter("apex demo", 5);
-        assert_eq!(hits.first().map(String::as_str), Some("ApexClass:Demo"));
+        };
+        let hits = set.filter("Demo", 5);
+        assert_eq!(hits[0].value, "ApexClass:Demo");
+        assert!(hits[0].path.ends_with("Demo.cls"));
         assert!(set.filter("zzzz", 5).is_empty());
     }
 
     #[test]
-    fn component_paths_map_to_types() {
-        assert_eq!(
-            component_from_path("force-app/main/default/classes/Demo.cls").as_deref(),
-            Some("ApexClass:Demo")
-        );
-        assert_eq!(
-            component_from_path("force-app/main/default/flows/Demo.flow-meta.xml").as_deref(),
-            Some("Flow:Demo")
-        );
-        assert!(component_from_path("force-app/main/default/classes/Demo.cls-meta.xml").is_some());
+    fn component_paths_map_to_types_with_source_paths() {
+        let (value, path) =
+            component_from_path("force-app/main/default/classes/Demo.cls").expect("component");
+        assert_eq!(value, "ApexClass:Demo");
+        assert_eq!(path, "force-app/main/default/classes/Demo.cls");
+        assert!(component_from_path("force-app/main/default/flows/Demo.flow-meta.xml").is_some());
+    }
+
+    #[test]
+    fn apex_classes_in_the_current_project_are_suggested_by_name() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let relative = "force-app/main/default/classes/DemoController.cls";
+        let path = dir.path().join(relative);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create dirs");
+        std::fs::write(&path, "public class DemoController {}").expect("write class");
+        let project = SfProject {
+            root: dir.path().to_path_buf(),
+            package_directories: vec!["force-app".to_owned()],
+            source_api_version: None,
+            manifests: Vec::new(),
+            source_files: vec![relative.to_owned()],
+        };
+        let hits = transfer_suggestions(Some(&project)).filter("DemoController", 5);
+        assert_eq!(hits[0].value, "ApexClass:DemoController");
+        assert_eq!(hits[0].path, relative);
     }
 
     #[test]

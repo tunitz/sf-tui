@@ -387,20 +387,21 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = crate::app::QUICK_ACTIONS
         .iter()
         .map(|action| {
-            ListItem::new(vec![
-                Line::from(vec![
-                    strong(format!("[{}] ", action.key), accent(app)),
-                    strong(action.label, Color::White),
-                    Span::styled(
-                        format!("   {}", action.command.trim_start_matches("sf ")),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]),
-                Line::from(Span::styled(
+            let mut lines = vec![Line::from(vec![
+                strong(format!("[{}] ", action.key), accent(app)),
+                strong(action.label, Color::White),
+                Span::styled(
+                    format!("   {}", action.command.trim_start_matches("sf ")),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])];
+            if !action.hint.is_empty() {
+                lines.push(Line::from(Span::styled(
                     format!("     {}", action.hint),
                     Style::default().fg(Color::Gray),
-                )),
-            ])
+                )));
+            }
+            ListItem::new(lines)
         })
         .collect();
     let mut state = ListState::default();
@@ -1059,7 +1060,7 @@ fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
                     PayloadMode::Manifest => {
                         options.manifest.as_deref() == Some(item.path.as_str())
                     }
-                    PayloadMode::Metadata => false,
+                    PayloadMode::Metadata => options.metadata_names.contains(&item.path),
                 };
                 Row::new(vec![
                     if selected { "x" } else { " " }.to_owned(),
@@ -1076,7 +1077,14 @@ fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_stateful_widget(
             Table::new(rows, [Constraint::Length(2), Constraint::Min(8)])
                 .header(Row::new(vec!["", "Path"]).style(Style::default().fg(accent(app))))
-                .block(block("metadata — Space selects", app))
+                .block(block(
+                    app.deploy_state
+                        .selected_component
+                        .as_deref()
+                        .map(|component| format!("Selected: {component} — Enter runs"))
+                        .unwrap_or_else(|| "components — Space selects".to_owned()),
+                    app,
+                ))
                 .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
                 .highlight_symbol(">"),
             sections[1],
@@ -1172,7 +1180,7 @@ fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
             let selected = match options.mode {
                 PayloadMode::Source => options.paths.contains(&item.path),
                 PayloadMode::Manifest => options.manifest.as_deref() == Some(item.path.as_str()),
-                PayloadMode::Metadata => false,
+                PayloadMode::Metadata => options.metadata_names.contains(&item.path),
             };
             Row::new(vec![
                 if selected { "✓" } else { " " }.to_owned(),
@@ -1196,7 +1204,14 @@ fn draw_deploy(frame: &mut Frame, area: Rect, app: &App) {
         ],
     )
     .header(Row::new(["", "kind", "path"]).style(Style::default().fg(accent(app))))
-    .block(block("metadata picker — Space selects", app))
+    .block(block(
+        app.deploy_state
+            .selected_component
+            .as_deref()
+            .map(|component| format!("Selected: {component} — Enter runs"))
+            .unwrap_or_else(|| "components — Space selects".to_owned()),
+        app,
+    ))
     .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White))
     .highlight_symbol("›");
     frame.render_stateful_widget(table, sections[1], &mut state);
@@ -1534,7 +1549,19 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             focus,
             ..
         } => {
-            let height = (fields.len() as u16 * 2 + 7).min(frame.area().height.saturating_sub(2));
+            let suggestion_lines: usize = fields
+                .iter()
+                .map(|field| {
+                    field
+                        .cached_suggestions()
+                        .len()
+                        .min(5)
+                        .saturating_mul(2)
+                        .saturating_add(1)
+                })
+                .sum();
+            let height = (fields.len() as u16 * 2 + 7 + suggestion_lines as u16)
+                .min(frame.area().height.saturating_sub(2));
             let area = centered(frame.area(), 76, height);
             frame.render_widget(Clear, area);
             let mut lines = Vec::new();
@@ -1566,19 +1593,34 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                     ));
                 }
                 lines.push(Line::from(spans));
-                let suggestions = crate::app::suggestions_for(field);
-                for (index, suggestion) in suggestions.iter().take(3).enumerate() {
+                let suggestions = field.cached_suggestions();
+                for (index, suggestion) in suggestions.iter().take(5).enumerate() {
                     let chosen = active && field.suggestion_index.unwrap_or(0) == index;
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("    {} ", if chosen { ">" } else { " " }),
                             Style::default().fg(if chosen { accent(app) } else { Color::DarkGray }),
                         ),
-                        faint(truncated(
-                            suggestion,
-                            usize::from(area.width).saturating_sub(10),
-                        )),
+                        Span::styled(
+                            truncated(
+                                &suggestion.value,
+                                usize::from(area.width).saturating_sub(10),
+                            ),
+                            Style::default().fg(if chosen { Color::White } else { Color::Gray }),
+                        ),
                     ]));
+                    if !suggestion.path.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "       {}",
+                                truncated(
+                                    &suggestion.path,
+                                    usize::from(area.width).saturating_sub(12)
+                                )
+                            ),
+                            Style::default().bg(Color::DarkGray).fg(Color::White),
+                        )));
+                    }
                 }
                 lines.push(Line::from(" "));
             }
@@ -1605,6 +1647,8 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Tab / 1-7", "next screen / jump directly"),
     ("Enter", "the highlighted action"),
     ("?", "show this help; any key closes it"),
+    ("h", "go Home from any screen"),
+    ("Backspace", "go back to the previous screen"),
     ("q / Ctrl+C", "quit / cancel the newest job"),
     ("/ (Catalog)", "fuzzy search the full CLI catalog"),
     ("f (Catalog)", "star the selected command"),

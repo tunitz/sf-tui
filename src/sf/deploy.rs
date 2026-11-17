@@ -15,9 +15,9 @@ pub enum PayloadMode {
 impl PayloadMode {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Source => "Source paths",
-            Self::Manifest => "Manifest (package.xml)",
-            Self::Metadata => "Metadata names (no paths)",
+            Self::Source => "Paths",
+            Self::Manifest => "Manifest",
+            Self::Metadata => "Component",
         }
     }
 }
