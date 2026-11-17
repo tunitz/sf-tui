@@ -1120,17 +1120,73 @@ fn test_run_lines(
     lines
 }
 
+fn summary_chips(summary: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (index, part) in summary
+        .split('·')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .enumerate()
+    {
+        if index > 0 {
+            spans.push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
+        }
+        let lower = part.to_ascii_lowercase();
+        let color = if lower.contains("fail") || lower.contains("error") {
+            Color::Red
+        } else if lower.contains("pass") || lower.contains("succeed") {
+            Color::Green
+        } else if lower.contains("coverage") || lower.contains('%') {
+            Color::Yellow
+        } else {
+            Color::Gray
+        };
+        spans.push(Span::styled(part.to_owned(), Style::default().fg(color)));
+    }
+    Line::from(spans)
+}
+
+fn coverage_bar(covered: usize, total: usize) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    let width = 12usize;
+    let filled = (covered * width).div_ceil(total).min(width);
+    let mut bar = String::new();
+    for index in 0..width {
+        bar.push(if index < filled { '█' } else { '░' });
+    }
+    bar
+}
+
 fn result_item_line(item: &crate::app::ResultItem) -> Line<'static> {
     let icon = if item.ok { "✓" } else { "x" };
     let color = if item.ok { Color::Green } else { Color::Red };
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!("[{icon}] "), Style::default().fg(color)),
         Span::styled(item.label.clone(), Style::default().fg(Color::White)),
-        Span::styled(
+    ];
+    if let Some((covered, total)) = item.progress {
+        let pct = (covered * 100).checked_div(total).unwrap_or(0);
+        let bar_color = if pct >= 80 {
+            Color::Green
+        } else if pct >= 50 {
+            Color::Yellow
+        } else {
+            Color::Red
+        };
+        spans.push(Span::styled(
+            format!(" {} ", coverage_bar(covered, total)),
+            Style::default().fg(bar_color),
+        ));
+    }
+    if !item.detail.is_empty() {
+        spans.push(Span::styled(
             format!("  {}", item.detail),
             Style::default().fg(if item.ok { Color::DarkGray } else { Color::Red }),
-        ),
-    ])
+        ));
+    }
+    Line::from(spans)
 }
 
 fn draw_result_view(
@@ -1143,9 +1199,13 @@ fn draw_result_view(
     let color = if result.ok { Color::Green } else { Color::Red };
     let mut lines = vec![
         strong(&result.title, accent(app))
-            + Span::styled(" — ", Style::default().fg(Color::DarkGray))
+            + Span::styled("  ", Style::default().fg(Color::DarkGray))
             + strong(&result.status, color),
-        Line::from(faint(&result.summary)),
+        Line::from(Span::styled(
+            "─".repeat(area.width.saturating_sub(2) as usize),
+            Style::default().fg(Color::DarkGray),
+        )),
+        summary_chips(&result.summary),
         Line::from(" "),
     ];
     for item in result.items.iter().take(20) {
@@ -1167,7 +1227,7 @@ fn draw_result_view(
     }
     lines.push(Line::from(" "));
     lines.push(Line::from(faint(
-        "[o] raw output   [h] Home   [Esc] Back   [r] Rerun",
+        "[o] raw output   [Esc] Back   [h] Home   [r] Rerun",
     )));
     if result.kind == crate::app::ResultKind::ApexTests {
         lines.push(Line::from(faint("[v] saved results")));
@@ -1747,7 +1807,7 @@ const HELP_ROWS: &[(&str, &str)] = &[
     ("Enter", "the highlighted action"),
     ("?", "show this help; any key closes it"),
     ("h", "go Home from any screen"),
-    ("Backspace", "go back to the previous screen"),
+    ("Esc", "cancel active job or go back to previous screen"),
     ("q / Ctrl+C", "quit / cancel the newest job"),
     ("/ (Catalog)", "fuzzy search the full CLI catalog"),
     ("f (Catalog)", "star the selected command"),

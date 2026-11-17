@@ -61,7 +61,7 @@ Home is just the menu:
 [4] Org
 ```
 
-Global: `Tab` next screen · `h` Home · `Backspace` back · `?` help · `q` quit.
+Global: `Tab` next screen · `h` Home · `Esc` cancel/back · `?` help · `q` quit.
 
 Apex Tests follows the same pattern: type to find real test classes (`*Test.cls` or `@IsTest`),
 `Space` check/uncheck, `Enter` confirm. Results are saved locally (last 50 runs) and shown with
@@ -70,7 +70,7 @@ screen to view previous runs. The Org menu replaces the old login shortcut: chec
 switch, login, delete/logout or reauth.
 
 On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
-`Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`. The search is async and debounced; selected components keep their source
+`Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`. `Esc` goes back. The search is async and debounced; selected components keep their source
 paths and become `--metadata` entries in the command.
 
 The confirmation dialog shows every selected component as a checkbox: `Space` toggles, `↑↓` moves,
@@ -78,8 +78,9 @@ The confirmation dialog shows every selected component as a checkbox: `Space` to
 goes back.
 
 Every command result is rendered human-readable immediately: status, counts, per-item pass/fail
-rows with `[✓]`/`[x]` icons, and sections for errors/values. Raw stdout/JSON is behind `o`. Apex
-test results also include per-class coverage; press `v` to view saved runs.
+rows with `[✓]`/`[x]` icons, color-coded metric chips, progress bars and section headers. Raw
+stdout/JSON is behind `o`. Apex test results show per-class coverage with percent, covered/total
+lines and uncovered counts; press `v` to view saved runs.
 
 ## Configuration
 

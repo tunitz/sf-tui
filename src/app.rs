@@ -316,6 +316,7 @@ pub struct ResultItem {
     pub ok: bool,
     pub label: String,
     pub detail: String,
+    pub progress: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -913,6 +914,7 @@ impl App {
                             ok: true,
                             label: "Deploy request accepted".to_owned(),
                             detail: id.clone(),
+                            progress: None,
                         }],
                         coverage: Vec::new(),
                         sections: Vec::new(),
@@ -1169,10 +1171,9 @@ impl App {
             KeyCode::F(5) => self.refresh_current_tab(),
             KeyCode::Esc => {
                 if !self.cancel_active_job() {
-                    self.status.clear();
+                    self.go_back();
                 }
             }
-            KeyCode::Backspace if !self.catalog_state.search_focused => self.go_back(),
             KeyCode::Char('h') if !self.catalog_state.search_focused => self.go_home(),
             KeyCode::Char('y') => self.copy_context(),
             _ => match self.tab {
@@ -1399,7 +1400,7 @@ impl App {
                 self.transfer_search.query.pop();
                 self.transfer_search.mark_edited();
             }
-            KeyCode::Esc => self.go_home(),
+            KeyCode::Esc => self.go_back(),
             KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.transfer_search.query.push(character);
                 self.transfer_search.mark_edited();
@@ -2908,7 +2909,12 @@ pub fn generic_result(title: &str, outcome: &ProcessOutcome, parsed: Option<&Val
             let label = row.first().cloned().unwrap_or_default();
             let detail = row.iter().skip(1).cloned().collect::<Vec<_>>().join(" | ");
             if !label.is_empty() || !detail.is_empty() {
-                items.push(ResultItem { ok, label, detail });
+                items.push(ResultItem {
+                    ok,
+                    label,
+                    detail,
+                    progress: None,
+                });
             }
         }
     }
@@ -2925,6 +2931,7 @@ pub fn generic_result(title: &str, outcome: &ProcessOutcome, parsed: Option<&Val
                 ok: !bad,
                 label: line.trim().to_owned(),
                 detail: String::new(),
+                progress: None,
             });
         }
     }
@@ -2938,6 +2945,7 @@ pub fn generic_result(title: &str, outcome: &ProcessOutcome, parsed: Option<&Val
                 ok: false,
                 label: line.trim().to_owned(),
                 detail: String::new(),
+                progress: None,
             })
             .collect();
         sections.push(ResultSection {
@@ -2979,6 +2987,7 @@ fn transfer_result(retrieve: bool, report: &TransferReport, job_id: Option<&str>
                 "Deploy request".to_owned()
             },
             detail: job_id.unwrap_or("").to_owned(),
+            progress: None,
         }]
     } else {
         report
@@ -3001,6 +3010,7 @@ fn transfer_result(retrieve: bool, report: &TransferReport, job_id: Option<&str>
                     } else {
                         format!("{} — {}", component.status, component.problem)
                     },
+                    progress: None,
                 }
             })
             .collect()
@@ -3044,6 +3054,7 @@ fn apex_result(run: &TestRun) -> ResultView {
             } else {
                 format!("{} — {}", test.outcome, test.message)
             },
+            progress: None,
         })
         .collect();
     let coverage = run
@@ -3055,7 +3066,16 @@ fn apex_result(run: &TestRun) -> ResultView {
             detail: if item.total == 0 {
                 item.percent.clone()
             } else {
-                format!("{} ({}/{})", item.percent, item.covered, item.total)
+                let uncovered = item.total.saturating_sub(item.covered);
+                format!(
+                    "{} · {}/{} lines · {} uncovered",
+                    item.percent, item.covered, item.total, uncovered
+                )
+            },
+            progress: if item.total == 0 {
+                None
+            } else {
+                Some((item.covered, item.total))
             },
         })
         .collect();
@@ -3359,12 +3379,12 @@ mod tests {
     }
 
     #[test]
-    fn home_key_and_backspace_navigate_between_screens() {
+    fn home_key_and_esc_navigate_between_screens() {
         let mut app = test_app();
         app.tab = Tab::Orgs;
         app.handle_key(key(KeyCode::Char('h')));
         assert_eq!(app.tab, Tab::Home);
-        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.tab, Tab::Orgs);
     }
 

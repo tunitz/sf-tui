@@ -170,16 +170,23 @@ fn extend_coverages(coverages: &mut Vec<Coverage>, items: &[Value]) {
         if name.is_empty() {
             continue;
         }
-        let covered = count(
+        let nested = item.get("coverage");
+        let mut covered = count(
             item.get("numLinesCovered")
                 .or_else(|| item.get("NumLinesCovered"))
                 .or_else(|| item.get("coveredLines")),
         );
-        let uncovered = count(
+        if covered == 0 {
+            covered = count(nested.and_then(|value| value.get("coveredLines")));
+        }
+        let mut uncovered = count(
             item.get("numLinesUncovered")
                 .or_else(|| item.get("NumLinesUncovered"))
                 .or_else(|| item.get("uncoveredLines")),
         );
+        if uncovered == 0 {
+            uncovered = count(nested.and_then(|value| value.get("uncoveredLines")));
+        }
         let percent = string_field(item, "percentage")
             .or_else(|| string_field(item, "percent"))
             .or_else(|| item.get("percentage").map(Value::to_string))
@@ -250,6 +257,24 @@ mod tests {
         assert_eq!(run.failures.len(), 1);
         assert_eq!(run.coverages[0].name, "Demo");
         assert_eq!(run.coverages[0].total, 10);
+    }
+
+    #[test]
+    fn parses_nested_coverage_line_counts() {
+        let value = serde_json::json!({
+          "status": 0,
+          "result": {
+            "summary": {"outcome": "Passed", "testsRan": 1, "passing": 1, "failing": 0, "testRunCoverage": "75%"},
+            "codecoverage": [{
+              "name": "Demo",
+              "percentage": "75%",
+              "coverage": {"coveredLines": [1, 2, 3], "uncoveredLines": [4]}
+            }]
+          }
+        });
+        let run = parse(&value, "sf apex run test");
+        assert_eq!(run.coverages[0].covered, 3);
+        assert_eq!(run.coverages[0].total, 4);
     }
 
     #[test]

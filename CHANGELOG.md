@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.12] - 2026-11-17
+
+### Changed
+
+- `Esc` now cancels the active job or goes back to the previous screen. `Backspace` is no longer
+  global navigation.
+- Result views are more visual: banner, colored metric chips, `[✓]`/`[x]` rows and section headers.
+- Apex coverage rows now show progress bars and full numbers: percent, covered/uncovered lines,
+  and total lines, including nested `coverage.coveredLines` shapes.
+
+[0.1.12]: https://github.com/tunitz/sf-tui/releases/tag/v0.1.12
+
 ## [0.1.11] - 2026-11-17
 
 ### Changed
