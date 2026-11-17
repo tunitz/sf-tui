@@ -161,6 +161,7 @@ pub fn run(options: UpdateOptions) -> Result<(), UpdateError> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstallOutcome {
+    #[cfg_attr(windows, allow(dead_code))]
     Replaced,
     #[cfg_attr(not(windows), allow(dead_code))]
     Staged,
