@@ -223,13 +223,6 @@ struct TestReport {
     coverage_polls: u32,
 }
 
-/// Which pane of the Tests screen receives navigation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestsFocus {
-    Search,
-    Coverage,
-}
-
 #[derive(Debug, Clone)]
 pub struct TransferSelection {
     pub item: SuggestionItem,
@@ -493,7 +486,7 @@ pub enum JobsFocus {
     Detail,
 }
 
-/// Which pane of the F6 Apex test history modal receives navigation.
+/// Which pane of the F8 Apex test history modal receives navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestHistoryFocus {
     List,
@@ -670,7 +663,7 @@ pub enum Modal {
     Help {
         scroll: usize,
     },
-    /// Global F3 command catalog: type to filter, arrows to move, Enter to confirm and run.
+    /// Global F7 command catalog: type to filter, arrows to move, Enter to confirm and run.
     Catalog {
         query: String,
         selected: usize,
@@ -694,7 +687,7 @@ pub enum Modal {
         scroll: usize,
         follow: bool,
     },
-    /// F6 on the Tests screen: two-pane list of saved Apex runs and their full results.
+    /// F8 on the Tests screen: two-pane list of saved Apex runs and their full results.
     TestHistory {
         selected: usize,
         list_scroll: usize,
@@ -786,8 +779,6 @@ pub struct App {
     pub test_search: TransferSearchState,
     pub output_state: OutputState,
     pub modal: Option<Modal>,
-    pub tests_focus: TestsFocus,
-    pub coverage_scroll: usize,
     pub setup_selected: usize,
     tab_history: Vec<Tab>,
     suggestion_cache: Option<(PathBuf, Arc<SuggestionSet>)>,
@@ -807,9 +798,7 @@ pub struct App {
     next_job_id: u64,
     /// Rows available in the Jobs detail pane at the last draw, used to clamp scrolling.
     pub(crate) jobs_detail_height: Cell<u16>,
-    /// Coverage rows visible at the last Tests draw, used to clamp table scrolling.
-    pub(crate) tests_coverage_rows: Cell<usize>,
-    /// List rows and detail line count recorded for the F6 history modal at the last draw.
+    /// List rows and detail line count recorded for the F8 history modal at the last draw.
     pub(crate) test_history_list_rows: Cell<usize>,
     pub(crate) test_history_detail_lines: Cell<usize>,
     /// Memoized result/detail line vectors, keyed by record revision, width and render flags.
@@ -894,8 +883,6 @@ impl App {
             test_search: TransferSearchState::new(false),
             output_state: OutputState::default(),
             modal: None,
-            tests_focus: TestsFocus::Search,
-            coverage_scroll: 0,
             setup_selected: 0,
             tab_history: Vec::new(),
             suggestion_cache: None,
@@ -914,7 +901,6 @@ impl App {
             test_reports: HashMap::new(),
             next_job_id: 1,
             jobs_detail_height: Cell::new(10),
-            tests_coverage_rows: Cell::new(6),
             test_history_list_rows: Cell::new(6),
             test_history_detail_lines: Cell::new(10),
             render_cache: RefCell::new(RenderCache::default()),
@@ -1511,9 +1497,8 @@ impl App {
                     ApexReportAction::Final => {
                         result_view = Some(apex_result(&run));
                         self.output_state.show_details = false;
-                        self.tests_focus = TestsFocus::Search;
-                        self.coverage_scroll = 0;
                         self.remember_apex_run(&run, org.clone(), job_id);
+                        self.keep_jobs_selection_on(job_id);
                         if succeeded {
                             self.notice("Apex test results ready — F2 jobs shows the details");
                         }
@@ -1523,8 +1508,6 @@ impl App {
                         if let Some(record) = self.output_state.find_mut(job_id) {
                             record.pending_report = true;
                         }
-                        self.tests_focus = TestsFocus::Search;
-                        self.coverage_scroll = 0;
                         self.test_reports.insert(
                             job_id,
                             TestReport {
@@ -1558,6 +1541,9 @@ impl App {
             && let Some(record) = self.output_state.find_mut(job_id)
         {
             record.result = Some(view);
+            // The final result (including a start-then-poll placeholder) is assigned here, after
+            // every earlier revision bump, so the detail cache key must change with it.
+            record.bump_render_revision();
         }
         let user_command = matches!(
             purpose,
@@ -1571,9 +1557,6 @@ impl App {
 
     /// Apply one polled `apex get test` response: finish the record or keep polling.
     fn apply_test_report(&mut self, record_id: u64, value: &Value, succeeded: bool) {
-        if let Some(record) = self.output_state.find_mut(record_id) {
-            record.bump_render_revision();
-        }
         let Some(report) = self.test_reports.get(&record_id) else {
             return;
         };
@@ -1593,11 +1576,13 @@ impl App {
             if let Some(record) = self.output_state.find_mut(record_id) {
                 record.result = Some(view);
                 record.pending_report = false;
+                record.ended_at.get_or_insert_with(Instant::now);
+                // Bump after every mutation so the cached detail cannot survive the new result.
+                record.bump_render_revision();
             }
             self.test_reports.remove(&record_id);
-            self.coverage_scroll = 0;
-            self.tests_focus = TestsFocus::Search;
             self.remember_apex_run(&run, org, record_id);
+            self.keep_jobs_selection_on(record_id);
             self.notice("Apex tests finished — F2 jobs");
             return;
         }
@@ -1609,21 +1594,22 @@ impl App {
             }
         }
         // Show progress in the running job while the org keeps working.
-        if let Some(record) = self.output_state.find_mut(record_id)
-            && let Some(view) = record.result.as_mut()
-        {
-            view.summary = if terminal {
-                format!("test run {run_id} passed — collecting coverage")
-            } else {
-                format!(
-                    "test run {run_id} {}",
-                    if run.outcome.is_empty() {
-                        "running"
-                    } else {
-                        run.outcome.as_str()
-                    }
-                )
-            };
+        if let Some(record) = self.output_state.find_mut(record_id) {
+            if let Some(view) = record.result.as_mut() {
+                view.summary = if terminal {
+                    format!("test run {run_id} passed — collecting coverage")
+                } else {
+                    format!(
+                        "test run {run_id} {}",
+                        if run.outcome.is_empty() {
+                            "running"
+                        } else {
+                            run.outcome.as_str()
+                        }
+                    )
+                };
+            }
+            record.bump_render_revision();
         }
     }
 
@@ -1641,9 +1627,6 @@ impl App {
 
     /// Stop polling a started test run and mark its row as failed rather than a false success.
     fn abandon_test_report(&mut self, record_id: u64, reason: &str) {
-        if let Some(record) = self.output_state.find_mut(record_id) {
-            record.bump_render_revision();
-        }
         self.test_reports.remove(&record_id);
         if let Some(record) = self.output_state.find_mut(record_id) {
             record.pending_report = false;
@@ -1659,8 +1642,28 @@ impl App {
                     detail: reason.to_owned(),
                     progress: None,
                 }];
+            } else {
+                // A poll that failed before the placeholder result existed still needs a clear
+                // failed result instead of an empty "waiting" row.
+                record.result = Some(ResultView {
+                    kind: ResultKind::ApexTests,
+                    title: "Apex tests".to_owned(),
+                    status: "Report unavailable".to_owned(),
+                    ok: false,
+                    summary: reason.to_owned(),
+                    items: vec![ResultItem {
+                        ok: false,
+                        label: "Test results unavailable".to_owned(),
+                        detail: reason.to_owned(),
+                        progress: None,
+                    }],
+                    coverage: Vec::new(),
+                    sections: Vec::new(),
+                });
             }
+            record.bump_render_revision();
         }
+        self.keep_jobs_selection_on(record_id);
         self.error(format!("Apex test report stopped: {reason}"));
     }
 
@@ -2089,7 +2092,7 @@ impl App {
             self.open_jobs();
             return;
         }
-        if key.code == KeyCode::F(3) {
+        if key.code == KeyCode::F(7) {
             self.open_catalog();
             return;
         }
@@ -2097,8 +2100,8 @@ impl App {
             self.open_switch_org();
             return;
         }
-        if key.code == KeyCode::F(6) {
-            // Apex test history is a Tests-only popup; F6 is inert on every other screen.
+        if key.code == KeyCode::F(8) {
+            // Apex test history is a Tests-only popup; F8 is inert on every other screen.
             if self.tab == Tab::Tests {
                 self.modal = Some(Modal::TestHistory {
                     selected: 0,
@@ -2511,47 +2514,6 @@ impl App {
     }
 
     fn test_key(&mut self, key: KeyEvent) {
-        let coverage = self
-            .latest_result(TaskKind::Tests)
-            .map(|result| result.coverage.len())
-            .unwrap_or(0);
-        if self.tests_focus == TestsFocus::Coverage && coverage == 0 {
-            self.tests_focus = TestsFocus::Search;
-        }
-        if self.tests_focus == TestsFocus::Coverage && coverage > 0 {
-            let visible = self.tests_coverage_rows.get().max(1);
-            let max_scroll = coverage.saturating_sub(visible);
-            match key.code {
-                KeyCode::Tab => {
-                    self.tests_focus = TestsFocus::Search;
-                    self.notice("Back to test search");
-                }
-                KeyCode::Esc => self.go_back(),
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.coverage_scroll = self.coverage_scroll.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.coverage_scroll = (self.coverage_scroll + 1).min(max_scroll);
-                }
-                KeyCode::PageUp => {
-                    self.coverage_scroll = self.coverage_scroll.saturating_sub(10);
-                }
-                KeyCode::PageDown => {
-                    self.coverage_scroll = (self.coverage_scroll + 10).min(max_scroll);
-                }
-                KeyCode::Home => self.coverage_scroll = 0,
-                KeyCode::End => self.coverage_scroll = max_scroll,
-                _ => {}
-            }
-            return;
-        }
-        if key.code == KeyCode::Tab && coverage > 0 {
-            self.tests_focus = TestsFocus::Coverage;
-            let visible = self.tests_coverage_rows.get().max(1);
-            self.coverage_scroll = self.coverage_scroll.min(coverage.saturating_sub(visible));
-            self.notice("Coverage table — ↑↓ scroll · Tab back to search");
-            return;
-        }
         match key.code {
             KeyCode::Up => self.test_search.cursor = self.test_search.cursor.saturating_sub(1),
             KeyCode::Down => {
@@ -2647,6 +2609,16 @@ impl App {
             .and_then(|record| record.result.as_ref())
     }
 
+    /// Number of Apex test runs still active: the initial `apex run test` command and its
+    /// start-then-poll follow-up share one Tests record, so each run is counted once.
+    pub fn active_apex_test_runs(&self) -> usize {
+        self.output_state
+            .records
+            .iter()
+            .filter(|record| record.task == TaskKind::Tests && record.is_running())
+            .count()
+    }
+
     /// Every visible job in Jobs-window order: running newest first, then queued in FIFO
     /// order, then finished newest first.
     pub fn job_rows(&self) -> Vec<JobRow<'_>> {
@@ -2716,7 +2688,7 @@ impl App {
         self.modal = Some(Modal::SwitchOrg { selected });
     }
 
-    /// Open the bundled command catalog. F3: discover an sf command from any screen without
+    /// Open the bundled command catalog. F7: discover an sf command from any screen without
     /// adding a menu entry or probing the CLI.
     fn open_catalog(&mut self) {
         self.modal = Some(Modal::Catalog {
@@ -2742,6 +2714,32 @@ impl App {
             scroll: 0,
             follow: true,
         });
+    }
+
+    /// Keep an open Jobs window pointing at `record_id` when that record changes section (a
+    /// pending Apex run moving to FINISHED reorders `job_rows`), so the detail pane follows the
+    /// same job instead of silently selecting a different one at the old index.
+    fn keep_jobs_selection_on(&mut self, record_id: u64) {
+        let target = self
+            .job_rows()
+            .into_iter()
+            .enumerate()
+            .find(|(_, row)| row.record.id == record_id)
+            .map(|(index, row)| (index, row.section == JobSection::Finished));
+        if let Some((index, finished)) = target
+            && let Some(Modal::Jobs {
+                selected,
+                scroll,
+                follow,
+                ..
+            }) = self.modal.as_mut()
+        {
+            *selected = index;
+            if finished {
+                *scroll = 0;
+                *follow = false;
+            }
+        }
     }
 
     /// Drop every finished job row; running, queued and pending-report rows are untouched.
@@ -2882,7 +2880,7 @@ impl App {
         });
     }
 
-    /// Keys for the Tests-only F6 history popup. The list keeps ↑↓ selection while the detail
+    /// Keys for the Tests-only F8 history popup. The list keeps ↑↓ selection while the detail
     /// pane scrolls with j/k/PgUp/PgDn/Home/End once focused.
     fn handle_test_history_key(
         &mut self,
@@ -5344,23 +5342,44 @@ mod tests {
     }
 
     #[test]
-    fn f3_opens_the_catalog_from_every_screen() {
+    fn f7_opens_the_catalog_from_every_screen() {
         let mut app = test_app();
         for tab in app.screens() {
             app.tab = tab;
-            app.handle_key(key(KeyCode::F(3)));
+            app.handle_key(key(KeyCode::F(7)));
             assert!(
                 matches!(app.modal, Some(Modal::Catalog { .. })),
-                "F3 did not open the catalog on {tab:?}"
+                "F7 did not open the catalog on {tab:?}"
             );
             app.modal = None;
         }
     }
 
     #[test]
+    fn plain_letters_and_digits_reach_the_search_fields() {
+        let mut app = test_app();
+        for tab in [Tab::Retrieve, Tab::Deploy, Tab::Tests] {
+            app.tab = tab;
+            app.modal = None;
+            app.transfer_search.query.clear();
+            app.test_search.query.clear();
+            for character in "e2v".chars() {
+                app.handle_key(key(KeyCode::Char(character)));
+            }
+            assert!(app.modal.is_none(), "plain keys opened a modal on {tab:?}");
+            let query = if tab == Tab::Tests {
+                app.test_search.query.as_str()
+            } else {
+                app.transfer_search.query.as_str()
+            };
+            assert_eq!(query, "e2v", "search field missed plain keys on {tab:?}");
+        }
+    }
+
+    #[test]
     fn catalog_selection_confirms_the_exact_command() {
         let mut app = test_app();
-        app.handle_key(key(KeyCode::F(3)));
+        app.handle_key(key(KeyCode::F(7)));
         for character in "org list".chars() {
             app.handle_key(key(KeyCode::Char(character)));
         }
@@ -5439,7 +5458,7 @@ mod tests {
     #[test]
     fn catalog_empty_search_keeps_the_modal_open_on_enter() {
         let mut app = test_app();
-        app.handle_key(key(KeyCode::F(3)));
+        app.handle_key(key(KeyCode::F(7)));
         for character in "zzzznotacommand".chars() {
             app.handle_key(key(KeyCode::Char(character)));
         }
@@ -5488,6 +5507,122 @@ mod tests {
     }
 
     #[test]
+    fn active_apex_test_runs_counts_running_and_pending_runs_once() {
+        let mut app = test_app();
+        assert_eq!(app.active_apex_test_runs(), 0);
+
+        let mut initial = record(1, TaskKind::Tests, Some(0));
+        initial.finished = false; // initial `apex run test` command still running
+        app.output_state.records.push(initial);
+        assert_eq!(app.active_apex_test_runs(), 1);
+
+        let mut polling = record(2, TaskKind::Tests, Some(0));
+        polling.pending_report = true; // start-then-poll phase of a second run
+        app.output_state.records.push(polling);
+        // A running deploy and a finished Apex run are not active test runs.
+        app.output_state
+            .records
+            .push(record(3, TaskKind::Deploy, None));
+        app.output_state
+            .records
+            .push(record(4, TaskKind::Tests, Some(0)));
+        assert_eq!(app.active_apex_test_runs(), 2);
+
+        // When the first command returns, start-then-poll keeps it active via pending_report.
+        app.output_state.records[0].finished = true;
+        app.output_state.records[0].pending_report = true;
+        assert_eq!(app.active_apex_test_runs(), 2);
+        app.output_state.records[1].pending_report = false;
+        assert_eq!(app.active_apex_test_runs(), 1);
+    }
+
+    #[test]
+    fn finalized_apex_report_refreshes_the_detail_and_keeps_the_jobs_selection() {
+        let mut app = test_app();
+        let mut pending = record(7, TaskKind::Tests, Some(0));
+        pending.pending_report = true;
+        pending.result = Some(started_test_view("08N000000000001"));
+        app.output_state.records.push(pending);
+        app.test_reports.insert(
+            7,
+            TestReport {
+                run_id: "08N000000000001".to_owned(),
+                org: None,
+                command: "sf apex run test".to_owned(),
+                poll_after: Instant::now(),
+                attempts: 1,
+                failures: 0,
+                // Last extra poll for per-class coverage: a terminal result must finalize here.
+                coverage_polls: 3,
+            },
+        );
+        app.modal = Some(Modal::Jobs {
+            selected: 0,
+            focus: JobsFocus::Detail,
+            scroll: 0,
+            follow: true,
+        });
+
+        let before = crate::ui::job_detail_text(&app, 7);
+        assert!(
+            before
+                .iter()
+                .any(|line| line.contains("waiting for org results")),
+            "pending detail should show the waiting placeholder"
+        );
+        let before_revision = app.output_state.records[0].render_revision;
+
+        app.apply_test_report(
+            7,
+            &serde_json::json!({
+                "result": {
+                    "testRunId": "08N000000000001",
+                    "summary": {
+                        "outcome": "Passed",
+                        "testsRan": 1,
+                        "passing": 1,
+                        "failing": 0,
+                        "testRunCoverage": "80%"
+                    },
+                    "tests": [{"FullName": "DemoTest.ok", "Outcome": "Pass"}]
+                }
+            }),
+            true,
+        );
+
+        let record = &app.output_state.records[0];
+        assert!(!record.pending_report);
+        assert!(record.ended_at.is_some());
+        assert!(
+            record.render_revision > before_revision,
+            "detail cache key must change"
+        );
+        assert_eq!(
+            record.result.as_ref().map(|view| view.status.as_str()),
+            Some("Passed")
+        );
+        let after = crate::ui::job_detail_text(&app, 7);
+        assert!(
+            !after
+                .iter()
+                .any(|line| line.contains("waiting for org results")),
+            "final detail must not show the waiting placeholder: {after:?}"
+        );
+        assert!(after.iter().any(|line| line.contains("Passed")));
+        // The row moved from RUNNING to FINISHED; the Jobs window must still select it.
+        assert_eq!(app.job_rows()[0].record.id, 7);
+        assert_eq!(app.job_rows()[0].section, JobSection::Finished);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Jobs {
+                selected: 0,
+                follow: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn cancelling_a_pending_report_removes_the_poll_entry() {
         let mut app = test_app();
         let mut pending = record(4, TaskKind::Tests, Some(0));
@@ -5517,44 +5652,6 @@ mod tests {
         assert!(record.finished);
         assert_eq!(record.exit_code, None);
         assert_eq!(app.job_rows()[0].section, JobSection::Finished);
-    }
-
-    #[test]
-    fn tests_tab_switches_to_coverage_only_when_a_table_exists() {
-        let mut app = test_app();
-        app.tab = Tab::Tests;
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.tests_focus, TestsFocus::Search);
-
-        let mut finished = record(1, TaskKind::Tests, Some(0));
-        finished.result = Some(ResultView {
-            kind: ResultKind::ApexTests,
-            title: "Apex tests".to_owned(),
-            status: "Passed".to_owned(),
-            ok: true,
-            summary: "2 run · 2 passed · 0 failed".to_owned(),
-            items: Vec::new(),
-            coverage: (0..8)
-                .map(|index| ResultItem {
-                    ok: true,
-                    label: format!("Demo{index}"),
-                    detail: format!("{}%", 30 + index * 5),
-                    progress: Some((index + 1, 10)),
-                })
-                .collect(),
-            sections: Vec::new(),
-        });
-        app.output_state.records.push(finished);
-        app.tests_coverage_rows.set(2);
-
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.tests_focus, TestsFocus::Coverage);
-        app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.coverage_scroll, 1);
-        app.handle_key(key(KeyCode::End));
-        assert_eq!(app.coverage_scroll, 6);
-        app.handle_key(key(KeyCode::Tab));
-        assert_eq!(app.tests_focus, TestsFocus::Search);
     }
 
     #[test]
@@ -6043,12 +6140,12 @@ mod tests {
     }
 
     #[test]
-    fn f6_opens_test_history_only_on_the_tests_screen() {
+    fn f8_opens_test_history_only_on_the_tests_screen() {
         let mut app = test_app();
-        app.handle_key(key(KeyCode::F(6)));
-        assert!(app.modal.is_none(), "F6 must be inert outside Tests");
+        app.handle_key(key(KeyCode::F(8)));
+        assert!(app.modal.is_none(), "F8 must be inert outside Tests");
         app.tab = Tab::Tests;
-        app.handle_key(key(KeyCode::F(6)));
+        app.handle_key(key(KeyCode::F(8)));
         assert!(matches!(app.modal, Some(Modal::TestHistory { .. })));
         app.handle_key(key(KeyCode::Esc));
         assert!(app.modal.is_none());

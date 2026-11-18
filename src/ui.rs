@@ -8,9 +8,7 @@ use ratatui::widgets::{
     Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 
-use crate::app::{
-    App, JobSection, JobsFocus, Modal, ResultItem, Tab, TestHistoryFocus, TestsFocus,
-};
+use crate::app::{App, JobSection, JobsFocus, Modal, ResultItem, Tab, TestHistoryFocus};
 use crate::json_view;
 use crate::view::apex_result;
 
@@ -76,27 +74,6 @@ fn density(area: Rect) -> Density {
     } else {
         Density::Roomy
     }
-}
-
-/// Split the Tests body between the test list and the coverage table. The list always keeps a
-/// usable minimum; when there is not enough room the coverage pane is hidden entirely.
-fn tests_pane_heights(body_height: u16, density: Density) -> Option<(u16, u16)> {
-    let min_list: u16 = match density {
-        Density::Tiny => 3,
-        Density::Compact => 4,
-        Density::Roomy => 6,
-    };
-    let min_coverage: u16 = match density {
-        Density::Tiny => 4,
-        Density::Compact => 5,
-        Density::Roomy => 6,
-    };
-    if body_height < min_list.saturating_add(min_coverage) {
-        return None;
-    }
-    let desired = ((u32::from(body_height) * 40 / 100) as u16).clamp(min_coverage, 14);
-    let coverage = desired.min(body_height - min_list);
-    Some((body_height - coverage, coverage))
 }
 
 fn block(title: impl Into<String>, app: &App) -> Block<'static> {
@@ -355,15 +332,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, density: Density) {
     );
 }
 
-/// Footer context for a screen. Tests has sub-states whose keycaps change with focus and
-/// coverage availability, so they are distinct contexts here.
+/// Footer context for a screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HintContext {
     Home,
     Transfer,
-    TestsSearch,
-    TestsCoverage,
-    TestsPlain,
+    Tests,
     Orgs,
     Setup,
 }
@@ -397,8 +371,7 @@ const KEYMAP: &[KeyBinding] = &[
         hints: &[
             (HintContext::Home, "open"),
             (HintContext::Transfer, "confirm"),
-            (HintContext::TestsSearch, "confirm"),
-            (HintContext::TestsPlain, "confirm"),
+            (HintContext::Tests, "confirm"),
             (HintContext::Orgs, "details"),
             (HintContext::Setup, "run"),
         ],
@@ -424,9 +397,7 @@ const KEYMAP: &[KeyBinding] = &[
         cap: "Esc",
         hints: &[
             (HintContext::Transfer, "back"),
-            (HintContext::TestsSearch, "back"),
-            (HintContext::TestsCoverage, "back"),
-            (HintContext::TestsPlain, "back"),
+            (HintContext::Tests, "back"),
             (HintContext::Orgs, "back"),
             (HintContext::Setup, "back"),
         ],
@@ -470,14 +441,10 @@ const KEYMAP: &[KeyBinding] = &[
         help: "refresh component search",
     },
     KeyBinding {
-        cap: "F6",
-        hints: &[
-            (HintContext::TestsSearch, "history"),
-            (HintContext::TestsCoverage, "history"),
-            (HintContext::TestsPlain, "history"),
-        ],
+        cap: "F8",
+        hints: &[(HintContext::Tests, "history")],
         order: 6,
-        help_key: "F6",
+        help_key: "F8",
         help: "Apex test history (Tests screen)",
     },
     KeyBinding {
@@ -492,9 +459,7 @@ const KEYMAP: &[KeyBinding] = &[
         hints: &[
             (HintContext::Home, "jobs"),
             (HintContext::Transfer, "jobs"),
-            (HintContext::TestsSearch, "jobs"),
-            (HintContext::TestsCoverage, "jobs"),
-            (HintContext::TestsPlain, "jobs"),
+            (HintContext::Tests, "jobs"),
             (HintContext::Setup, "jobs"),
         ],
         order: 8,
@@ -502,24 +467,22 @@ const KEYMAP: &[KeyBinding] = &[
         help: "open the jobs window from any screen",
     },
     KeyBinding {
-        cap: "F3",
+        cap: "F7",
         hints: &[
             (HintContext::Home, "commands"),
             (HintContext::Transfer, "commands"),
-            (HintContext::TestsSearch, "commands"),
-            (HintContext::TestsCoverage, "commands"),
-            (HintContext::TestsPlain, "commands"),
+            (HintContext::Tests, "commands"),
             (HintContext::Setup, "commands"),
         ],
         order: 10,
-        help_key: "F3",
+        help_key: "F7",
         help: "open the command catalog",
     },
     KeyBinding {
         cap: "",
         hints: &[],
         order: 0,
-        help_key: "F3 (catalog)",
+        help_key: "F7 (catalog)",
         help: "type to filter · ↑↓ move · Enter run · Esc close",
     },
     KeyBinding {
@@ -554,22 +517,11 @@ const KEYMAP: &[KeyBinding] = &[
         cap: "Space",
         hints: &[
             (HintContext::Transfer, "select"),
-            (HintContext::TestsSearch, "select"),
-            (HintContext::TestsPlain, "select"),
+            (HintContext::Tests, "select"),
         ],
         order: 3,
         help_key: "Space (search/confirm)",
         help: "select a component, test class or row",
-    },
-    KeyBinding {
-        cap: "Tab",
-        hints: &[
-            (HintContext::TestsSearch, "coverage"),
-            (HintContext::TestsCoverage, "search"),
-        ],
-        order: 5,
-        help_key: "Tab (Tests)",
-        help: "toggle the per-class coverage table",
     },
     KeyBinding {
         cap: "",
@@ -594,18 +546,8 @@ const KEYMAP: &[KeyBinding] = &[
     },
     KeyBinding {
         cap: "↑↓",
-        hints: &[
-            (HintContext::Home, "move"),
-            (HintContext::TestsCoverage, "scroll"),
-        ],
+        hints: &[(HintContext::Home, "move")],
         order: 1,
-        help_key: "↑↓ PgUp/PgDn",
-        help: "move or scroll lists and results",
-    },
-    KeyBinding {
-        cap: "PgUp/PgDn",
-        hints: &[(HintContext::TestsCoverage, "page")],
-        order: 4,
         help_key: "↑↓ PgUp/PgDn",
         help: "move or scroll lists and results",
     },
@@ -617,18 +559,7 @@ fn hint_context(app: &App) -> HintContext {
         Tab::Retrieve | Tab::Deploy => HintContext::Transfer,
         Tab::Orgs => HintContext::Orgs,
         Tab::Setup => HintContext::Setup,
-        Tab::Tests => {
-            let has_coverage = app
-                .latest_result(crate::app::TaskKind::Tests)
-                .is_some_and(|result| !result.coverage.is_empty());
-            if !has_coverage {
-                HintContext::TestsPlain
-            } else if app.tests_focus == TestsFocus::Coverage {
-                HintContext::TestsCoverage
-            } else {
-                HintContext::TestsSearch
-            }
-        }
+        Tab::Tests => HintContext::Tests,
     }
 }
 
@@ -643,10 +574,7 @@ fn hint_pairs(ctx: HintContext, search_dirty: bool) -> Vec<(&'static str, &'stat
                 .iter()
                 .find(|(context, _)| *context == ctx)
                 .map(|(_, label)| {
-                    let can_search = matches!(
-                        ctx,
-                        HintContext::Transfer | HintContext::TestsSearch | HintContext::TestsPlain
-                    );
+                    let can_search = matches!(ctx, HintContext::Transfer | HintContext::Tests);
                     let label = if binding.cap == "Enter" && can_search && search_dirty {
                         "search"
                     } else {
@@ -667,7 +595,7 @@ fn key_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     let ctx = hint_context(app);
     let search_dirty = match ctx {
         HintContext::Transfer => app.transfer_search.needs_search(),
-        HintContext::TestsSearch | HintContext::TestsPlain => app.test_search.needs_search(),
+        HintContext::Tests => app.test_search.needs_search(),
         _ => false,
     };
     hint_pairs(ctx, search_dirty)
@@ -776,8 +704,6 @@ fn draw_home(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
     let state = &app.test_search;
-    let latest = app.latest_result(crate::app::TaskKind::Tests);
-    let has_coverage = latest.is_some_and(|result| !result.coverage.is_empty());
     let sections = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -785,10 +711,18 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ])
     .split(area);
-    frame.render_widget(
-        Line::from(vec![strong("Apex tests", accent(app))]),
-        sections[0],
-    );
+    let mut header = vec![strong("Apex tests", accent(app))];
+    let active = app.active_apex_test_runs();
+    if active > 0 {
+        header.push(Span::styled(
+            format!(
+                "  ({active} test class{} running)",
+                if active == 1 { "" } else { "es" }
+            ),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    frame.render_widget(Line::from(header), sections[0]);
     let query = if state.query.is_empty() {
         "type a test class name".to_owned()
     } else {
@@ -805,41 +739,17 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
         sections[1],
     );
 
-    if has_coverage && let Some(result) = latest {
-        let body = sections[2];
-        if let Some((list_height, coverage_height)) = tests_pane_heights(body.height, density(area))
-        {
-            let rows = Layout::vertical([
-                Constraint::Length(list_height),
-                Constraint::Length(coverage_height),
-            ])
-            .split(body);
-            render_test_list(frame, rows[0], app, state);
-            draw_test_coverage(frame, rows[1], app, result);
-        } else {
-            // Too small for both panes: give the whole body to the test list.
-            render_test_list(frame, body, app, state);
-        }
-    } else {
-        render_test_list(frame, sections[2], app, state);
-    }
+    // The whole body belongs to the test list; per-class coverage stays available in the Jobs
+    // result view and the Apex test history popup.
+    render_test_list(frame, sections[2], app, state);
 
-    let footer = if has_coverage && app.tests_focus == TestsFocus::Coverage {
-        let classes = latest.map_or(0, |result| result.coverage.len());
-        format!("coverage focused — {classes} classes")
-    } else {
-        let mut text = format!("{} selected", state.checked().len());
-        if state.searching {
-            text.push_str("   searching…");
-        } else if state.needs_search() {
-            text.push_str("   results out of date");
-        }
-        if has_coverage {
-            text.push_str("   coverage available");
-        }
-        text
-    };
-    frame.render_widget(Paragraph::new(Line::from(faint(footer))), sections[3]);
+    let mut text = format!("{} selected", state.checked().len());
+    if state.searching {
+        text.push_str("   searching…");
+    } else if state.needs_search() {
+        text.push_str("   results out of date");
+    }
+    frame.render_widget(Paragraph::new(Line::from(faint(text))), sections[3]);
 }
 
 fn render_test_list(
@@ -889,38 +799,6 @@ fn render_test_list(
         area,
         &mut list_state,
     );
-}
-
-fn draw_test_coverage(frame: &mut Frame, area: Rect, app: &App, result: &crate::app::ResultView) {
-    let focused = app.tests_focus == TestsFocus::Coverage;
-    let cover_block = pane_block("coverage", app, focused);
-    frame.render_widget(cover_block.clone(), area);
-    let inner = cover_block.inner(area);
-    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(inner);
-    let color = if result.ok { Color::Green } else { Color::Red };
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("[{}] ", if result.ok { "✓" } else { "✗" }),
-                Style::default().fg(color),
-            ),
-            strong("RESULT ", accent(app)),
-            Span::styled(
-                format!("{} · {}", result.status, result.summary),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])),
-        sections[0],
-    );
-    let visible = usize::from(sections[1].height).saturating_sub(3).max(1);
-    app.tests_coverage_rows.set(visible);
-    let (lines, _) = coverage_table_lines(
-        &result.coverage,
-        usize::from(sections[1].width),
-        app.coverage_scroll,
-        visible,
-    );
-    frame.render_widget(Paragraph::new(Text::from(lines)), sections[1]);
 }
 
 /// Percentage points parsed from the stored coverage string, falling back to covered/total.
@@ -1322,9 +1200,18 @@ fn coverage_bar(covered: usize, total: usize) -> String {
     bar
 }
 
-fn result_item_line(item: &crate::app::ResultItem) -> Line<'static> {
-    let icon = if item.ok { "✓" } else { "✗" };
-    let color = if item.ok { Color::Green } else { Color::Red };
+/// A pending Apex run is not a success: show an amber circle instead of a green checkmark.
+const PENDING_GLYPH: &str = "◌";
+const PENDING_COLOR: Color = Color::LightYellow;
+
+fn result_item_line(item: &crate::app::ResultItem, pending: bool) -> Line<'static> {
+    let (icon, color) = if pending {
+        (PENDING_GLYPH, PENDING_COLOR)
+    } else if item.ok {
+        ("✓", Color::Green)
+    } else {
+        ("✗", Color::Red)
+    };
     let mut spans = vec![
         Span::styled(format!("[{icon}] "), Style::default().fg(color)),
         Span::styled(item.label.clone(), Style::default().fg(Color::Reset)),
@@ -1346,13 +1233,17 @@ fn result_item_line(item: &crate::app::ResultItem) -> Line<'static> {
     if !item.detail.is_empty() {
         spans.push(Span::styled(
             format!("  {}", item.detail),
-            Style::default().fg(if item.ok { Color::DarkGray } else { Color::Red }),
+            Style::default().fg(if pending || item.ok {
+                Color::DarkGray
+            } else {
+                Color::Red
+            }),
         ));
     }
     Line::from(spans)
 }
 
-/// Render a result view. `record` is `None` for a reconstructed saved result (F6 history), which
+/// Render a result view. `record` is `None` for a reconstructed saved result (F8 history), which
 /// has no retained raw output or JSON to show.
 fn result_lines(
     app: &App,
@@ -1360,7 +1251,14 @@ fn result_lines(
     result: &crate::app::ResultView,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let color = if result.ok { Color::Green } else { Color::Red };
+    let pending = record.is_some_and(|record| record.pending_report);
+    let color = if pending {
+        PENDING_COLOR
+    } else if result.ok {
+        Color::Green
+    } else {
+        Color::Red
+    };
     let mut lines = vec![
         strong(&result.title, accent(app))
             + Span::styled("  ", Style::default().fg(Color::DarkGray))
@@ -1373,7 +1271,7 @@ fn result_lines(
         Line::from(" "),
     ];
     for item in result.items.iter().take(200) {
-        lines.push(result_item_line(item));
+        lines.push(result_item_line(item, pending));
     }
     if result.items.len() > 200 {
         lines.push(Line::from(faint(format!(
@@ -1395,7 +1293,7 @@ fn result_lines(
         };
         lines.push(strong_line(&section.title, header_color));
         for item in section.rows.iter().take(200) {
-            lines.push(result_item_line(item));
+            lines.push(result_item_line(item, pending));
         }
         if section.rows.len() > 200 {
             lines.push(Line::from(faint(format!(
@@ -1516,7 +1414,17 @@ fn build_job_detail_lines(
     }
     lines.push(Line::from(" "));
     if record.pending_report {
-        lines.push(Line::from(faint("running — waiting for org results")));
+        // A terminal run that is only collecting per-class coverage has a real summary; show it
+        // instead of claiming the test is still waiting for the org to finish.
+        let waiting = record
+            .result
+            .as_ref()
+            .filter(|view| {
+                view.kind == crate::app::ResultKind::ApexTests && !view.summary.is_empty()
+            })
+            .map(|view| view.summary.as_str())
+            .unwrap_or("running — waiting for org results");
+        lines.push(Line::from(faint(waiting)));
         lines.push(Line::from(" "));
     }
     if let Some(result) = &record.result {
@@ -1570,6 +1478,28 @@ pub(crate) fn job_detail_len(
     queued_position: Option<usize>,
 ) -> usize {
     job_detail_lines(app, record, queued_position, 80).len()
+}
+
+/// Test seam: the cached text of one job's detail pane, including the "waiting" placeholder.
+#[cfg(test)]
+pub(crate) fn job_detail_text(app: &App, record_id: u64) -> Vec<String> {
+    let Some(record) = app
+        .output_state
+        .records
+        .iter()
+        .find(|record| record.id == record_id)
+    else {
+        return Vec::new();
+    };
+    job_detail_lines(app, record, None, 80)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
 }
 
 fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
@@ -1680,7 +1610,9 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 fn record_status(record: &crate::app::OutputRecord) -> (&'static str, Color) {
     if record.queued {
         ("…", Color::Yellow)
-    } else if record.pending_report || !record.finished {
+    } else if record.pending_report {
+        (PENDING_GLYPH, PENDING_COLOR)
+    } else if !record.finished {
         ("▶", Color::Yellow)
     } else {
         match record.exit_code {
@@ -1954,7 +1886,7 @@ fn run_time_label(millis: u64) -> String {
     )
 }
 
-/// F6 history popup: newest-first run list on the left, full result for the selected run on the
+/// F8 history popup: newest-first run list on the left, full result for the selected run on the
 /// right (stacked on narrow terminals). The detail view reuses the standard result renderer.
 fn draw_test_history(
     frame: &mut Frame,
@@ -2761,6 +2693,24 @@ mod tests {
     }
 
     #[test]
+    fn pending_result_items_render_as_amber_circles_not_checkmarks() {
+        let item = ResultItem {
+            ok: true,
+            label: "Test run 707AY000000000001".to_owned(),
+            detail: "waiting for org results".to_owned(),
+            progress: None,
+        };
+        let pending = result_item_line(&item, true);
+        assert!(line_text(&pending).starts_with("[◌] "));
+        assert_eq!(pending.spans[0].style.fg, Some(PENDING_COLOR));
+        assert!(!line_text(&pending).contains('✓'));
+
+        let finished = result_item_line(&item, false);
+        assert!(line_text(&finished).starts_with("[✓] "));
+        assert_eq!(finished.spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
     fn render_cache_is_bounded_and_keyed_on_revision() {
         let key = |record_id: u64, revision: u64| DetailCacheKey {
             record_id,
@@ -2796,12 +2746,10 @@ mod tests {
         assert!(modal.x >= area.x && modal.y >= area.y);
     }
 
-    const ALL_CONTEXTS: [HintContext; 7] = [
+    const ALL_CONTEXTS: [HintContext; 5] = [
         HintContext::Home,
         HintContext::Transfer,
-        HintContext::TestsSearch,
-        HintContext::TestsCoverage,
-        HintContext::TestsPlain,
+        HintContext::Tests,
         HintContext::Orgs,
         HintContext::Setup,
     ];
@@ -2933,24 +2881,6 @@ mod tests {
         let result = summary_result("FailedLoginTests 2 · 2 passed", true, 0);
         let line = summary_chips(&result);
         assert!(red_chip_text(&line).is_empty());
-    }
-
-    #[test]
-    fn tests_layout_keeps_a_usable_list_at_small_sizes() {
-        let (list, coverage) = tests_pane_heights(7, Density::Tiny).expect("tiny split");
-        assert!(list >= 3, "tiny list too short: {list}");
-        assert!(coverage >= 4, "tiny coverage too short: {coverage}");
-        let (list, coverage) = tests_pane_heights(18, Density::Compact).expect("compact split");
-        assert!(list >= 4, "compact list too short: {list}");
-        assert!(coverage >= 5, "compact coverage too short: {coverage}");
-        let (list, coverage) = tests_pane_heights(30, Density::Roomy).expect("roomy split");
-        assert!(list >= 6 && coverage >= 6);
-    }
-
-    #[test]
-    fn tests_layout_hides_coverage_only_without_room() {
-        assert!(tests_pane_heights(4, Density::Tiny).is_none());
-        assert!(tests_pane_heights(0, Density::Roomy).is_none());
     }
 
     #[test]

@@ -263,8 +263,8 @@ fn every_screen_renders_without_panicking() {
             }
             if (width, height) == (60, 16) && tab == sftui::app::Tab::Tests {
                 assert!(
-                    rendered.to_lowercase().contains("coverage"),
-                    "coverage pane missing"
+                    !rendered.to_lowercase().contains("coverage"),
+                    "Tests screen must not render a coverage pane"
                 );
             }
             if (width, height) == (120, 40) && tab == sftui::app::Tab::Home {
@@ -499,11 +499,11 @@ fn help_modal_renders_as_a_table_at_multiple_sizes() {
         if width == 80 {
             assert!(
                 rendered.contains("open the command catalog"),
-                "F3 help row missing at {width}x{height}"
+                "F7 help row missing at {width}x{height}"
             );
             assert!(
                 rendered.contains("Apex test history (Tests screen)"),
-                "F6 help row missing at {width}x{height}"
+                "F8 help row missing at {width}x{height}"
             );
         }
         assert!(
@@ -514,7 +514,7 @@ fn help_modal_renders_as_a_table_at_multiple_sizes() {
 }
 
 #[test]
-fn f3_catalog_renders_at_small_and_roomy_sizes() {
+fn f7_catalog_renders_at_small_and_roomy_sizes() {
     assert_synthetic_environment();
     let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
     let _guard = _runtime.enter();
@@ -528,10 +528,10 @@ fn f3_catalog_renders_at_small_and_roomy_sizes() {
         Config::default(),
         PathBuf::from("/tmp/sftui-test"),
     );
-    app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+    app.handle_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE));
     assert!(
         matches!(app.modal, Some(sftui::app::Modal::Catalog { .. })),
-        "F3 must open the catalog"
+        "F7 must open the catalog"
     );
     for character in "org list".chars() {
         app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
@@ -666,7 +666,7 @@ fn narrow_terminal_truncates_long_org_names_without_panicking() {
 }
 
 #[test]
-fn tests_screen_with_coverage_renders_at_small_and_roomy_sizes() {
+fn tests_screen_has_no_coverage_pane_at_small_and_roomy_sizes() {
     assert_synthetic_environment();
     let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
     let _guard = _runtime.enter();
@@ -723,7 +723,7 @@ fn tests_screen_with_coverage_renders_at_small_and_roomy_sizes() {
         render_revision: 0,
         lines_truncated: false,
     });
-    for (width, height) in [(48, 12), (80, 24)] {
+    for (width, height) in [(80, 24), (60, 16)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
         let rendered: String = terminal
@@ -734,14 +734,70 @@ fn tests_screen_with_coverage_renders_at_small_and_roomy_sizes() {
             .map(|cell| cell.symbol())
             .collect();
         assert!(
-            rendered.to_lowercase().contains("coverage"),
-            "coverage pane missing at {width}x{height}"
+            !rendered.to_lowercase().contains("coverage"),
+            "Tests body must not render a coverage pane at {width}x{height}: {rendered}"
         );
         assert!(
             rendered.contains("VisibleTestClass"),
             "test list has no usable rows at {width}x{height}"
         );
     }
+}
+
+#[test]
+fn tests_header_shows_active_apex_run_count() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup::pending(),
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.tab = sftui::app::Tab::Tests;
+    let render = |app: &App| -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| ui::draw(frame, app)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    };
+    let test_record = |id, finished, pending_report| OutputRecord {
+        id,
+        command: "sf apex run test".to_owned(),
+        purpose: "apex tests".to_owned(),
+        task: sftui::app::TaskKind::Tests,
+        executable: "sf".into(),
+        argv: vec!["apex".to_owned()],
+        lines: Vec::new(),
+        line_bytes: 0,
+        exit_code: Some(0),
+        finished,
+        queued: false,
+        started_at: Some(Instant::now()),
+        ended_at: None,
+        json: None,
+        result: None,
+        pending_report,
+        render_revision: 0,
+        lines_truncated: false,
+    };
+
+    assert!(
+        !render(&app).contains("test class running"),
+        "no running count when no Apex test job is active"
+    );
+    app.output_state.records.push(test_record(1, false, false));
+    let one = render(&app);
+    assert!(one.contains("(1 test class running)"), "header: {one}");
+
+    app.output_state.records.push(test_record(2, true, true));
+    let two = render(&app);
+    assert!(two.contains("(2 test classes running)"), "header: {two}");
 }
 
 fn saved_apex_run(id: &str, outcome: &str) -> sftui::state_store::SavedTestRun {
@@ -775,7 +831,7 @@ fn saved_apex_run(id: &str, outcome: &str) -> sftui::state_store::SavedTestRun {
 }
 
 #[test]
-fn f6_history_modal_renders_at_small_and_roomy_sizes() {
+fn f8_history_modal_renders_at_small_and_roomy_sizes() {
     assert_synthetic_environment();
     let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
     let _guard = _runtime.enter();
@@ -890,7 +946,7 @@ fn f4_switcher_shows_cached_org_detail() {
 }
 
 #[test]
-fn f6_hint_is_shown_only_on_the_tests_screen() {
+fn f8_hint_is_shown_only_on_the_tests_screen() {
     assert_synthetic_environment();
     let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
     let _guard = _runtime.enter();
@@ -910,12 +966,24 @@ fn f6_hint_is_shown_only_on_the_tests_screen() {
             .map(|cell| cell.symbol())
             .collect()
     };
+    let home = render(&app);
     assert!(
-        !render(&app).contains("[F6]"),
-        "F6 must not show outside Tests"
+        !home.contains("[F8]"),
+        "F8 history key must not show outside Tests"
+    );
+    assert!(
+        home.contains("[F7]"),
+        "F7 catalog hint missing on Home: {home}"
     );
     app.tab = sftui::app::Tab::Tests;
     let tests = render(&app);
-    assert!(tests.contains("[F6]"), "F6 hint missing on Tests: {tests}");
-    assert!(tests.to_lowercase().contains("history"), "F6 label missing");
+    assert!(tests.contains("[F8]"), "F8 hint missing on Tests: {tests}");
+    assert!(
+        tests.contains("[F7]"),
+        "F7 catalog hint missing on Tests: {tests}"
+    );
+    assert!(
+        tests.to_lowercase().contains("history"),
+        "F8 history label missing"
+    );
 }

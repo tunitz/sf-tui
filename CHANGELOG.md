@@ -4,6 +4,18 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.23] - 2026-11-18
+
+### Changed
+
+- A waiting Apex test run shows an amber `◌` instead of a success check, in both the Jobs list and the detail pane.
+- The command catalog moved from `F3` to **`F7`**, and Apex test history from `F6` to **`F8`**, to avoid conflicts with VS Code shortcuts. Plain letters and digits reach the search fields without being intercepted.
+- The Tests screen no longer shows a coverage pane at the bottom; its body is dedicated to the test-class list. The Apex tests header shows `(1 test class running)` (pluralized) while runs are active and drops the count when they finish.
+
+### Fixed
+
+- The Jobs detail pane now refreshes when an Apex run finishes: the render cache is invalidated after the final result is written, and the selection follows the record as it moves from RUNNING to FINISHED. Timeout and failure always end in a real result instead of leaving a "waiting for org results" placeholder.
+
 ## [0.1.22] - 2026-11-17
 
 ### Added
