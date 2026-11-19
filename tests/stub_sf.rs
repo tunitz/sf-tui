@@ -62,6 +62,36 @@ async fn stub_version_probe_returns_synthetic_version() {
 }
 
 #[tokio::test]
+async fn stub_lists_curated_org_metadata_for_the_username() {
+    assert_synthetic_environment();
+    for metadata_type in ["ApexClass", "Flow", "LightningComponentBundle"] {
+        let argv =
+            sftui::sf::commands::org_list_metadata(metadata_type, "test-scratch@example.invalid");
+        let outcome = runner::capture(
+            &stub_installation().executable,
+            &argv,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("org list metadata");
+        assert!(outcome.succeeded(), "{metadata_type}: {outcome:?}");
+        let value = runner::parse_json_document(&outcome.stdout).expect("json");
+        let components = sftui::sf::metadata::parse_org_components(&value, metadata_type);
+        assert!(
+            components
+                .iter()
+                .any(|item| item.identity().starts_with(metadata_type)),
+            "{metadata_type} must produce synthetic rows"
+        );
+        assert!(
+            components
+                .iter()
+                .all(|item| !item.identity().contains("SYNTHETIC-DO-NOT-USE"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn runner_streams_stdout_and_reports_completion() {
     assert_synthetic_environment();
     let (tx, mut rx) = mpsc::channel::<SfEvent>(16);
@@ -97,6 +127,24 @@ async fn runner_streams_stdout_and_reports_completion() {
     let value = runner::parse_json_document(&outcome.stdout).expect("json");
     assert_eq!(sftui::sf::org::parse_org_list(&value).len(), 1);
     let _ = job.join().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_a_synthetic_stub_job_reaps_it_quickly() {
+    assert_synthetic_environment();
+    let (tx, _rx) = mpsc::channel::<SfEvent>(16);
+    let job = runner::spawn_sf(&stub_installation(), &["slow".to_owned()], 91, tx)
+        .expect("spawn slow stub");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let started = Instant::now();
+    let _outcome = tokio::time::timeout(Duration::from_secs(5), job.cancel_and_join())
+        .await
+        .expect("stub job reaped after stop");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "stop must reap the child instead of waiting for it to finish"
+    );
 }
 
 #[tokio::test]
@@ -175,6 +223,123 @@ async fn failed_stub_command_captures_stderr_and_exit_code() {
     assert!(outcome.stderr.contains("synthetic failure"));
 }
 
+fn apex_report_argv(run_id: &str) -> Vec<String> {
+    vec![
+        "apex".to_owned(),
+        "get".to_owned(),
+        "test".to_owned(),
+        "--test-run-id".to_owned(),
+        run_id.to_owned(),
+        "--result-format".to_owned(),
+        "json".to_owned(),
+        "--code-coverage".to_owned(),
+        "--target-org".to_owned(),
+        "test-scratch".to_owned(),
+        "--json".to_owned(),
+    ]
+}
+
+#[tokio::test]
+async fn stub_failed_report_with_exit_100_shows_every_class_and_method_in_jobs_and_history() {
+    assert_synthetic_environment();
+    let outcome = runner::capture(
+        &stub_installation().executable,
+        &apex_report_argv("08N000000000002"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("capture");
+    assert_eq!(outcome.exit_code, Some(100));
+    assert!(!outcome.succeeded());
+    let value = runner::parse_json_document(&outcome.stdout).expect("json");
+    let run = sftui::sf::test_results::parse_terminal_report(
+        &value,
+        "sf apex get test",
+        "08N000000000002",
+    )
+    .expect("terminal report");
+    assert_eq!(run.outcome, "Failed");
+    let view = sftui::view::apex_result(&run);
+    assert!(!view.ok);
+    assert!(view.summary.starts_with("Tests failed · "));
+    let methods = view
+        .sections
+        .iter()
+        .find(|section| section.title == "TEST METHODS")
+        .expect("method section");
+    assert_eq!(methods.rows.len(), 3);
+    assert!(methods.rows.iter().any(
+        |row| row.label == "BetaTest.bad" && row.detail.contains("synthetic assertion failed")
+    ));
+
+    // The same report drives the F8 history detail view.
+    let mut app = App::new(
+        Startup::pending(),
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test"),
+    );
+    app.tab = sftui::app::Tab::Tests;
+    app.test_history
+        .runs
+        .push(sftui::state_store::SavedTestRun {
+            id: "stub-failed-report".to_owned(),
+            finished_at: 1_700_000_000_000,
+            org: Some("test-scratch".to_owned()),
+            command: "sf apex run test".to_owned(),
+            run,
+        });
+    app.modal = Some(sftui::app::Modal::TestHistory {
+        selected: 0,
+        list_scroll: 0,
+        detail_scroll: 0,
+        focus: sftui::app::TestHistoryFocus::Detail,
+        confirm_clear: false,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(180, 30)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    for expected in [
+        "AlphaTest",
+        "BetaTest.bad",
+        "synthetic assertion failed",
+        "Tests failed",
+    ] {
+        assert!(
+            rendered.contains(expected),
+            "missing {expected}: {rendered}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stub_exit_100_error_payload_is_not_a_terminal_report() {
+    assert_synthetic_environment();
+    let outcome = runner::capture(
+        &stub_installation().executable,
+        &apex_report_argv("08N000000000003"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("capture");
+    assert_eq!(outcome.exit_code, Some(100));
+    let value = runner::parse_json_document(&outcome.stdout).expect("json");
+    assert!(
+        sftui::sf::test_results::parse_terminal_report(
+            &value,
+            "sf apex get test",
+            "08N000000000003",
+        )
+        .is_none(),
+        "a CLI error envelope must never become a test result"
+    );
+}
+
 #[test]
 fn every_screen_renders_without_panicking() {
     assert_synthetic_environment();
@@ -209,6 +374,9 @@ fn every_screen_renders_without_panicking() {
         pending_report: false,
         render_revision: 0,
         lines_truncated: false,
+        lifecycle: sftui::app::JobLifecycle::Finished,
+        invocation: None,
+        cleanup_error: None,
     });
     app.output_state.records.push(OutputRecord {
         id: 2,
@@ -245,6 +413,9 @@ fn every_screen_renders_without_panicking() {
         pending_report: false,
         render_revision: 0,
         lines_truncated: false,
+        lifecycle: sftui::app::JobLifecycle::Finished,
+        invocation: None,
+        cleanup_error: None,
     });
     for (width, height) in [(120, 40), (80, 24), (60, 16), (48, 12)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -308,10 +479,16 @@ fn every_screen_renders_without_panicking() {
                 focus: 0,
             },
             sftui::app::Modal::Jobs {
-                selected: 0,
+                selected_id: None,
                 focus: sftui::app::JobsFocus::List,
                 scroll: 0,
                 follow: true,
+                detail_view: sftui::app::JobDetailView::Summary,
+            },
+            sftui::app::Modal::RerunReview {
+                job_id: 1,
+                org: String::new(),
+                org_required: true,
             },
             sftui::app::Modal::TestConfirm {
                 entries: Vec::new(),
@@ -565,7 +742,7 @@ fn f7_catalog_renders_at_small_and_roomy_sizes() {
 }
 
 #[test]
-fn create_metadata_modal_shows_local_output_and_scannable_templates() {
+fn create_wizard_renders_grouped_types_and_external_cli_hint() {
     assert_synthetic_environment();
     let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
     let _guard = _runtime.enter();
@@ -579,17 +756,14 @@ fn create_metadata_modal_shows_local_output_and_scannable_templates() {
         Config::default(),
         PathBuf::from("/tmp/sftui-test"),
     );
-    app.modal = Some(sftui::app::Modal::Prompt {
-        title: "Create metadata".to_owned(),
-        kind: sftui::app::PromptKind::CreateMetadata,
-        fields: vec![
-            sftui::app::PromptField::new("Template", "").with_suggestions(std::sync::Arc::new(
-                sftui::sf::metadata::create_suggestions(),
-            )),
-            sftui::app::PromptField::new("Component name (PascalCase)", ""),
-            sftui::app::PromptField::new("Output dir (optional)", ""),
-        ],
-        focus: 0,
+    app.modal = Some(sftui::app::Modal::CreateWizard {
+        state: sftui::app::CreateWizardState::Choose {
+            query: String::new(),
+            results: sftui::sf::create::ALL_TYPES.to_vec(),
+            selected: 0,
+            searching: false,
+            searched_query: Some(String::new()),
+        },
     });
 
     for (width, height) in [(80, 24), (60, 16)] {
@@ -603,24 +777,17 @@ fn create_metadata_modal_shows_local_output_and_scannable_templates() {
             .map(|cell| cell.symbol())
             .collect();
         assert!(
-            rendered.contains("ApexClass"),
-            "template suggestions missing at {width}x{height}"
+            rendered.contains("Apex Class"),
+            "grouped type missing at {width}x{height}"
         );
         assert!(
-            rendered.contains("classes/"),
-            "destination folder missing at {width}x{height}"
+            rendered.contains("External CLI"),
+            "interactive-only type must be marked at {width}x{height}"
         );
         assert!(
             !rendered.contains("Org"),
             "the irrelevant Org field must be gone at {width}x{height}"
         );
-        if width == 80 {
-            assert!(
-                rendered.contains("Component name (PascalCase)")
-                    && rendered.contains("Output dir (optional)"),
-                "improved field labels missing: {rendered}"
-            );
-        }
     }
 }
 
@@ -722,6 +889,9 @@ fn tests_screen_has_no_coverage_pane_at_small_and_roomy_sizes() {
         pending_report: false,
         render_revision: 0,
         lines_truncated: false,
+        lifecycle: sftui::app::JobLifecycle::Finished,
+        invocation: None,
+        cleanup_error: None,
     });
     for (width, height) in [(80, 24), (60, 16)] {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
@@ -785,6 +955,9 @@ fn tests_header_shows_active_apex_run_count() {
         pending_report,
         render_revision: 0,
         lines_truncated: false,
+        lifecycle: sftui::app::JobLifecycle::Finished,
+        invocation: None,
+        cleanup_error: None,
     };
 
     assert!(
@@ -985,5 +1158,133 @@ fn f8_hint_is_shown_only_on_the_tests_screen() {
     assert!(
         tests.to_lowercase().contains("history"),
         "F8 history label missing"
+    );
+}
+
+#[test]
+fn home_has_one_combined_metadata_entry_and_no_separate_deploy_entry() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup::pending(),
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test-home"),
+    );
+    app.tab = sftui::app::Tab::Home;
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal.draw(|frame| ui::draw(frame, &app)).expect("draw");
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(
+        rendered.contains("[1] Retrieve/Deploy Metadata"),
+        "combined Home entry missing: {rendered}"
+    );
+    assert!(
+        !rendered.contains("[2] Deploy Metadata"),
+        "Deploy must not have a separate Home entry"
+    );
+    assert!(
+        !rendered.contains("[4] Apex Tests"),
+        "Apex Tests must be [3] after the menu merge"
+    );
+}
+
+#[test]
+fn org_browse_modal_renders_and_preserves_scoped_selection() {
+    assert_synthetic_environment();
+    let _runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let _guard = _runtime.enter();
+    let mut app = App::new(
+        Startup::pending(),
+        Config::default(),
+        PathBuf::from("/tmp/sftui-test-browse"),
+    );
+    app.tab = sftui::app::Tab::Retrieve;
+    app.org_state.orgs.push(sftui::sf::org::OrgSummary {
+        username: "dev@example.invalid".to_owned(),
+        aliases: vec!["dev-alias".to_owned()],
+        ..Default::default()
+    });
+    app.org_browse.username = "dev@example.invalid".to_owned();
+    app.org_browse.org_label = "dev-alias".to_owned();
+    app.org_browse.metadata_type = "ApexClass".to_owned();
+    app.org_browse.rows = vec![sftui::sf::metadata::OrgComponent {
+        metadata_type: "ApexClass".to_owned(),
+        full_name: "OrgOnly".to_owned(),
+    }];
+    app.org_browse.checked = vec!["ApexClass:OrgOnly".to_owned()];
+    app.modal = Some(sftui::app::Modal::OrgBrowse);
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+    terminal
+        .draw(|frame| ui::draw(frame, &app))
+        .expect("draw browse");
+    let rendered: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(rendered.contains("ORG"), "org column missing: {rendered}");
+    assert!(
+        rendered.contains("Org only"),
+        "org-only label missing: {rendered}"
+    );
+    assert!(
+        rendered.contains("ApexClass:OrgOnly"),
+        "component row missing: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn stub_answers_create_metadata_generator_commands() {
+    assert_synthetic_environment();
+    let installation = stub_installation();
+    let destination = PathBuf::from("/tmp/sftui-create-stub");
+    let mut draft = sftui::sf::create::CreateDraft::new(
+        sftui::sf::create::CreateKind::ApexClass,
+        sftui::sf::create::Destination {
+            label: "force-app/main/default".to_owned(),
+            relative: PathBuf::from("force-app/main/default"),
+        },
+    );
+    draft.set(sftui::sf::create::FieldKey::Name, "DemoController");
+    for kind in [
+        sftui::sf::create::CreateKind::ApexClass,
+        sftui::sf::create::CreateKind::ApexTrigger,
+        sftui::sf::create::CreateKind::Lwc,
+        sftui::sf::create::CreateKind::LightningApp,
+        sftui::sf::create::CreateKind::FlexiPage,
+        sftui::sf::create::CreateKind::VisualforcePage,
+        sftui::sf::create::CreateKind::VisualforceComponent,
+        sftui::sf::create::CreateKind::StaticResource,
+        sftui::sf::create::CreateKind::CustomMetadataType,
+        sftui::sf::create::CreateKind::AnalyticsTemplate,
+    ] {
+        let mut spec = draft.clone();
+        spec.kind = kind;
+        let argv = sftui::sf::commands::create_metadata_argv(&spec, &destination);
+        let outcome = runner::capture(&installation.executable, &argv, Duration::from_secs(5))
+            .await
+            .expect("stub generator call");
+        assert!(outcome.succeeded(), "{kind:?}: {outcome:?}");
+    }
+    let mut interactive = draft.clone();
+    interactive.kind = sftui::sf::create::CreateKind::CustomObject;
+    interactive.set(sftui::sf::create::FieldKey::Label, "My Object");
+    let argv = sftui::sf::commands::create_metadata_argv(&interactive, &destination);
+    assert!(!argv.iter().any(|part| part.starts_with("--output")));
+    let outcome = runner::capture(&installation.executable, &argv, Duration::from_secs(5))
+        .await
+        .expect("stub interactive command call");
+    assert!(
+        outcome.succeeded(),
+        "interactive Copy CLI command: {outcome:?}"
     );
 }

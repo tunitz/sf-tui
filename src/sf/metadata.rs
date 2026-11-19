@@ -8,8 +8,11 @@ use std::collections::{HashMap, HashSet};
 
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
+use serde_json::Value;
 
+use super::org::SENSITIVE_FIELDS;
 use super::project::SfProject;
+use super::string_field;
 
 thread_local! {
     static MATCHER: RefCell<SkimMatcherV2> =
@@ -293,126 +296,20 @@ pub fn test_suggestions(all: &SuggestionSet, project: Option<&SfProject>) -> Sug
     )
 }
 
-/// A scaffold command supported by the Create metadata shortcut. `output_dir` is the metadata
-/// folder inside a package directory, so generated files land next to the other components.
-#[derive(Debug, Clone, Copy)]
-pub struct CreateTemplate {
-    pub label: &'static str,
-    pub command: &'static [&'static str],
-    pub name_flag: &'static str,
-    pub output_dir: &'static str,
-}
-
-pub const CREATE_TEMPLATES: &[CreateTemplate] = &[
-    CreateTemplate {
-        label: "ApexClass",
-        command: &["template", "generate", "apex", "class"],
-        name_flag: "--name",
-        output_dir: "classes",
-    },
-    CreateTemplate {
-        label: "ApexTrigger",
-        command: &["template", "generate", "apex", "trigger"],
-        name_flag: "--name",
-        output_dir: "triggers",
-    },
-    CreateTemplate {
-        label: "Lightning Web Component",
-        command: &[
-            "template",
-            "generate",
-            "lightning",
-            "component",
-            "--type",
-            "lwc",
-        ],
-        name_flag: "--name",
-        output_dir: "lwc",
-    },
-    CreateTemplate {
-        label: "Aura Component",
-        command: &[
-            "template",
-            "generate",
-            "lightning",
-            "component",
-            "--type",
-            "aura",
-        ],
-        name_flag: "--name",
-        output_dir: "aura",
-    },
-    CreateTemplate {
-        label: "FlexiPage",
-        command: &["template", "generate", "flexipage"],
-        name_flag: "--name",
-        output_dir: "flexipages",
-    },
-    CreateTemplate {
-        label: "StaticResource",
-        command: &["template", "generate", "static-resource"],
-        name_flag: "--name",
-        output_dir: "staticresources",
-    },
-    CreateTemplate {
-        label: "CustomObject",
-        command: &["schema", "generate", "sobject"],
-        name_flag: "--label",
-        output_dir: "objects",
-    },
-    CreateTemplate {
-        label: "Custom Metadata Type",
-        command: &["cmdt", "generate", "object"],
-        name_flag: "--type-name",
-        output_dir: "customMetadata",
-    },
-    CreateTemplate {
-        label: "Visualforce Page",
-        command: &["template", "generate", "visualforce", "page"],
-        name_flag: "--name",
-        output_dir: "pages",
-    },
-    CreateTemplate {
-        label: "Visualforce Component",
-        command: &["template", "generate", "visualforce", "component"],
-        name_flag: "--name",
-        output_dir: "components",
-    },
-    CreateTemplate {
-        label: "Lightning App",
-        command: &["template", "generate", "lightning", "app"],
-        name_flag: "--name",
-        output_dir: "aura",
-    },
-    CreateTemplate {
-        label: "Analytics Template",
-        command: &["template", "generate", "analytics", "template"],
-        name_flag: "--name",
-        output_dir: "waveTemplates",
-    },
-];
-
-pub fn create_template_for(label: &str) -> Option<&'static CreateTemplate> {
-    let needle = label.trim().to_ascii_lowercase();
-    CREATE_TEMPLATES
-        .iter()
-        .find(|template| template.label.eq_ignore_ascii_case(&needle))
-}
-
+/// Fuzzy index for the Create wizard's grouped type picker. The catalog lives in `sf::create`;
+/// this module only owns the ranking set so the shared search controller can rank it off-thread.
 pub fn create_suggestions() -> SuggestionSet {
     SuggestionSet::with_items(
         SuggestionKind::Create,
-        CREATE_TEMPLATES
+        super::create::ALL_TYPES
             .iter()
-            .map(|template| {
-                SuggestionItem::new(
-                    template.label,
-                    format!(
-                        "→ {}/   sf {}",
-                        template.output_dir,
-                        template.command.join(" ")
-                    ),
-                )
+            .map(|kind| {
+                let detail = if kind.interactive_only() {
+                    format!("{} · External CLI (copy command)", kind.group().label())
+                } else {
+                    format!("{} · {}/", kind.group().label(), kind.folder())
+                };
+                SuggestionItem::new(kind.label(), detail)
             })
             .collect(),
     )
@@ -472,6 +369,22 @@ fn component_from_path(path: &str) -> Option<(String, String)> {
     if stem.is_empty() {
         return None;
     }
+    // Decomposed custom fields live at objects/<Object>/fields/<Field>.field-meta.xml. The org
+    // identity is CustomField:Object.Field, not the bare field name.
+    if file.contains(".field-meta.xml")
+        && let Some(object) = part_after(&parts, "objects")
+    {
+        return Some((format!("CustomField:{object}.{stem}"), path.to_owned()));
+    }
+    // Lightning bundles are directories: lwc/<bundle>/... and aura/<bundle>/....
+    for marker in ["lwc", "aura"] {
+        if let Some(bundle) = part_after(&parts, marker) {
+            return Some((
+                format!("LightningComponentBundle:{bundle}"),
+                path.to_owned(),
+            ));
+        }
+    }
     // File extensions win: Salesforce projects sometimes keep Apex outside `classes/`.
     let kind = if file.contains(".cls-meta.xml") || file.ends_with(".cls") {
         "ApexClass"
@@ -501,6 +414,112 @@ fn component_from_path(path: &str) -> Option<(String, String)> {
         stem
     };
     Some((format!("{kind}:{name}"), path.to_owned()))
+}
+
+fn part_after<'a>(parts: &[&'a str], marker: &str) -> Option<&'a str> {
+    parts
+        .iter()
+        .position(|part| *part == marker)
+        .and_then(|index| parts.get(index + 1).copied())
+}
+
+/// Metadata types the org browser offers. Browsing the whole org for arbitrary types is slow, so
+/// this curated list keeps the picker focused on the components people retrieve most often.
+pub const ORG_BROWSE_TYPES: &[&str] = &[
+    "ApexClass",
+    "ApexTrigger",
+    "Flow",
+    "PermissionSet",
+    "CustomObject",
+    "LightningComponentBundle",
+];
+
+/// One component reported by `sf org list metadata --json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgComponent {
+    pub metadata_type: String,
+    pub full_name: String,
+}
+
+impl OrgComponent {
+    /// The `Type:fullName` identity used for tooltips, deduplication and `--metadata` arguments.
+    pub fn identity(&self) -> String {
+        format!("{}:{}", self.metadata_type, self.full_name)
+    }
+}
+
+/// Parse `sf org list metadata --json` defensively.
+pub fn parse_org_components(value: &Value, fallback_type: &str) -> Vec<OrgComponent> {
+    let result = value.get("result").unwrap_or(value);
+    let mut rows: Vec<&Value> = Vec::new();
+    if let Some(items) = result.as_array() {
+        rows.extend(items);
+    } else if let Some(map) = result.as_object() {
+        for key in ["metadata", "components", "items", "records", "result"] {
+            if let Some(items) = map.get(key).and_then(Value::as_array) {
+                rows.extend(items);
+            }
+        }
+        if rows.is_empty() {
+            rows.push(result);
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut components = Vec::new();
+    for row in rows {
+        let Some(full_name) = string_field(row, "fullName")
+            .or_else(|| string_field(row, "fullname"))
+            .or_else(|| string_field(row, "name"))
+        else {
+            continue;
+        };
+        if has_secret_material(&full_name) {
+            continue;
+        }
+        let metadata_type = string_field(row, "type")
+            .or_else(|| string_field(row, "metadataType"))
+            .or_else(|| string_field(row, "metadata_type"))
+            .unwrap_or_else(|| fallback_type.to_owned());
+        if has_secret_material(&metadata_type) {
+            continue;
+        }
+        let component = OrgComponent {
+            metadata_type,
+            full_name,
+        };
+        if seen.insert(component.identity()) {
+            components.push(component);
+        }
+    }
+    components.sort_by_key(|component| component.identity());
+    components
+}
+
+fn has_secret_material(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("force://") || SENSITIVE_FIELDS.iter().any(|secret| lower.contains(secret))
+}
+
+/// The `Type:Name` identities that actually exist in the current project.
+pub fn local_identities(project: Option<&SfProject>) -> HashSet<String> {
+    let mut identities = HashSet::new();
+    let Some(project) = project else {
+        return identities;
+    };
+    for path in &project.source_files {
+        if let Some((identity, _)) = component_from_path(path) {
+            identities.insert(identity);
+        }
+    }
+    for manifest in &project.manifests {
+        let Ok(xml) = std::fs::read_to_string(project.root.join(manifest)) else {
+            continue;
+        };
+        for component in super::project::parse_manifest_components(&xml) {
+            identities.insert(component);
+        }
+    }
+    identities
 }
 
 #[cfg(test)]
@@ -695,38 +714,72 @@ mod tests {
     }
 
     #[test]
-    fn create_template_lookup_is_case_insensitive() {
-        assert_eq!(
-            create_template_for("apexclass").map(|template| template.label),
-            Some("ApexClass")
+    fn create_suggestions_cover_the_grouped_catalog() {
+        let set = create_suggestions();
+        assert_eq!(set.items.len(), super::super::create::ALL_TYPES.len());
+        assert!(
+            set.items
+                .iter()
+                .all(|item| !item.path.is_empty() && !item.value.is_empty())
         );
-        assert!(create_template_for("unknown").is_none());
+        assert!(
+            set.items
+                .iter()
+                .any(|item| item.path.contains("External CLI"))
+        );
+        let hits = set.filter("apex", 10);
+        assert!(hits.iter().any(|item| item.value == "Apex Class"));
+        assert!(
+            set.filter("lwc", 10)
+                .iter()
+                .any(|item| item.value == "Lightning Web Component")
+        );
     }
 
     #[test]
-    fn create_templates_map_to_their_metadata_folders() {
-        assert!(
-            CREATE_TEMPLATES
-                .iter()
-                .all(|template| !template.output_dir.is_empty())
+    fn org_components_parse_wrapped_and_bare_arrays_and_dedupe() {
+        let wrapped = serde_json::json!({"status": 0, "result": [
+            {"type": "ApexClass", "fullName": "Demo"},
+            {"type": "ApexClass", "fullName": "Demo"},
+            {"fullName": "OrgOnly"},
+            {"name": "Demo Flow", "type": "Flow"},
+            {"fullName": ""},
+            {"type": "ApexClass", "fullName": "force://secret"}
+        ]});
+        let parsed = parse_org_components(&wrapped, "ApexClass");
+        let identities: Vec<String> = parsed.iter().map(OrgComponent::identity).collect();
+        assert_eq!(
+            identities,
+            vec!["ApexClass:Demo", "ApexClass:OrgOnly", "Flow:Demo Flow",]
         );
-        let folder = |label: &str| create_template_for(label).map(|template| template.output_dir);
-        assert_eq!(folder("ApexClass"), Some("classes"));
-        assert_eq!(folder("ApexTrigger"), Some("triggers"));
-        assert_eq!(folder("Lightning Web Component"), Some("lwc"));
-        assert_eq!(folder("Aura Component"), Some("aura"));
-        assert_eq!(folder("Lightning App"), Some("aura"));
-        assert_eq!(folder("StaticResource"), Some("staticresources"));
-        assert_eq!(folder("Visualforce Page"), Some("pages"));
-        assert_eq!(folder("Visualforce Component"), Some("components"));
-        assert_eq!(folder("CustomObject"), Some("objects"));
-        assert_eq!(folder("Custom Metadata Type"), Some("customMetadata"));
-        assert_eq!(folder("Analytics Template"), Some("waveTemplates"));
-        assert!(
-            create_suggestions()
-                .items
-                .iter()
-                .all(|item| item.path.starts_with("→ "))
+
+        let object_wrapped = serde_json::json!({"result": {"metadata": [
+            {"type": "Flow", "fullName": "Only"}
+        ]}});
+        assert_eq!(
+            parse_org_components(&object_wrapped, "Flow")
+                .first()
+                .map(OrgComponent::identity),
+            Some("Flow:Only".to_owned())
         );
+    }
+
+    #[test]
+    fn local_identities_include_bundles_and_decomposed_fields() {
+        let project = SfProject {
+            root: std::path::PathBuf::from("."),
+            package_directories: Vec::new(),
+            source_api_version: None,
+            manifests: Vec::new(),
+            source_files: vec![
+                "force-app/main/default/lwc/demoCard/demoCard.js".to_owned(),
+                "force-app/main/default/aura/demoCmp/demoCmp.cmp".to_owned(),
+                "force-app/main/default/objects/Account/fields/Score__c.field-meta.xml".to_owned(),
+            ],
+        };
+        let identities = local_identities(Some(&project));
+        assert!(identities.contains("LightningComponentBundle:demoCard"));
+        assert!(identities.contains("LightningComponentBundle:demoCmp"));
+        assert!(identities.contains("CustomField:Account.Score__c"));
     }
 }

@@ -2,6 +2,10 @@
 //!
 //! Keeping these in one place means the command preview and the executed argv cannot drift.
 
+use std::path::Path;
+
+use super::create::{CreateDraft, CreateKind, FieldKey};
+
 /// The exact `sf apex run test` argv used by the Tests screen.
 pub fn apex_test_argv(class_names: &[String], org: Option<&str>) -> Vec<String> {
     let mut argv = vec![
@@ -61,6 +65,22 @@ pub fn org_list() -> Vec<String> {
     vec!["org".to_owned(), "list".to_owned(), "--json".to_owned()]
 }
 
+/// `sf org list metadata --metadata-type <type> --target-org <username> --json`.
+///
+/// The username (never the alias) is passed to the CLI; aliases are only for display labels.
+pub fn org_list_metadata(metadata_type: &str, org: &str) -> Vec<String> {
+    vec![
+        "org".to_owned(),
+        "list".to_owned(),
+        "metadata".to_owned(),
+        "--metadata-type".to_owned(),
+        metadata_type.to_owned(),
+        "--target-org".to_owned(),
+        org.to_owned(),
+        "--json".to_owned(),
+    ]
+}
+
 pub fn org_display(target: Option<&str>) -> Vec<String> {
     let mut argv = vec!["org".to_owned(), "display".to_owned()];
     if let Some(target) = target.filter(|target| !target.is_empty()) {
@@ -93,6 +113,175 @@ pub fn logout(target: &str) -> Vec<String> {
         "--no-prompt".to_owned(),
         "--json".to_owned(),
     ]
+}
+
+/// Build the exact argv for a Create Metadata generator.
+///
+/// `output_dir` is the private per-job staging directory: every generator that accepts an output
+/// flag writes there, and sftui publishes the result into the project with exclusive creation.
+/// The interactive Custom Object generator gets no output flag and is never run by sftui.
+pub fn create_metadata_argv(draft: &CreateDraft, output_dir: &Path) -> Vec<String> {
+    let dir = output_dir.to_string_lossy().into_owned();
+    let name = draft.get(FieldKey::Name).trim();
+    let mut argv: Vec<String> = match draft.kind {
+        CreateKind::ApexClass => {
+            let mut argv = vec![
+                "template".to_owned(),
+                "generate".to_owned(),
+                "apex".to_owned(),
+                "class".to_owned(),
+                "--name".to_owned(),
+                name.to_owned(),
+            ];
+            let template = draft.get(FieldKey::ApexTemplate);
+            if !template.trim().is_empty() {
+                argv.push("--template".to_owned());
+                argv.push(template.trim().to_owned());
+            }
+            argv
+        }
+        CreateKind::ApexTrigger => vec![
+            "template".to_owned(),
+            "generate".to_owned(),
+            "apex".to_owned(),
+            "trigger".to_owned(),
+            "--name".to_owned(),
+            name.to_owned(),
+            "--sobject".to_owned(),
+            draft.get(FieldKey::SObject).trim().to_owned(),
+            "--event".to_owned(),
+            draft.get(FieldKey::Event).trim().to_owned(),
+        ],
+        CreateKind::Lwc | CreateKind::Aura => vec![
+            "template".to_owned(),
+            "generate".to_owned(),
+            "lightning".to_owned(),
+            "component".to_owned(),
+            "--type".to_owned(),
+            if draft.kind == CreateKind::Lwc {
+                "lwc".to_owned()
+            } else {
+                "aura".to_owned()
+            },
+            "--name".to_owned(),
+            name.to_owned(),
+        ],
+        CreateKind::LightningApp => vec![
+            "template".to_owned(),
+            "generate".to_owned(),
+            "lightning".to_owned(),
+            "app".to_owned(),
+            "--name".to_owned(),
+            name.to_owned(),
+        ],
+        CreateKind::FlexiPage => {
+            let mut argv = vec![
+                "template".to_owned(),
+                "generate".to_owned(),
+                "flexipage".to_owned(),
+                "--name".to_owned(),
+                name.to_owned(),
+                "--template".to_owned(),
+                draft.get(FieldKey::FlexiTemplate).trim().to_owned(),
+            ];
+            let sobject = draft.get(FieldKey::SObject).trim();
+            if draft.get(FieldKey::FlexiTemplate) == "RecordPage" && !sobject.is_empty() {
+                argv.push("--sobject".to_owned());
+                argv.push(sobject.to_owned());
+            }
+            argv
+        }
+        CreateKind::VisualforcePage => {
+            let mut argv = vec![
+                "template".to_owned(),
+                "generate".to_owned(),
+                "visualforce".to_owned(),
+                "page".to_owned(),
+                "--name".to_owned(),
+                name.to_owned(),
+                "--label".to_owned(),
+                draft.get(FieldKey::Label).trim().to_owned(),
+            ];
+            argv.push("--output-dir".to_owned());
+            argv.push(dir);
+            return argv;
+        }
+        CreateKind::VisualforceComponent => {
+            let mut argv = vec![
+                "template".to_owned(),
+                "generate".to_owned(),
+                "visualforce".to_owned(),
+                "component".to_owned(),
+                "--name".to_owned(),
+                name.to_owned(),
+                "--label".to_owned(),
+                draft.get(FieldKey::Label).trim().to_owned(),
+            ];
+            argv.push("--output-dir".to_owned());
+            argv.push(dir);
+            return argv;
+        }
+        CreateKind::StaticResource => vec![
+            "template".to_owned(),
+            "generate".to_owned(),
+            "static-resource".to_owned(),
+            "--name".to_owned(),
+            name.to_owned(),
+            "--type".to_owned(),
+            draft.get(FieldKey::ContentType).trim().to_owned(),
+        ],
+        CreateKind::CustomMetadataType => {
+            let mut argv = vec![
+                "cmdt".to_owned(),
+                "generate".to_owned(),
+                "object".to_owned(),
+                "--type-name".to_owned(),
+                name.to_owned(),
+            ];
+            for (flag, key) in [
+                ("--label", FieldKey::Label),
+                ("--plural-label", FieldKey::PluralLabel),
+            ] {
+                let value = draft.get(key).trim();
+                if !value.is_empty() {
+                    argv.push(flag.to_owned());
+                    argv.push(value.to_owned());
+                }
+            }
+            argv.push("--visibility".to_owned());
+            argv.push(draft.get(FieldKey::Visibility).trim().to_owned());
+            // The cmdt generator uses `--output-directory`, not `--output-dir`.
+            argv.push("--output-directory".to_owned());
+            argv.push(dir);
+            return argv;
+        }
+        CreateKind::AnalyticsTemplate => vec![
+            "template".to_owned(),
+            "generate".to_owned(),
+            "analytics".to_owned(),
+            "template".to_owned(),
+            "--name".to_owned(),
+            name.to_owned(),
+        ],
+        CreateKind::CustomObject => {
+            // Interactive in the CLI. The caller copies this command; it is never queued.
+            return vec![
+                "schema".to_owned(),
+                "generate".to_owned(),
+                "sobject".to_owned(),
+                "--label".to_owned(),
+                draft.get(FieldKey::Label).trim().to_owned(),
+            ];
+        }
+    };
+    argv.push("--output-dir".to_owned());
+    argv.push(dir);
+    argv
+}
+
+/// Human-readable `sf …` rendering of the same argv, for display and the job record only.
+pub fn create_metadata_display(argv: &[String]) -> String {
+    format!("sf {}", argv.join(" "))
 }
 
 pub fn create_scratch(alias: &str, definition: Option<&str>, days: &str) -> Vec<String> {
@@ -161,5 +350,31 @@ mod tests {
     fn org_display_and_list_include_json() {
         assert_eq!(org_display(None).last().map(String::as_str), Some("--json"));
         assert_eq!(org_list().last().map(String::as_str), Some("--json"));
+    }
+
+    #[test]
+    fn org_list_metadata_uses_the_username_for_the_cli() {
+        let argv = org_list_metadata("ApexClass", "dev-user@example.invalid");
+        assert_eq!(
+            argv,
+            vec![
+                "org",
+                "list",
+                "metadata",
+                "--metadata-type",
+                "ApexClass",
+                "--target-org",
+                "dev-user@example.invalid",
+                "--json",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+        // A type is one argv element; the user's alias is never sent to the CLI.
+        let bundle = org_list_metadata("LightningComponentBundle", "dev-user@example.invalid");
+        assert!(bundle.contains(&"LightningComponentBundle".to_owned()));
+        assert!(!bundle.iter().any(|part| part.contains('*')));
+        assert!(!bundle.iter().any(|part| part == "dev-alias"));
     }
 }

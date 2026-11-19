@@ -4,6 +4,26 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.24] - 2026-11-20
+
+### Added
+
+- Genuinely async live fuzzy search with debounced background ranking for Metadata, Apex Tests and the Create Metadata type picker; typing stays responsive while results re-rank off-thread.
+- Org-only metadata browsing via `sf org list metadata --metadata-type ... --target-org ... --json`, plus exact-name retrieval of a single component.
+- A retry report in the Jobs window, and rerun of a finished job with its original test classes, options and target org.
+
+### Changed
+
+- Retrieve and Deploy are combined into one Metadata screen.
+- Retrieving now refreshes the project so the locally retrieved components are picked up immediately.
+- Jobs redesigned around summary-first detail, with clear stop/cancel semantics, deploy cancellation and Apex stop tracking.
+- Create Metadata wizard redesigned with per-type fields, staged safe writes and explicit messaging that files are created locally only.
+- Updated documentation and key hints to match the new screens and controls.
+
+### Fixed
+
+- Apex results when one of several test classes fails: exit-code-100 reports with valid results are now read correctly, and all class and method results are preserved instead of being dropped.
+
 ## [0.1.23] - 2026-11-18
 
 ### Changed

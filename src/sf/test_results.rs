@@ -335,9 +335,94 @@ pub fn is_terminal_outcome(outcome: &str) -> bool {
     )
 }
 
+/// Recognise an authoritative Apex test report inside a CLI response.
+///
+/// `sf apex get test --json` prints the complete report and exits 100 when tests fail, so the
+/// exit code cannot decide whether the payload is usable. A payload is accepted only when it has
+/// a terminal summary whose run id matches the one we requested: an error envelope, an empty
+/// response and a still-running status are never presented as test results.
+pub fn parse_terminal_report(
+    value: &Value,
+    command: &str,
+    expected_run_id: &str,
+) -> Option<TestRun> {
+    let result = value.get("result").unwrap_or(value);
+    let summary = result.get("summary")?;
+    let outcome = summary.get("outcome").and_then(Value::as_str)?;
+    if !is_terminal_outcome(outcome) {
+        return None;
+    }
+    let run = parse(value, command);
+    (run.id == expected_run_id).then_some(run)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_failed_report_is_parsed_with_every_class_and_method() {
+        let value = serde_json::json!({
+          "status": 100,
+          "result": {
+            "testRunId": "08N000000000002",
+            "summary": {"outcome": "Failed", "testsRan": 3, "passing": 2, "failing": 1,
+                        "skipped": 0, "testRunCoverage": "75%"},
+            "tests": [
+              {"fullName": "AlphaTest.ok", "outcome": "Pass"},
+              {"fullName": "AlphaTest.alsoOk", "outcome": "Pass"},
+              {"fullName": "BetaTest.bad", "outcome": "Fail",
+               "message": "System.AssertException: synthetic assertion failed"}
+            ],
+            "codecoverage": [{"name": "BetaService", "percentage": "75%",
+                              "numLinesCovered": 3, "numLinesUncovered": 1}]
+          }
+        });
+        let run = parse_terminal_report(&value, "sf apex get test", "08N000000000002")
+            .expect("terminal report");
+        assert_eq!(run.outcome, "Failed");
+        assert_eq!(run.tests.len(), 3);
+        assert_eq!(run.tests[0].name, "AlphaTest.ok");
+        assert_eq!(run.tests[2].name, "BetaTest.bad");
+        assert_eq!(
+            run.failures[0].message,
+            "System.AssertException: synthetic assertion failed"
+        );
+        assert_eq!(run.coverages[0].name, "BetaService");
+    }
+
+    #[test]
+    fn error_payload_is_not_a_terminal_report() {
+        let value = serde_json::json!({
+          "status": 100,
+          "name": "SfError",
+          "message": "synthetic report failure",
+          "exitCode": 100
+        });
+        assert!(
+            parse_terminal_report(&value, "sf apex get test", "08N000000000003").is_none(),
+            "a CLI error envelope must not become a test result"
+        );
+    }
+
+    #[test]
+    fn non_terminal_and_foreign_run_reports_are_rejected() {
+        let processing = serde_json::json!({
+          "status": 0,
+          "result": {"testRunId": "08N000000000002",
+                     "summary": {"outcome": "Processing"}}
+        });
+        assert!(
+            parse_terminal_report(&processing, "sf apex get test", "08N000000000002").is_none()
+        );
+
+        let failed = serde_json::json!({
+          "status": 100,
+          "result": {"testRunId": "08N000000000009",
+                     "summary": {"outcome": "Failed", "failing": 1}}
+        });
+        assert!(parse_terminal_report(&failed, "sf apex get test", "08N000000000002").is_none());
+    }
 
     #[test]
     fn terminal_outcomes_are_recognized() {

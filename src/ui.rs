@@ -8,8 +8,12 @@ use ratatui::widgets::{
     Block, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap,
 };
 
-use crate::app::{App, JobSection, JobsFocus, Modal, ResultItem, Tab, TestHistoryFocus};
+use crate::app::{
+    App, CreateWizardState, JobDetailView, JobSection, JobsFocus, Modal, ResultItem, Tab,
+    TestHistoryFocus,
+};
 use crate::json_view;
+use crate::sf::create::FieldKey;
 use crate::view::apex_result;
 
 fn accent(app: &App) -> Color {
@@ -26,8 +30,7 @@ struct DetailCacheKey {
     record_id: u64,
     revision: u64,
     width: usize,
-    show_details: bool,
-    show_json: bool,
+    detail_view: JobDetailView,
     queued_position: Option<usize>,
     accent: Color,
     elapsed: String,
@@ -363,8 +366,8 @@ const KEYMAP: &[KeyBinding] = &[
         cap: "",
         hints: &[],
         order: 0,
-        help_key: "Menu 1/2/3/4",
-        help: "retrieve · deploy · create · tests",
+        help_key: "Menu 1/2/3",
+        help: "retrieve/deploy metadata · create · tests",
     },
     KeyBinding {
         cap: "Enter",
@@ -438,7 +441,28 @@ const KEYMAP: &[KeyBinding] = &[
         hints: &[(HintContext::Transfer, "refresh")],
         order: 15,
         help_key: "F5",
-        help: "refresh component search",
+        help: "refresh component search and the active org listing",
+    },
+    KeyBinding {
+        cap: "F3",
+        hints: &[(HintContext::Transfer, "mode")],
+        order: 4,
+        help_key: "F3",
+        help: "switch Retrieve/Deploy on the Metadata screen; clears selection",
+    },
+    KeyBinding {
+        cap: "F6",
+        hints: &[(HintContext::Transfer, "browse")],
+        order: 5,
+        help_key: "F6",
+        help: "browse an org for components missing locally (Retrieve mode)",
+    },
+    KeyBinding {
+        cap: "F9",
+        hints: &[(HintContext::Transfer, "exact")],
+        order: 5,
+        help_key: "F9",
+        help: "add an exact Type:FullName from the browsed org",
     },
     KeyBinding {
         cap: "F8",
@@ -529,6 +553,20 @@ const KEYMAP: &[KeyBinding] = &[
         order: 0,
         help_key: "c (confirm)",
         help: "show the exact command that will run",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "Create wizard",
+        help: "3 on Menu: type to filter · ↑↓ move · Enter select · Tab fields · Esc back",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "c (Review)",
+        help: "show the structured Create command (display only)",
     },
     KeyBinding {
         cap: "",
@@ -1065,8 +1103,22 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ])
     .split(area);
-    let title = if state.retrieve { "Retrieve" } else { "Deploy" };
+    let title = if state.retrieve {
+        "Retrieve Metadata"
+    } else {
+        "Deploy Metadata"
+    };
     let mut heading = vec![strong(title, accent(app))];
+    let mode_hint = if state.retrieve {
+        "F3 Deploy · F6 Browse Org · F9 exact name"
+    } else {
+        "F3 Retrieve"
+    };
+    heading.push(faint(format!(
+        "   {} · org: {}",
+        mode_hint,
+        truncated(&app.org_display(), 32)
+    )));
     if let Some(error) = &app.deploy_state.project_error {
         heading.push(faint(format!(
             "   {}",
@@ -1339,18 +1391,10 @@ fn result_lines(
     lines
 }
 
+/// Status in words, not only a glyph or colour. The typed lifecycle keeps meaning even with
+/// NO_COLOR and for screen readers.
 fn job_state_label(record: &crate::app::OutputRecord) -> &'static str {
-    if record.queued {
-        "queued"
-    } else if record.pending_report || !record.finished {
-        "running"
-    } else {
-        match record.exit_code {
-            Some(0) => "ok",
-            Some(_) => "failed",
-            None => "stopped",
-        }
-    }
+    record.status_text()
 }
 
 fn job_detail_lines(
@@ -1358,14 +1402,14 @@ fn job_detail_lines(
     record: &crate::app::OutputRecord,
     queued_position: Option<usize>,
     width: usize,
+    detail_view: JobDetailView,
 ) -> Vec<Line<'static>> {
     let now = std::time::Instant::now();
     let key = DetailCacheKey {
         record_id: record.id,
         revision: record.render_revision,
         width,
-        show_details: app.output_state.show_details,
-        show_json: app.output_state.show_json,
+        detail_view,
         queued_position,
         accent: accent(app),
         // The elapsed label is part of the drawn header; keying on it keeps the clock accurate
@@ -1378,7 +1422,7 @@ fn job_detail_lines(
             return lines.clone();
         }
     }
-    let lines = build_job_detail_lines(app, record, queued_position, width, now);
+    let lines = build_job_detail_lines(app, record, queued_position, width, now, detail_view);
     app.render_cache.borrow_mut().put(key, lines.clone());
     lines
 }
@@ -1389,84 +1433,182 @@ fn build_job_detail_lines(
     queued_position: Option<usize>,
     width: usize,
     now: std::time::Instant,
+    detail_view: JobDetailView,
 ) -> Vec<Line<'static>> {
     let (glyph, color) = record_status(record);
     let elapsed = record.elapsed_label(now);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled(format!("{glyph} "), Style::default().fg(color)),
-            strong(format!("#{} ", record.id), accent(app)),
-            strong(record.task.label(), accent(app)),
-            Span::styled(
-                format!("  {} · {}", job_state_label(record), elapsed),
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-        Line::from(Span::styled(
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        strong(format!("#{} ", record.id), accent(app)),
+        strong(record.task.label(), accent(app)),
+        Span::styled(
+            format!("  {} · {}", job_state_label(record), elapsed),
+            Style::default().fg(Color::Gray),
+        ),
+    ])];
+    // The long command is deliberately shown only in the Output view; the Summary and JSON views
+    // do not repeat it on every line.
+    if detail_view == JobDetailView::Output {
+        lines.push(Line::from(Span::styled(
             truncated(&record.display_command(), width),
             Style::default().fg(Color::Reset),
-        )),
-    ];
+        )));
+    }
     if let Some(position) = queued_position {
         lines.push(Line::from(faint(format!(
-            "queue position {position} — waits for a free job slot"
+            "queue position {position} - waits for a free job slot"
         ))));
     }
-    lines.push(Line::from(" "));
-    if record.pending_report {
-        // A terminal run that is only collecting per-class coverage has a real summary; show it
-        // instead of claiming the test is still waiting for the org to finish.
-        let waiting = record
-            .result
-            .as_ref()
-            .filter(|view| {
-                view.kind == crate::app::ResultKind::ApexTests && !view.summary.is_empty()
-            })
-            .map(|view| view.summary.as_str())
-            .unwrap_or("running — waiting for org results");
-        lines.push(Line::from(faint(waiting)));
-        lines.push(Line::from(" "));
+    match detail_view {
+        JobDetailView::Summary => lines.extend(summary_detail_lines(app, record, width)),
+        JobDetailView::Output => lines.extend(output_detail_lines(app, record)),
+        JobDetailView::Json => lines.extend(json_detail_lines(app, record)),
     }
-    if let Some(result) = &record.result {
-        lines.extend(result_lines(app, Some(record), result, width));
-    } else if app.output_state.show_json && record.finished {
-        lines.push(strong_line("JSON", accent(app)));
-        if let Some(value) = &record.json {
-            let view = json_view::table(value);
-            for row in view.rows.iter().take(500) {
-                lines.push(Line::from(faint(row.join(" | "))));
+    lines
+}
+
+/// Compact summary: task/state/elapsed are in the header; here we add the org, the remote id once,
+/// Apex pass/fail plus the first failure, coverage and the deploy state.
+fn summary_detail_lines(
+    _app: &App,
+    record: &crate::app::OutputRecord,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let org = record
+        .invocation
+        .as_ref()
+        .and_then(|spec| spec.org.as_deref())
+        .or(match &record.lifecycle {
+            crate::app::JobLifecycle::DeployPending { org, .. }
+            | crate::app::JobLifecycle::ApexPending { org, .. } => org.as_deref(),
+            _ => None,
+        })
+        .filter(|org| !org.is_empty());
+    if let Some(org) = org {
+        lines.push(Line::from(faint(format!("Org: {org}"))));
+    }
+    if let Some(id) = record.remote_id() {
+        let label = if record.task == crate::app::TaskKind::Deploy {
+            "Deploy ID"
+        } else {
+            "Test run ID"
+        };
+        lines.push(Line::from(faint(format!("{label}: {id}"))));
+    }
+    if let Some(error) = &record.cleanup_error {
+        lines.push(Line::from(Span::styled(
+            format!("Stop cleanup failed: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(" "));
+    match &record.result {
+        Some(result) => {
+            if record.pending_report {
+                lines.push(Line::from(faint("Waiting for org results")));
             }
-            if view.rows.len() > 500 {
+            if !result.status.is_empty() {
+                lines.push(strong_line(
+                    &result.status,
+                    if result.ok { Color::Green } else { Color::Red },
+                ));
+            }
+            if !result.summary.is_empty() {
+                lines.push(Line::from(faint(truncated(&result.summary, width))));
+            }
+            // Apex: show the first failing class, then the failing test methods with their detail.
+            for failed in result.items.iter().take(3) {
+                lines.push(Line::from(Span::styled(
+                    truncated(&failed.label, width),
+                    Style::default().fg(Color::Red),
+                )));
+                if !failed.detail.is_empty() {
+                    lines.push(Line::from(faint(truncated(&failed.detail, width))));
+                }
+            }
+            for section in &result.sections {
+                let failing: Vec<_> = section.rows.iter().filter(|row| !row.ok).take(3).collect();
+                if !failing.is_empty() {
+                    lines.push(Line::from(faint(&section.title)));
+                    for row in failing {
+                        let text = if row.detail.is_empty() {
+                            row.label.clone()
+                        } else {
+                            format!("{} - {}", row.label, row.detail)
+                        };
+                        lines.push(Line::from(Span::styled(
+                            truncated(&text, width),
+                            Style::default().fg(Color::Red),
+                        )));
+                    }
+                }
+            }
+            if !result.coverage.is_empty() {
+                let covered: usize = result.coverage.iter().filter(|item| item.ok).count();
                 lines.push(Line::from(faint(format!(
-                    "… {} more JSON rows",
-                    view.rows.len() - 500
+                    "Coverage: {covered}/{} classes",
+                    result.coverage.len()
                 ))));
             }
+        }
+        None => {
+            let text = if record.pending_report {
+                "Waiting for org results"
+            } else if record.queued {
+                "Waiting for a free job slot"
+            } else if !record.finished {
+                "Running - no result yet"
+            } else {
+                "No result captured"
+            };
+            lines.push(Line::from(faint(text)));
+        }
+    }
+    // [r]/[t] availability is shown in the footer; the summary stays intentionally short.
+    lines
+}
+
+fn output_detail_lines(app: &App, record: &crate::app::OutputRecord) -> Vec<Line<'static>> {
+    let mut lines = vec![strong_line("OUTPUT", accent(app))];
+    if record.lines.is_empty() {
+        lines.push(Line::from(faint(if record.finished {
+            "No streamed output retained."
         } else {
-            lines.push(Line::from(faint("No JSON captured.")));
+            "Waiting for output..."
+        })));
+    }
+    for line in &record.lines {
+        lines.push(Line::from(Span::styled(
+            line.text.clone(),
+            Style::default().fg(if line.stream == crate::sf::runner::OutputStream::Stderr {
+                Color::Red
+            } else {
+                Color::Gray
+            }),
+        )));
+    }
+    if record.lines_truncated() {
+        lines.push(output_truncated_notice());
+    }
+    lines
+}
+
+fn json_detail_lines(app: &App, record: &crate::app::OutputRecord) -> Vec<Line<'static>> {
+    let mut lines = vec![strong_line("JSON", accent(app))];
+    if let Some(value) = &record.json {
+        let view = json_view::table(value);
+        for row in view.rows.iter().take(500) {
+            lines.push(Line::from(faint(row.join(" | "))));
+        }
+        if view.rows.len() > 500 {
+            lines.push(Line::from(faint(format!(
+                "... {} more JSON rows",
+                view.rows.len() - 500
+            ))));
         }
     } else {
-        lines.push(strong_line("OUTPUT", accent(app)));
-        if record.lines.is_empty() {
-            lines.push(Line::from(faint(if record.finished {
-                "No streamed output retained."
-            } else {
-                "Waiting for output…"
-            })));
-        }
-        for line in &record.lines {
-            lines.push(Line::from(Span::styled(
-                line.text.clone(),
-                Style::default().fg(if line.stream == crate::sf::runner::OutputStream::Stderr {
-                    Color::Red
-                } else {
-                    Color::Gray
-                }),
-            )));
-        }
-        if record.lines_truncated() {
-            lines.push(output_truncated_notice());
-        }
+        lines.push(Line::from(faint("No JSON captured.")));
     }
     lines
 }
@@ -1476,8 +1618,9 @@ pub(crate) fn job_detail_len(
     app: &App,
     record: &crate::app::OutputRecord,
     queued_position: Option<usize>,
+    detail_view: JobDetailView,
 ) -> usize {
-    job_detail_lines(app, record, queued_position, 80).len()
+    job_detail_lines(app, record, queued_position, 80, detail_view).len()
 }
 
 /// Test seam: the cached text of one job's detail pane, including the "waiting" placeholder.
@@ -1491,7 +1634,7 @@ pub(crate) fn job_detail_text(app: &App, record_id: u64) -> Vec<String> {
     else {
         return Vec::new();
     };
-    job_detail_lines(app, record, None, 80)
+    job_detail_lines(app, record, None, 80, JobDetailView::Summary)
         .iter()
         .map(|line| {
             line.spans
@@ -1590,6 +1733,59 @@ fn draw_setup(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Review before a rerun. Shows the exact stored invocation and lets the user resolve the org;
+/// nothing is enqueued until Enter is pressed.
+fn draw_rerun_review(frame: &mut Frame, app: &App, job_id: u64, org: &str, org_required: bool) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    let panel = centered(area, 90, 16);
+    let outer = block("Rerun review", app);
+    frame.render_widget(outer.clone(), panel);
+    let inner = outer.inner(panel);
+    let record = app
+        .output_state
+        .records
+        .iter()
+        .find(|record| record.id == job_id);
+    let mut lines: Vec<Line<'static>> = vec![Line::from(strong(
+        format!(
+            "Job #{job_id} - {}",
+            record.map(|r| r.task.label()).unwrap_or("unknown")
+        ),
+        accent(app),
+    ))];
+    if let Some(spec) = record.and_then(|record| record.invocation.as_ref()) {
+        lines.push(Line::from(faint(format!("Args: {}", spec.display))));
+        lines.push(Line::from(faint(format!(
+            "Dir: {}",
+            spec.working_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "current directory".to_owned())
+        ))));
+        lines.push(Line::from(" "));
+    }
+    lines.push(Line::from(faint(format!(
+        "Org: {}{}",
+        org,
+        if org.is_empty() && org_required {
+            "  (required - type the username)"
+        } else if org.is_empty() {
+            "  (blank = CLI default)"
+        } else {
+            ""
+        }
+    ))));
+    lines.push(Line::from(" "));
+    lines.push(Line::from(faint(
+        "Enter enqueues a NEW job with these exact arguments; Esc cancels.",
+    )));
+    lines.push(Line::from(faint(
+        "The previous result stays in the Jobs window.",
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width
         .min(area.width.saturating_sub(2))
@@ -1629,15 +1825,18 @@ struct JobsView {
     focus: JobsFocus,
     scroll: usize,
     follow: bool,
+    detail_view: JobDetailView,
+    narrow: bool,
 }
 
 fn draw_jobs(
     frame: &mut Frame,
     app: &App,
-    selected: usize,
+    selected_id: Option<u64>,
     focus: JobsFocus,
     scroll: usize,
     follow: bool,
+    detail_view: JobDetailView,
 ) {
     let area = frame.area();
     frame.render_widget(Clear, area);
@@ -1658,7 +1857,7 @@ fn draw_jobs(
         "Jobs".to_owned()
     } else {
         format!(
-            "Jobs — {} running · {} queued · {} finished",
+            "Jobs - {} running · {} queued · {} finished",
             running, queued, finished
         )
     };
@@ -1668,27 +1867,34 @@ fn draw_jobs(
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(faint(
-                "No jobs yet — start a retrieve, deploy or test run.",
+                "No jobs yet - start a retrieve, deploy or test run.",
             ))),
             inner,
         );
         return;
     }
     let sections = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(inner);
+    // Selection is resolved from the stable id on every draw; a section move cannot change it.
+    let selected = selected_id
+        .and_then(|id| rows.iter().position(|row| row.record.id == id))
+        .unwrap_or(0);
+    let narrow = area.width < 100 || area.height < 20;
     let view = JobsView {
-        selected: selected.min(rows.len().saturating_sub(1)),
+        selected,
         focus,
         scroll,
         follow,
+        detail_view,
+        narrow,
     };
-    if area.width >= 100 {
-        let columns = Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)])
+    if !narrow {
+        let columns = Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)])
             .split(sections[0]);
         draw_job_list(frame, columns[0], app, &rows, view);
         draw_job_detail(frame, columns[1], app, &rows, view);
     } else {
-        // Stacked layout: give the list only the rows it needs (up to half the window) so the
-        // selected job's result keeps as much vertical space as possible.
+        // Stacked layout on narrow terminals: the list keeps focus, Enter/Tab/Esc move between
+        // list and detail, and the footer prioritises actions on the selected job.
         let wanted = (rows.len() as u16).saturating_add(5);
         let list_height = wanted.min((sections[0].height / 2).max(5));
         let panes = Layout::vertical([Constraint::Length(list_height), Constraint::Min(3)])
@@ -1700,7 +1906,7 @@ fn draw_jobs(
     let live = rows
         .get(view.selected)
         .is_some_and(|row| row.section != JobSection::Finished);
-    let hints = jobs_hint_pairs(record, view.focus, live, view.follow);
+    let hints = jobs_hint_pairs(record, view.focus, live, view.follow, view.narrow);
     frame.render_widget(
         Paragraph::new(keycap_pairs_line(&hints, app, usize::from(inner.width))),
         sections[1],
@@ -1718,7 +1924,7 @@ fn draw_job_list(
     let mut items: Vec<ListItem> = Vec::with_capacity(rows.len() + 3);
     let mut selected_item = None;
     let mut section = None;
-    for (index, row) in rows.iter().enumerate() {
+    for (row_index, row) in rows.iter().enumerate() {
         if section != Some(row.section) {
             section = Some(row.section);
             items.push(ListItem::new(Line::from(strong(
@@ -1726,7 +1932,7 @@ fn draw_job_list(
                 accent(app),
             ))));
         }
-        if index == view.selected {
+        if row_index == view.selected {
             selected_item = Some(items.len());
         }
         let (glyph, color) = record_status(row.record);
@@ -1741,9 +1947,9 @@ fn draw_job_list(
     let mut state = ListState::default();
     state.select(selected_item);
     let title = if view.focus == JobsFocus::List {
-        "› job queue"
+        "› jobs"
     } else {
-        "job queue"
+        "jobs"
     };
     let list = List::new(items)
         .block(pane_block(title, app, view.focus == JobsFocus::List))
@@ -1757,7 +1963,8 @@ fn draw_job_list(
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// One row per job: `✓ #2  Apex tests  sf apex …   7s  4/4 ✓`.
+/// One compact row per job. The long command is deliberately omitted here (it is available in
+/// the Output view); the state is shown in words so glyph/colour are not the only signal.
 fn job_row_text(record: &crate::app::OutputRecord, width: usize) -> String {
     let elapsed = record.elapsed_label(std::time::Instant::now());
     let summary = record.outcome_summary();
@@ -1766,10 +1973,12 @@ fn job_row_text(record: &crate::app::OutputRecord, width: usize) -> String {
     } else {
         format!("{elapsed}  {summary}")
     };
-    let head = format!("#{:<3} {:<11} ", record.id, record.task.label());
-    let budget = width.saturating_sub(head.chars().count() + tail.chars().count() + 2);
-    let command = truncated(&record.display_command(), budget.max(1));
-    truncated(&format!("{head}{command}  {tail}"), width)
+    let head = format!("#{:<3} ", record.id);
+    let state = record.status_text();
+    let budget = width
+        .saturating_sub(head.chars().count() + state.chars().count() + tail.chars().count() + 4);
+    let task = truncated(record.task.label(), budget.max(1));
+    truncated(&format!("{head}{state:<14} {task} {tail}"), width)
 }
 
 fn draw_job_detail(
@@ -1782,7 +1991,7 @@ fn draw_job_detail(
     let Some(row) = rows.get(view.selected) else {
         frame.render_widget(
             Paragraph::new(Line::from(faint("No job selected")))
-                .block(pane_block("result", app, false)),
+                .block(pane_block("summary", app, false)),
             area,
         );
         return;
@@ -1794,16 +2003,23 @@ fn draw_job_detail(
         .filter(|row| row.section == JobSection::Queued)
         .position(|row| row.record.id == record.id)
         .map(|index| index + 1);
-    let title = if live {
-        format!("live output — #{} {}", record.id, record.task.label())
-    } else {
-        format!("result — #{} {}", record.id, record.task.label())
+    let view_name = match view.detail_view {
+        JobDetailView::Summary => "summary",
+        JobDetailView::Output => "output",
+        JobDetailView::Json => "json",
     };
+    let title = format!("{} - #{} {}", view_name, record.id, record.task.label());
     let outer = pane_block(&title, app, view.focus == JobsFocus::Detail);
     frame.render_widget(outer.clone(), area);
     let inner = outer.inner(area);
     app.jobs_detail_height.set(inner.height);
-    let lines = job_detail_lines(app, record, queued_position, usize::from(inner.width));
+    let lines = job_detail_lines(
+        app,
+        record,
+        queued_position,
+        usize::from(inner.width),
+        view.detail_view,
+    );
     let max_scroll = lines.len().saturating_sub(usize::from(inner.height));
     let top = if live && view.follow {
         max_scroll
@@ -1816,46 +2032,65 @@ fn draw_job_detail(
     );
 }
 
-/// Context-sensitive keycaps for the Jobs window, most useful key first.
+/// Context-sensitive keycaps for the Jobs window, most useful key first. On narrow terminals the
+/// selected job's actions (`x`, `t`, `r`, `s/o/z`) come before navigation hints.
 fn jobs_hint_pairs(
     record: Option<&crate::app::OutputRecord>,
     focus: JobsFocus,
     live: bool,
     follow: bool,
+    narrow: bool,
 ) -> Vec<(&'static str, &'static str)> {
-    if focus == JobsFocus::List {
-        let mut hints = vec![
-            ("↑↓", "select"),
-            ("Enter", "open"),
-            ("Esc", "close"),
-            ("Tab", "detail"),
-            ("x", "cancel"),
-            ("c", "clear finished"),
-        ];
-        if record.is_some_and(|record| record.queued) {
-            hints[3] = ("x", "dequeue");
+    let queued = record.is_some_and(|record| record.queued);
+    let can_retry = record.is_some_and(|record| record.lifecycle.can_retry_report());
+    let can_rerun = record.is_some_and(|record| {
+        record.invocation.is_some()
+            && !matches!(
+                record.lifecycle,
+                crate::app::JobLifecycle::DeployPending { .. }
+                    | crate::app::JobLifecycle::ApexPending { .. }
+                    | crate::app::JobLifecycle::Running
+                    | crate::app::JobLifecycle::Stopping
+            )
+    });
+    let mut job_actions: Vec<(&'static str, &'static str)> = Vec::new();
+    if queued {
+        job_actions.push(("x", "dequeue"));
+    } else if live {
+        job_actions.push(("x", "stop"));
+    } else if let Some(record) = record {
+        match record.lifecycle {
+            crate::app::JobLifecycle::DeployPending {
+                cancel_requested: false,
+                ..
+            } => job_actions.push(("x", "cancel deploy")),
+            crate::app::JobLifecycle::ApexPending { tracking: true, .. } => {
+                job_actions.push(("x", "stop tracking"))
+            }
+            _ => {}
         }
-        return hints;
     }
-    if live {
-        let mut hints = vec![("Tab", "list"), ("Esc", "back"), ("PgUp/PgDn", "scroll")];
-        if follow {
-            hints.push(("↑", "pause follow"));
-        } else {
-            hints.push(("End", "follow"));
-        }
-        if record.is_some_and(crate::app::OutputRecord::is_running) {
-            hints.push(("x", "cancel"));
-        }
-        return hints;
+    if can_retry {
+        job_actions.push(("t", "retry report"));
     }
-    vec![
-        ("Tab", "list"),
-        ("Esc", "back"),
-        ("j/k", "scroll"),
-        ("o", "raw output"),
-        ("z", "JSON"),
-    ]
+    if can_rerun {
+        job_actions.push(("r", "rerun"));
+    }
+    job_actions.push(("s", "summary"));
+    job_actions.push(("o", "output"));
+    job_actions.push(("z", "JSON"));
+    if narrow {
+        // Prioritise the visible selected-job actions when there is little footer width.
+        job_actions.truncate(4);
+        job_actions.extend([("Tab", "detail"), ("Esc", "close")]);
+        return job_actions;
+    }
+    let mut hints = vec![("↑↓", "select"), ("Enter", "open"), ("Tab", "detail")];
+    hints.extend(job_actions);
+    hints.push(("Esc", "close"));
+    hints.push(("c", "clear"));
+    let _ = (focus, follow);
+    hints
 }
 
 /// Compact UTC timestamp for a saved run; no date crate is needed for a `YYYY-MM-DD HH:MM` label.
@@ -2075,8 +2310,479 @@ fn draw_test_history(
     );
 }
 
+/// F6 org browser: pick an org and a curated type, then check exact components to retrieve.
+fn draw_org_browse(frame: &mut Frame, app: &App) {
+    use crate::app::OrgBrowseFocus;
+
+    let area = centered(frame.area(), 90, frame.area().height.min(28));
+    frame.render_widget(Clear, area);
+    let title = block(
+        "browse org metadata — Tab focus · ↑↓ move · Enter load/confirm · Esc close",
+        app,
+    );
+    frame.render_widget(title.clone(), area);
+    let body =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(title.inner(area));
+    let columns = Layout::horizontal([
+        Constraint::Length(24),
+        Constraint::Length(26),
+        Constraint::Min(20),
+    ])
+    .split(body[0]);
+
+    let org_items: Vec<ListItem> = app
+        .org_state
+        .orgs
+        .iter()
+        .enumerate()
+        .map(|(index, org)| {
+            let marker = if index == app.org_browse.org_selected {
+                "›"
+            } else {
+                " "
+            };
+            ListItem::new(truncated(
+                &format!("{marker} {} · {}", org.label(), org.username),
+                usize::from(columns[0].width).saturating_sub(2),
+            ))
+        })
+        .collect();
+    let org_block = pane_block("ORGS", app, app.org_browse.focus == OrgBrowseFocus::Orgs);
+    frame.render_widget(org_block.clone(), columns[0]);
+    let mut org_state = ListState::default();
+    if !org_items.is_empty() {
+        org_state.select(Some(app.org_browse.org_selected.min(org_items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(org_items),
+        org_block.inner(columns[0]),
+        &mut org_state,
+    );
+
+    let type_items: Vec<ListItem> = crate::sf::metadata::ORG_BROWSE_TYPES
+        .iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let marker = if index == app.org_browse.type_selected {
+                "›"
+            } else {
+                " "
+            };
+            ListItem::new(format!("{marker} {kind}"))
+        })
+        .collect();
+    let type_block = pane_block("TYPE", app, app.org_browse.focus == OrgBrowseFocus::Types);
+    frame.render_widget(type_block.clone(), columns[1]);
+    let mut type_state = ListState::default();
+    if !type_items.is_empty() {
+        type_state.select(Some(app.org_browse.type_selected.min(type_items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(type_items),
+        type_block.inner(columns[1]),
+        &mut type_state,
+    );
+
+    let rows = app.org_browse.visible_rows();
+    let row_items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let identity = row.identity();
+            let checked = app.org_browse.checked.contains(&identity);
+            let local = app.org_browse.local_identities.contains(&identity);
+            let marker = if index == app.org_browse.cursor {
+                "›"
+            } else {
+                " "
+            };
+            ListItem::new(truncated(
+                &format!(
+                    "{marker} [{}] {} ({})",
+                    if checked { "✓" } else { " " },
+                    identity,
+                    if local { "Local" } else { "Org only" }
+                ),
+                usize::from(columns[2].width).saturating_sub(2),
+            ))
+        })
+        .collect();
+    let rows_block = pane_block(
+        "COMPONENTS",
+        app,
+        app.org_browse.focus == OrgBrowseFocus::Components,
+    );
+    frame.render_widget(rows_block.clone(), columns[2]);
+    let mut row_state = ListState::default();
+    if !row_items.is_empty() {
+        row_state.select(Some(app.org_browse.cursor.min(row_items.len() - 1)));
+    }
+    frame.render_stateful_widget(
+        List::new(row_items),
+        rows_block.inner(columns[2]),
+        &mut row_state,
+    );
+
+    let status = if app.org_browse.loading {
+        "Loading from org…".to_owned()
+    } else if let Some(error) = &app.org_browse.error {
+        truncated(error, usize::from(body[1].width).saturating_sub(4))
+    } else if app.org_browse.has_scope() {
+        format!(
+            "{} · {} · {} checked · F5 refresh · F9 exact",
+            app.org_browse.org_label,
+            app.org_browse.metadata_type,
+            app.org_browse.checked.len()
+        )
+    } else {
+        "↑↓ pick an org · Tab to type · Enter loads the listing".to_owned()
+    };
+    frame.render_widget(faint(status), body[1]);
+}
+
+/// Full-screen Create Metadata wizard. Every step fits the frame and uses only state supplied by
+/// the app; no fuzzy ranking or filesystem work happens here.
+fn draw_create_wizard(frame: &mut Frame, state: &CreateWizardState, app: &App) {
+    let area = centered(
+        frame.area(),
+        frame.area().width.min(92),
+        frame.area().height,
+    );
+    frame.render_widget(Clear, area);
+    match state {
+        CreateWizardState::Choose {
+            query,
+            results,
+            selected,
+            searching,
+            ..
+        } => {
+            let outer = block(
+                format!(
+                    "Create Metadata — choose type   search: {query}_   {}",
+                    if *searching { "searching…" } else { "" }
+                ),
+                app,
+            );
+            frame.render_widget(outer.clone(), area);
+            let inner = outer.inner(area);
+            if results.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(Line::from(faint("No matching type — refine the search"))),
+                    inner,
+                );
+                return;
+            }
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            let mut previous_group = None;
+            for (index, kind) in results.iter().enumerate() {
+                if Some(kind.group()) != previous_group {
+                    lines.push(Line::from(Span::styled(
+                        format!("── {} ", kind.group().label()),
+                        Style::default()
+                            .fg(accent(app))
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    previous_group = Some(kind.group());
+                }
+                let active = index == *selected;
+                let marker = if active { "›" } else { " " };
+                let description = if kind.interactive_only() {
+                    "External CLI — command copied, not run"
+                } else {
+                    kind.folder()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!(" {marker} {:<28}", kind.label()),
+                        Style::default()
+                            .fg(if active { accent(app) } else { Color::Reset })
+                            .add_modifier(if active {
+                                Modifier::REVERSED
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(description.to_owned(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            let view = Paragraph::new(lines);
+            frame.render_widget(view, inner);
+            let footer = Line::from(faint(
+                "type to filter · ↑↓ move · Enter select highlighted · Esc cancel",
+            ));
+            let hint = Rect {
+                y: area.y + area.height.saturating_sub(1),
+                height: 1,
+                ..area
+            };
+            frame.render_widget(footer, hint);
+        }
+        CreateWizardState::Configure {
+            kind,
+            values,
+            focus,
+            cursor,
+            destinations,
+            destination_index,
+            custom_path,
+            error,
+            error_field,
+            checking,
+        } => {
+            let title = format!("Create Metadata — configure {}", kind.label());
+            let outer = block(title, app);
+            frame.render_widget(outer.clone(), area);
+            let inner = outer.inner(area);
+            let fields = crate::sf::create::fields_for(*kind);
+            let other_index = destinations.len();
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            for (index, field) in fields.iter().enumerate() {
+                let active = index == *focus;
+                let value = values.get(&field.key).map_or("", String::as_str);
+                let shown = if value.is_empty() && !field.required {
+                    "(optional)".to_owned()
+                } else {
+                    value.to_owned()
+                };
+                let invalid = *error_field == Some(field.key);
+                let label = format!(
+                    " {} {:<16}",
+                    if active { "›" } else { " " },
+                    field.key.label()
+                );
+                let mut spans = vec![Span::styled(
+                    label,
+                    Style::default()
+                        .fg(if invalid {
+                            Color::Red
+                        } else if active {
+                            accent(app)
+                        } else {
+                            Color::DarkGray
+                        })
+                        .add_modifier(if active {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                )];
+                if active {
+                    let (before, after) = value.split_at((*cursor).min(value.len()));
+                    spans.push(Span::styled(before.to_owned(), Style::default()));
+                    spans.push(Span::styled(
+                        after
+                            .chars()
+                            .next()
+                            .map_or(" ".to_owned(), |c| c.to_string()),
+                        Style::default().bg(accent(app)).fg(Color::Black),
+                    ));
+                    spans.push(Span::styled(
+                        after.chars().skip(1).collect::<String>(),
+                        Style::default(),
+                    ));
+                } else {
+                    spans.push(Span::styled(shown, Style::default().fg(Color::Reset)));
+                }
+                lines.push(Line::from(spans));
+            }
+            lines.push(Line::from(" "));
+            let dest_focus = *focus == fields.len();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {} {:<16}",
+                    if dest_focus { "›" } else { " " },
+                    "Destination"
+                ),
+                Style::default()
+                    .fg(if dest_focus {
+                        accent(app)
+                    } else {
+                        Color::DarkGray
+                    })
+                    .add_modifier(if dest_focus {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            )));
+            for (index, destination) in destinations.iter().enumerate() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "    [{}] {}",
+                        if index == *destination_index {
+                            "x"
+                        } else {
+                            " "
+                        },
+                        destination.label
+                    ),
+                    Style::default().fg(if dest_focus {
+                        Color::Reset
+                    } else {
+                        Color::Gray
+                    }),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    [{}] other project-relative path: {custom_path}_",
+                    if *destination_index == other_index {
+                        "x"
+                    } else {
+                        " "
+                    }
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+            lines.push(Line::from(" "));
+            if *checking {
+                lines.push(Line::from(Span::styled(
+                    "Checking destination for collisions…",
+                    Style::default().fg(Color::Yellow),
+                )));
+            } else if let Some(problem) = error {
+                lines.push(Line::from(Span::styled(
+                    problem.clone(),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            let view = Paragraph::new(lines);
+            frame.render_widget(view, inner);
+            let hint = Rect {
+                y: area.y + area.height.saturating_sub(1),
+                height: 1,
+                ..area
+            };
+            frame.render_widget(
+                Line::from(faint(
+                    "Tab/Shift+Tab fields · ↑↓ value/choice · Enter review · Esc back",
+                )),
+                hint,
+            );
+        }
+        CreateWizardState::Review {
+            draft,
+            show_command,
+            paths,
+            ..
+        } => {
+            let outer = block(
+                format!("Create Metadata — review {}", draft.kind.label()),
+                app,
+            );
+            frame.render_widget(outer.clone(), area);
+            let inner = outer.inner(area);
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(vec![
+                Span::styled("Type    ", Style::default().fg(Color::DarkGray)),
+                Span::styled(draft.kind.label().to_owned(), Style::default()),
+            ]));
+            for (key, label) in [
+                (FieldKey::Name, "Name"),
+                (FieldKey::SObject, "SObject"),
+                (FieldKey::Event, "Event"),
+                (FieldKey::FlexiTemplate, "Page type"),
+                (FieldKey::Label, "Label"),
+                (FieldKey::PluralLabel, "Plural label"),
+                (FieldKey::Visibility, "Visibility"),
+                (FieldKey::ContentType, "Content type"),
+                (FieldKey::ApexTemplate, "Class template"),
+            ] {
+                let value = draft.get(key);
+                if !value.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{label:<8}"), Style::default().fg(Color::DarkGray)),
+                        Span::styled(value.to_owned(), Style::default()),
+                    ]));
+                }
+            }
+            lines.push(Line::from(vec![
+                Span::styled("Where   ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    draft.destination.relative.to_string_lossy().into_owned(),
+                    Style::default(),
+                ),
+            ]));
+            lines.push(Line::from(" "));
+            lines.push(Line::from(Span::styled(
+                "Expected paths",
+                Style::default()
+                    .fg(accent(app))
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for path in paths {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", path.to_string_lossy()),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            if draft.kind.interactive_only() {
+                lines.push(Line::from(" "));
+                lines.push(Line::from(Span::styled(
+                    "External CLI — this command is interactive; sftui copies it but never queues it.",
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            if *show_command {
+                let staging = std::path::Path::new(".sftui-create-<job>");
+                let argv = crate::sf::commands::create_metadata_argv(draft, staging);
+                lines.push(Line::from(" "));
+                lines.push(Line::from(Span::styled(
+                    "Structured command (display only — never executed from this text)",
+                    Style::default().fg(accent(app)),
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!("  sf {}", argv.join(" ")),
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+            lines.push(Line::from(" "));
+            lines.push(Line::from(Span::styled(
+                "Creates local files only. Does not deploy.",
+                Style::default().fg(Color::Yellow),
+            )));
+            frame.render_widget(Paragraph::new(lines), inner);
+            let hint = Rect {
+                y: area.y + area.height.saturating_sub(1),
+                height: 1,
+                ..area
+            };
+            frame.render_widget(
+                Line::from(faint(if draft.kind.interactive_only() {
+                    "[Enter] Copy CLI  ·  [c] Command  ·  [Esc] Back"
+                } else {
+                    "[Enter] Create  ·  [c] Command  ·  [Esc] Back"
+                })),
+                hint,
+            );
+        }
+        CreateWizardState::Failed { draft, message, .. } => {
+            let outer = block("Create Metadata — job failed", app);
+            frame.render_widget(outer.clone(), area);
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    message.clone(),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(" "),
+                Line::from(faint(format!(
+                    "Draft: {} — {}",
+                    draft.kind.label(),
+                    draft.display_name()
+                ))),
+            ];
+            lines.push(Line::from(" "));
+            lines.push(Line::from(faint("[e] Edit draft · any other key closes")));
+            frame.render_widget(Paragraph::new(lines), outer.inner(area));
+        }
+    }
+}
+
 fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
     match modal {
+        Modal::CreateWizard { state } => draw_create_wizard(frame, state, app),
+        Modal::OrgBrowse => draw_org_browse(frame, app),
         Modal::Help { scroll } => {
             let area = centered(frame.area(), 86, frame.area().height.min(24));
             frame.render_widget(Clear, area);
@@ -2372,11 +3078,25 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
             );
         }
         Modal::Jobs {
-            selected,
+            selected_id,
             focus,
             scroll,
             follow,
-        } => draw_jobs(frame, app, *selected, *focus, *scroll, *follow),
+            detail_view,
+        } => draw_jobs(
+            frame,
+            app,
+            *selected_id,
+            *focus,
+            *scroll,
+            *follow,
+            *detail_view,
+        ),
+        Modal::RerunReview {
+            job_id,
+            org,
+            org_required,
+        } => draw_rerun_review(frame, app, *job_id, org, *org_required),
         Modal::TestHistory {
             selected,
             list_scroll,
@@ -2716,8 +3436,7 @@ mod tests {
             record_id,
             revision,
             width: 80,
-            show_details: false,
-            show_json: false,
+            detail_view: JobDetailView::Summary,
             queued_position: None,
             accent: Color::Reset,
             elapsed: "0s".to_owned(),

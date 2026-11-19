@@ -39,6 +39,9 @@ pub enum SfEvent {
         job_id: u64,
         outcome: ProcessOutcome,
     },
+    /// The owned child tree could not be fully terminated. Reported so the UI never claims a
+    /// clean stop; a best-effort direct-child kill still happened.
+    CleanupFailed { job_id: u64, error: String },
 }
 
 /// Upper bound for retained stdout/stderr per process. The UI also caps streamed lines.
@@ -81,7 +84,7 @@ pub enum RunnerError {
 /// A tracked background job: dropping the cancel sender does not kill it, using it does.
 pub struct RunningJob {
     pub id: u64,
-    cancel: oneshot::Sender<()>,
+    cancel: Option<oneshot::Sender<()>>,
     task: JoinHandle<ProcessOutcome>,
 }
 
@@ -90,15 +93,23 @@ impl RunningJob {
         self.task.is_finished()
     }
 
+    /// Request termination while keeping ownership of the task, so the caller can wait for the
+    /// child tree to be reaped before it frees the user job slot.
+    pub fn request_cancel(&mut self) -> bool {
+        self.cancel
+            .take()
+            .is_some_and(|cancel| cancel.send(()).is_ok())
+    }
+
     /// Request cooperative termination. Returns false if the job already finished.
-    pub fn cancel(self) -> bool {
-        self.cancel.send(()).is_ok()
+    pub fn cancel(mut self) -> bool {
+        self.request_cancel()
     }
 
     /// Request termination and wait for the capture task to finish.
-    pub async fn cancel_and_join(self) -> ProcessOutcome {
-        let RunningJob { cancel, task, .. } = self;
-        let _ = cancel.send(());
+    pub async fn cancel_and_join(mut self) -> ProcessOutcome {
+        let _ = self.request_cancel();
+        let task = self.task;
         task.await.unwrap_or(ProcessOutcome {
             exit_code: None,
             stdout: String::new(),
@@ -187,13 +198,42 @@ where
     E: Send + 'static,
     F: Fn(SfEvent) -> E + Send + Clone + 'static,
 {
+    spawn_with_env_in(executable, argv, job_id, events, map, env, None)
+}
+
+/// Same as [`spawn_with_env`] with an explicit working directory. Create jobs run inside the
+/// Salesforce project so generators can read `sfdx-project.json` (e.g. `defaultLwcLanguage`).
+pub fn spawn_with_env_in<E, F>(
+    executable: &Path,
+    argv: &[String],
+    job_id: u64,
+    events: Sender<E>,
+    map: F,
+    env: &[(&str, &str)],
+    cwd: Option<&Path>,
+) -> Result<RunningJob, RunnerError>
+where
+    E: Send + 'static,
+    F: Fn(SfEvent) -> E + Send + Clone + 'static,
+{
     let mut command = Command::new(executable);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
     command
         .args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The `sf` launcher is often a shell script that starts Node as a grandchild. On Unix, put the
+    // whole invocation in its own process group so cancellation can reach every descendant.
+    // This is a std-only, safe API; no crate or unsafe block is required.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
     for (key, value) in env {
         command.env(key, value);
     }
@@ -201,6 +241,7 @@ where
         command: format!("{} {}", executable.display(), argv.join(" ")),
         source,
     })?;
+    let child_pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let stdout_task = stdout.map(|pipe| {
@@ -222,10 +263,23 @@ where
         ))
     });
     let (cancel, cancelled) = oneshot::channel::<()>();
+    let cleanup_events = events.clone();
     let task: JoinHandle<ProcessOutcome> = tokio::spawn(async move {
         let status = tokio::select! {
             status = child.wait() => status.ok(),
             _ = cancelled => {
+                // Kill the owned tree first (launcher plus Node descendants), then make sure the
+                // direct child is reaped. A group/tree kill failure is reported, never hidden.
+                if let Some(pid) = child_pid
+                    && let Err(error) = kill_process_tree(pid).await
+                {
+                    let _ = cleanup_events
+                        .send(map(SfEvent::CleanupFailed {
+                            job_id,
+                            error: error.clone(),
+                        }))
+                        .await;
+                }
                 let _ = child.kill().await;
                 child.wait().await.ok()
             }
@@ -246,9 +300,34 @@ where
     });
     Ok(RunningJob {
         id: job_id,
-        cancel,
+        cancel: Some(cancel),
         task,
     })
+}
+
+/// Best-effort termination of the whole process tree using only std and OS utilities (no crate
+/// dependency and no unsafe). On Unix the child was started in its own process group, so a group
+/// signal reaches grandchildren such as the Node process behind an `sf` launcher. On Windows
+/// `taskkill /T` walks the same tree. A failure is returned to the caller and reported in the UI.
+async fn kill_process_tree(pid: u32) -> Result<(), String> {
+    let result = if cfg!(unix) {
+        tokio::process::Command::new("sh")
+            .args(["-c", &format!("kill -KILL -{pid}")])
+            .status()
+            .await
+    } else if cfg!(windows) {
+        tokio::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .status()
+            .await
+    } else {
+        return Err("process-tree cancellation is unsupported on this platform".to_owned());
+    };
+    match result {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!("process-tree kill exited with {status}")),
+        Err(error) => Err(format!("process-tree kill could not start: {error}")),
+    }
 }
 
 async fn join_optional(task: Option<JoinHandle<String>>) -> String {
@@ -343,6 +422,14 @@ pub async fn capture_with_env(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // The `sf` launcher is often a shell script that starts Node as a grandchild. On Unix, put the
+    // whole invocation in its own process group so cancellation can reach every descendant.
+    // This is a std-only, safe API; no crate or unsafe block is required.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.as_std_mut().process_group(0);
+    }
     for (key, value) in env {
         command.env(key, value);
     }
@@ -454,6 +541,52 @@ mod tests {
             }
         }
         assert_eq!(texts, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_job_reaps_its_whole_process_group() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let marker = dir.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > {}; wait", marker.display());
+        let (tx, _rx) = tokio::sync::mpsc::channel::<SfEvent>(16);
+        let job = spawn_with_env(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), script],
+            77,
+            tx,
+            std::convert::identity,
+            &[],
+        )
+        .expect("spawn");
+
+        // Wait until the launcher has spawned its grandchild and written its pid.
+        let mut child_pid = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = text.trim().parse::<u32>()
+            {
+                child_pid = Some(pid);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let child_pid = child_pid.expect("grandchild pid written");
+
+        let _outcome = job.cancel_and_join().await;
+        // The grandchild is in the same process group and must be gone after cancellation.
+        let mut reaped = false;
+        for _ in 0..100 {
+            if !Path::new(&format!("/proc/{child_pid}")).exists() {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            reaped,
+            "grandchild process {child_pid} survived cancellation"
+        );
     }
 
     #[test]

@@ -139,7 +139,10 @@ impl TransferOptions {
         }
         // Both start commands run without --json: retrieve renders its human stdout, and deploy's
         // job id is parsed from that same stdout. Only the follow-up report command uses --json.
-        argv.push("--ignore-conflicts".to_owned());
+        // Retrieves must not silently overwrite local changes, so --ignore-conflicts is deploy-only.
+        if !self.retrieve {
+            argv.push("--ignore-conflicts".to_owned());
+        }
         argv
     }
 
@@ -166,6 +169,26 @@ impl TransferOptions {
         argv.push("--json".to_owned());
         Some(argv)
     }
+}
+
+/// Cancel an async deploy by its exact server job id. The target org is the resolved username
+/// captured when the deploy started; `--use-most-recent` is deliberately never used because it
+/// can cancel an unrelated deploy.
+pub fn deploy_cancel_argv(job_id: &str, target_org: &str) -> Option<Vec<String>> {
+    if job_id.trim().is_empty() || target_org.trim().is_empty() {
+        return None;
+    }
+    Some(vec![
+        "project".to_owned(),
+        "deploy".to_owned(),
+        "cancel".to_owned(),
+        "--job-id".to_owned(),
+        job_id.to_owned(),
+        "--target-org".to_owned(),
+        target_org.to_owned(),
+        "--async".to_owned(),
+        "--json".to_owned(),
+    ])
 }
 
 /// Per-component result from a deploy/retrieve report.
@@ -224,6 +247,26 @@ pub fn parse_started_job_id_from_text(stdout: &str) -> Option<String> {
                 && bytes.iter().all(u8::is_ascii_alphanumeric)
         })
         .map(str::to_owned)
+}
+
+/// Capture a labelled Deploy ID from streamed human output, e.g. `Deploy ID: 0Af...`. Only a
+/// validated 15/18-character `0Af` token after the label is accepted.
+pub fn parse_labelled_deploy_id(line: &str) -> Option<String> {
+    let (_, value) = line.split_once("Deploy ID")?;
+    let value = value.trim_start().trim_start_matches(':').trim();
+    let token = value
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .next()
+        .unwrap_or("");
+    let bytes = token.as_bytes();
+    if (bytes.len() == 15 || bytes.len() == 18)
+        && token.starts_with("0Af")
+        && bytes.iter().all(u8::is_ascii_alphanumeric)
+    {
+        Some(token.to_owned())
+    } else {
+        None
+    }
 }
 
 /// Parse a report from several SF and legacy response shapes.
@@ -337,17 +380,39 @@ mod tests {
         };
         assert_eq!(
             options.argv(),
+            vec!["project", "retrieve", "start", "--metadata", "ApexClass"]
+        );
+        assert!(!options.argv().contains(&"--json".to_owned()));
+        assert!(!options.argv().contains(&"--ignore-conflicts".to_owned()));
+        assert!(options.report_argv("0Af000000000001").is_none());
+    }
+
+    #[test]
+    fn retrieve_keeps_exact_component_names_as_single_arguments() {
+        let options = TransferOptions {
+            retrieve: true,
+            mode: PayloadMode::Metadata,
+            metadata_names: vec![
+                "ApexClass:Org Only Class".to_owned(),
+                "Flow:Demo Flow".to_owned(),
+            ],
+            target_org: Some("dev-user@example.invalid".to_owned()),
+            ..TransferOptions::default()
+        };
+        assert_eq!(
+            options.argv(),
             vec![
                 "project",
                 "retrieve",
                 "start",
                 "--metadata",
-                "ApexClass",
-                "--ignore-conflicts"
+                "ApexClass:Org Only Class",
+                "--metadata",
+                "Flow:Demo Flow",
+                "--target-org",
+                "dev-user@example.invalid",
             ]
         );
-        assert!(!options.argv().contains(&"--json".to_owned()));
-        assert!(options.report_argv("0Af000000000001").is_none());
     }
 
     #[test]
@@ -402,6 +467,45 @@ mod tests {
             parse_started_job_id(&value).as_deref(),
             Some("0Af000000000003")
         );
+    }
+
+    #[test]
+    fn deploy_cancel_uses_exact_id_and_async_json() {
+        let argv = deploy_cancel_argv("0Af000000000001", "dev").expect("argv");
+        assert_eq!(
+            argv,
+            vec![
+                "project",
+                "deploy",
+                "cancel",
+                "--job-id",
+                "0Af000000000001",
+                "--target-org",
+                "dev",
+                "--async",
+                "--json",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+        assert!(!argv.iter().any(|part| part.contains("use-most-recent")));
+        assert!(deploy_cancel_argv("", "dev").is_none());
+        assert!(deploy_cancel_argv("0Af000000000001", "").is_none());
+    }
+
+    #[test]
+    fn labelled_deploy_id_is_captured_from_streamed_output() {
+        assert_eq!(
+            parse_labelled_deploy_id("Deploy ID: 0Af000000000001").as_deref(),
+            Some("0Af000000000001")
+        );
+        assert_eq!(
+            parse_labelled_deploy_id("  Deploy ID: 0AfAAAAAAAAAAAAAAA ").as_deref(),
+            Some("0AfAAAAAAAAAAAAAAA")
+        );
+        assert_eq!(parse_labelled_deploy_id("Deploy ID: nope"), None);
+        assert_eq!(parse_labelled_deploy_id("no label here"), None);
     }
 
     #[test]

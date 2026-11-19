@@ -291,8 +291,13 @@ pub fn apex_result(run: &TestRun) -> ResultView {
         status: run.outcome.clone(),
         ok,
         summary: format!(
-            "{} run · {} passed · {} failed · {} skipped · coverage {}",
-            run.tests_run, run.passing, run.failing, run.skipped, run.coverage
+            "{} · {} run · {} passed · {} failed · {} skipped · coverage {}",
+            if ok { "Tests passed" } else { "Tests failed" },
+            run.tests_run,
+            run.passing,
+            run.failing,
+            run.skipped,
+            run.coverage
         ),
         items: class_rows,
         coverage,
@@ -310,6 +315,45 @@ mod tests {
             stdout: stdout.to_owned(),
             stderr: String::new(),
         }
+    }
+
+    #[test]
+    fn apex_result_shows_every_class_method_and_failure_message() {
+        let run = crate::sf::test_results::TestRun {
+            outcome: "Failed".to_owned(),
+            tests_run: 3,
+            passing: 2,
+            failing: 1,
+            tests: vec![
+                crate::sf::test_results::TestResultRow {
+                    name: "AlphaTest.ok".to_owned(),
+                    outcome: "Pass".to_owned(),
+                    message: String::new(),
+                },
+                crate::sf::test_results::TestResultRow {
+                    name: "BetaTest.bad".to_owned(),
+                    outcome: "Fail".to_owned(),
+                    message: "synthetic assertion failed".to_owned(),
+                },
+            ],
+            ..crate::sf::test_results::TestRun::default()
+        };
+        let view = apex_result(&run);
+        assert!(!view.ok);
+        assert!(view.summary.starts_with("Tests failed · "));
+        assert_eq!(view.status, "Failed");
+        assert!(view.items.iter().any(|item| item.label == "AlphaTest"));
+        assert!(view.items.iter().any(|item| item.label == "BetaTest"));
+        let methods = view
+            .sections
+            .iter()
+            .find(|section| section.title == "TEST METHODS")
+            .expect("method section");
+        assert_eq!(methods.rows.len(), 2);
+        assert!(
+            methods.rows.iter().any(|row| row.label == "BetaTest.bad"
+                && row.detail.contains("synthetic assertion failed"))
+        );
     }
 
     #[test]

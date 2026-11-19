@@ -2,10 +2,12 @@
 
 pub mod catalog;
 pub mod commands;
+pub mod create;
 pub mod deploy;
 pub mod detect;
 pub mod metadata;
 pub mod org;
+pub mod picker_search;
 pub mod project;
 pub mod runner;
 pub mod test_results;

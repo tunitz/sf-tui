@@ -6,12 +6,14 @@ A single-binary terminal UI for the Salesforce CLI. `sftui` wraps the `sf` execu
 installed on your machine: it does not store credentials, and all authentication stays with `sf`
 in its own home directory.
 
-The interface opens on a **Menu**: Retrieve Metadata, Deploy Metadata, Create Metadata, Apex
-Tests, Organization and Run command. Each entry opens a focused screen, with project paths and the
+The interface opens on a **Menu**: Retrieve/Deploy Metadata, Create Metadata and Apex Tests.
+Retrieve and Deploy share one Metadata screen — `F3` switches its mode — with project paths and the
 default org pre-filled so you do not retype them. `Esc` returns to the previous screen and `h`
 returns to the Menu; there is no tab bar.
 
-- **focused screens** for retrieve, deploy, Apex tests and org operations;
+- a **unified Metadata screen** for retrieve and deploy, with org browsing for components that are
+  not local yet;
+- **focused screens** for Apex tests and org operations;
 - one **Jobs window** (`F2`) for every running, queued and finished command, available from any
   screen;
 - **Run command** for the occasional `sf` invocation that has no dedicated screen.
@@ -72,14 +74,21 @@ All key hints live on the footer line; screens and the header carry context only
 The menu is the whole navigation:
 
 ```text
-[r] Retrieve Metadata   [d] Deploy Metadata   [c] Create Metadata
-[t] Apex Tests          [o] Organization      [e] Run command
+[1] Retrieve/Deploy Metadata   [2] Create Metadata   [3] Apex Tests
 ```
 
 Global: `h` Menu · `Esc` previous screen · `?` help · `y` copy · `F5` refresh ·
 `F2` Jobs · `F4` switch the default org · `q` quit (asks while a job runs).
 `Ctrl+X` cancels the newest job; `Ctrl+C` cancels it or quits when idle.
 `Ctrl+Y` copies the current selection while a search field has focus.
+
+Create Metadata opens a three-step wizard: choose a grouped metadata type (type to filter,
+`↑↓` move, `Enter` selects the highlighted row), configure the per-type fields and pick a package
+source root from `sfdx-project.json` (or an explicit project-relative path), then review the exact
+argv, destination and expected paths. It only creates local files; it never deploys. Generators run
+into a private staging directory and are published with exclusive creation, so an existing file is
+never overwritten. Custom Object is interactive in the Salesforce CLI, so sftui offers a Copy CLI
+command instead of running it. A failed job keeps its draft: press `e` in `F2` Jobs to edit it.
 
 Retrieve, deploy and test runs execute in the background. Up to four commands run in parallel and
 anything beyond that waits in a queue, starting automatically as slots free up. Leaving a screen
@@ -104,9 +113,20 @@ Setup › Apex Test Execution. The Organization screen lists orgs and their deta
 org. `F4` opens the same choice from any screen: pick an org, Enter sets it as `target-org` for
 the project and the header updates immediately.
 
-On the Retrieve/Deploy/Test screens, type the query, press `Enter` to search, `↑↓` move,
+On the Metadata/Test screens, type the query, press `Enter` to search, `↑↓` move,
 `Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`; typing keeps
 your existing selection, and returning to the screen keeps it too. `Esc` goes back.
+
+On the Metadata screen, `F3` switches between Retrieve and Deploy; checked items never carry over.
+Components that exist only in an org can be pulled in first: press `F6` (Retrieve mode), pick an
+org and one of ApexClass, ApexTrigger, Flow, PermissionSet, CustomObject or
+LightningComponentBundle, then `Enter` to list it. `sftui` runs `sf org list metadata` in the
+background and marks each row **Local** or **Org only**; `Space` checks exact components and
+`F9` adds an exact `Type:FullName` when the name is not listed. Bare types, wildcards and blanks
+are rejected. The retrieve uses the org's username and exact `--metadata Type:FullName` arguments,
+and a successful retrieve rescans the project so new files appear in Deploy and Apex tests.
+Listings are cached per org and type for the session; `F5` refreshes them, and a failed refresh
+never replaces a good listing with an empty one.
 
 The confirmation dialog shows every selected component as a checkbox: `Space` toggles, `↑↓` moves,
 `c` shows the exact command, `v/t/w` toggle deploy options, `g` cycles orgs, `Enter` runs and `Esc`
