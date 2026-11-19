@@ -212,34 +212,6 @@ pub enum AppEvent {
     },
 }
 
-/// Which half of the unified Metadata screen is active. Retrieve is the default; F3 switches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MetadataMode {
-    Retrieve,
-    Deploy,
-}
-
-impl MetadataMode {
-    pub fn retrieve(self) -> bool {
-        self == Self::Retrieve
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Retrieve => "Retrieve",
-            Self::Deploy => "Deploy",
-        }
-    }
-
-    pub fn tab(self) -> Tab {
-        if self.retrieve() {
-            Tab::Retrieve
-        } else {
-            Tab::Deploy
-        }
-    }
-}
-
 /// A destination or action on the main menu. Retrieve and Deploy share one Metadata screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
@@ -1258,6 +1230,8 @@ pub struct App {
     pub deploy_state: DeployState,
     pub org_browse: OrgBrowseState,
     pub transfer_search: TransferSearchState,
+    /// Action chosen in the confirmation dialog, remembered when it is reopened.
+    pub transfer_action: bool,
     pub test_search: TransferSearchState,
     pub output_state: OutputState,
     pub modal: Option<Modal>,
@@ -1375,7 +1349,8 @@ impl App {
             },
             deploy_state: DeployState::default(),
             org_browse: OrgBrowseState::default(),
-            transfer_search: TransferSearchState::new(false),
+            transfer_search: TransferSearchState::new(true),
+            transfer_action: true,
             test_search: TransferSearchState::new(false),
             output_state: OutputState::default(),
             modal: None,
@@ -3324,17 +3299,6 @@ impl App {
         {
             self.refresh_orgs();
         }
-        if matches!(tab, Tab::Retrieve | Tab::Deploy) {
-            let retrieve = tab == Tab::Retrieve;
-            if self.transfer_search.retrieve != retrieve {
-                self.transfer_search = TransferSearchState::new(retrieve);
-            }
-            if !retrieve {
-                // Browsed org components only ever feed a retrieve; never let them follow a
-                // check into Deploy mode.
-                self.org_browse.checked.clear();
-            }
-        }
         if tab != self.tab {
             self.tab_history.push(self.tab);
             if self.tab_history.len() > 16 {
@@ -3477,10 +3441,9 @@ impl App {
         match item.action {
             MenuAction::Metadata => {
                 self.ensure_suggestion_sets(false);
-                // One Home entry opens the unified screen in Retrieve mode. Any selection from a
-                // previous Deploy visit is dropped by set_tab before the screen is shown.
+                // One mode-neutral screen. The action is chosen in the confirmation dialog.
                 self.set_tab(Tab::Retrieve);
-                self.notice("Type a component name · F3 switches Retrieve/Deploy");
+                self.notice("Type a component name · Enter chooses Retrieve or Deploy");
             }
             MenuAction::Create => self.open_create_wizard(),
             MenuAction::Tests => {
@@ -3706,17 +3669,10 @@ impl App {
             KeyCode::Char(' ') if self.transfer_search.focus == SearchFocus::List => {
                 self.transfer_search.toggle_result();
             }
-            KeyCode::Enter => {
-                if self.transfer_search.retrieve && !self.org_browse.checked.is_empty() {
-                    self.open_org_confirm();
-                } else {
-                    self.open_transfer_confirm();
-                }
-            }
+            KeyCode::Enter => self.open_transfer_confirm(),
             KeyCode::Backspace => self.edit_search(SearchKind::Transfer, |query| {
                 query.pop();
             }),
-            KeyCode::F(3) => self.switch_metadata_mode(),
             KeyCode::F(5) => self.refresh_current_tab(),
             KeyCode::F(6) => self.open_org_browse(),
             KeyCode::F(9) => self.open_org_exact_prompt(),
@@ -3734,19 +3690,7 @@ impl App {
             self.error("Select at least one component with Space");
             return;
         }
-        let retrieve = self.transfer_search.retrieve;
-        if !retrieve
-            && let Some(bare) = checked
-                .iter()
-                .find(|item| !is_explicit_component(&item.value))
-        {
-            // A bare type or a manifest-only row would deploy far more than the user expects.
-            self.error(format!(
-                "Deploy needs an exact Type:Name, not '{}'",
-                bare.value
-            ));
-            return;
-        }
+        let retrieve = self.transfer_action;
         let mut options = TransferOptions {
             retrieve,
             mode: PayloadMode::Metadata,
@@ -4175,33 +4119,14 @@ impl App {
         self.spawn(argv, JobPurpose::Transfer { options });
     }
 
-    /// F3 switches the unified screen between Retrieve and Deploy. A mode switch always drops the
-    /// checked items: a component picked for one operation must never leak into the other.
-    fn switch_metadata_mode(&mut self) {
-        let mode = if self.transfer_search.retrieve {
-            MetadataMode::Deploy
-        } else {
-            MetadataMode::Retrieve
-        };
-        self.transfer_search = TransferSearchState::new(mode.retrieve());
-        self.org_browse.checked.clear();
-        self.search.cancel_pending(SearchKind::Transfer);
-        self.tab = mode.tab();
-        self.notice(format!("{} mode — selection cleared", mode.label()));
-    }
-
     /// Refresh the set of local `Type:fullName` identities used to label org rows.
     fn refresh_local_identities(&mut self) {
         self.org_browse.local_identities =
             crate::sf::metadata::local_identities(self.deploy_state.project.as_ref());
     }
 
-    /// F6 opens the org browser. Only Retrieve can pull components from an org.
+    /// F6 opens the org browser to find components that exist only in the org.
     fn open_org_browse(&mut self) {
-        if !self.transfer_search.retrieve {
-            self.notice("Org browsing is for Retrieve — press F3 to switch");
-            return;
-        }
         if self.org_state.orgs.is_empty() && !self.org_state.loading {
             self.refresh_orgs();
         }
@@ -4432,10 +4357,6 @@ impl App {
         let mut close = false;
         match key.code {
             KeyCode::Esc | KeyCode::F(6) => close = true,
-            KeyCode::F(3) => {
-                close = true;
-                self.switch_metadata_mode();
-            }
             KeyCode::F(5) => self.fetch_org_listing(true),
             KeyCode::F(9) => self.open_org_exact_prompt(),
             KeyCode::Tab => {
@@ -5021,6 +4942,36 @@ impl App {
                         options,
                     });
                 }
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    self.transfer_action = true;
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve: true,
+                        entries,
+                        focus,
+                        show_command,
+                        options: TransferOptions {
+                            retrieve: true,
+                            ..options
+                        },
+                    });
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    let mut next = retrieve;
+                    if let Some(problem) = deploy_problem(&entries) {
+                        self.error(problem);
+                    } else {
+                        self.transfer_action = false;
+                        next = false;
+                        options.retrieve = false;
+                    }
+                    self.modal = Some(Modal::TransferConfirm {
+                        retrieve: next,
+                        entries,
+                        focus,
+                        show_command,
+                        options,
+                    });
+                }
                 KeyCode::Enter => {
                     let names: Vec<String> = entries
                         .iter()
@@ -5029,6 +4980,17 @@ impl App {
                         .collect();
                     if names.is_empty() {
                         self.error("Select at least one component");
+                        self.modal = Some(Modal::TransferConfirm {
+                            retrieve,
+                            entries,
+                            focus,
+                            show_command,
+                            options,
+                        });
+                        return;
+                    }
+                    if !retrieve && let Some(problem) = deploy_problem(&entries) {
+                        self.error(problem);
                         self.modal = Some(Modal::TransferConfirm {
                             retrieve,
                             entries,
@@ -7000,6 +6962,26 @@ fn is_explicit_component(value: &str) -> bool {
     !kind.trim().is_empty() && !name.trim().is_empty() && !name.contains(['*', '%', '?'])
 }
 
+/// Why the checked entries cannot be deployed. Org-only components have no local source, and a
+/// bare type or wildcard would deploy far more than the user expects.
+fn deploy_problem(entries: &[TransferSelection]) -> Option<String> {
+    for entry in entries.iter().filter(|entry| entry.checked) {
+        if entry.item.path.starts_with("org:") {
+            return Some(format!(
+                "{} exists only in the org — it can be retrieved, not deployed",
+                entry.item.value
+            ));
+        }
+        if !is_explicit_component(&entry.item.value) {
+            return Some(format!(
+                "Deploy needs an exact Type:Name, not '{}'",
+                entry.item.value
+            ));
+        }
+    }
+    None
+}
+
 /// Commands whose output or arguments must not be retained or shown verbatim.
 fn is_secret_command(command: &str) -> bool {
     let lower = command.to_ascii_lowercase();
@@ -8680,10 +8662,7 @@ mod tests {
         let mut app = test_app();
         app.handle_key(key(KeyCode::Char('1')));
         assert_eq!(app.tab, Tab::Retrieve);
-        assert!(app.transfer_search.retrieve);
-        // Deploy has no Home entry; F3 is the only way to reach it.
-        app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.tab, Tab::Deploy);
+        assert!(app.transfer_action, "the dialog defaults to Retrieve");
         app.go_home();
         app.handle_key(key(KeyCode::Char('3')));
         assert_eq!(app.tab, Tab::Tests);
@@ -8694,8 +8673,6 @@ mod tests {
         let mut app = test_app();
         app.tab = Tab::Home;
         app.handle_key(key(KeyCode::Char('1')));
-        app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.tab, Tab::Deploy);
         app.transfer_search.results = vec![
             SuggestionItem::new("ApexClass:Demo", "force-app/classes/Demo.cls"),
             SuggestionItem::new("Flow:Other", "force-app/flows/Other.flow-meta.xml"),
@@ -8715,7 +8692,7 @@ mod tests {
         }
         app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.tab, Tab::Deploy);
+        assert_eq!(app.tab, Tab::Retrieve);
     }
 
     #[test]
@@ -9665,25 +9642,69 @@ mod tests {
     }
 
     #[test]
-    fn f3_switches_metadata_mode_and_drops_all_checked_items() {
+    fn dialog_chooses_the_action_without_clearing_the_selection() {
         let mut app = test_app();
         app.set_tab(Tab::Retrieve);
-        app.transfer_search.results = vec![SuggestionItem::new("ApexClass:Demo", "Demo.cls")];
+        app.transfer_search.results = vec![SuggestionItem::new(
+            "ApexClass:Demo",
+            "force-app/classes/Demo.cls",
+        )];
         app.transfer_search.searched_query = Some(String::new());
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char(' ')));
         assert_eq!(app.transfer_search.checked().len(), 1);
-        app.org_browse.checked.push("ApexClass:OrgOnly".to_owned());
+        app.handle_key(key(KeyCode::Enter));
+        match app.modal.as_ref() {
+            Some(Modal::TransferConfirm { retrieve, .. }) => assert!(*retrieve),
+            other => panic!("expected transfer confirmation, got {other:?}"),
+        }
 
-        app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.tab, Tab::Deploy);
-        assert!(!app.transfer_search.retrieve);
-        assert!(app.transfer_search.checked().is_empty());
-        assert!(app.org_browse.checked.is_empty());
+        app.handle_key(key(KeyCode::Char('d')));
+        match app.modal.as_ref() {
+            Some(Modal::TransferConfirm {
+                retrieve, options, ..
+            }) => {
+                assert!(!retrieve, "d selects Deploy in the dialog");
+                assert!(!options.retrieve);
+            }
+            other => panic!("expected transfer confirmation, got {other:?}"),
+        }
+        assert_eq!(app.transfer_search.checked().len(), 1, "selection survives");
 
-        app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.tab, Tab::Retrieve);
-        assert!(app.transfer_search.checked().is_empty());
+        // Unchecking still works in the dialog.
+        app.handle_key(key(KeyCode::Char(' ')));
+        match app.modal.as_ref() {
+            Some(Modal::TransferConfirm { entries, .. }) => {
+                assert!(entries.iter().all(|entry| !entry.checked));
+            }
+            other => panic!("expected transfer confirmation, got {other:?}"),
+        }
+
+        app.handle_key(key(KeyCode::Char('r')));
+        match app.modal.as_ref() {
+            Some(Modal::TransferConfirm { retrieve, .. }) => assert!(*retrieve),
+            other => panic!("expected transfer confirmation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn org_only_components_cannot_be_deployed_from_the_dialog() {
+        let mut app = test_app();
+        app.set_tab(Tab::Retrieve);
+        app.transfer_search.results =
+            vec![SuggestionItem::new("ApexClass:OrgOnly", "org:dev-alias")];
+        app.transfer_search.searched_query = Some(String::new());
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('d')));
+        match app.modal.as_ref() {
+            Some(Modal::TransferConfirm { retrieve, .. }) => {
+                assert!(*retrieve, "Deploy must be refused for org-only components");
+            }
+            other => panic!("expected transfer confirmation, got {other:?}"),
+        }
+        assert!(app.status.contains("only in the org"));
     }
 
     #[test]
@@ -9798,26 +9819,37 @@ mod tests {
     fn local_deploy_picker_rejects_bare_and_wildcard_items() {
         let mut app = test_app();
         app.set_tab(Tab::Retrieve);
-        app.handle_key(key(KeyCode::F(3)));
-        assert_eq!(app.tab, Tab::Deploy);
         app.transfer_search.results = vec![SuggestionItem::new("ApexClass", "type")];
         app.transfer_search.searched_query = Some(String::new());
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Enter));
-        assert!(
-            app.modal.is_none(),
-            "a bare type must not open a deploy review"
-        );
+        app.handle_key(key(KeyCode::Char('d')));
+        match app.modal.as_ref() {
+            Some(Modal::TransferConfirm { retrieve, .. }) => {
+                assert!(
+                    *retrieve,
+                    "a bare type must not switch the dialog to Deploy"
+                );
+            }
+            other => panic!("expected transfer confirmation, got {other:?}"),
+        }
         assert!(app.status.contains("exact Type:Name"));
 
+        app.handle_key(key(KeyCode::Esc));
+        app.transfer_search = TransferSearchState::new(true);
         app.transfer_search.results = vec![SuggestionItem::new("ApexClass:%.cls", "types")];
+        app.transfer_search.searched_query = Some(String::new());
+        app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Char(' ')));
         app.handle_key(key(KeyCode::Enter));
-        assert!(
-            app.modal.is_none(),
-            "wildcards must not open a deploy review"
-        );
+        app.handle_key(key(KeyCode::Char('d')));
+        match app.modal.as_ref() {
+            Some(Modal::TransferConfirm { retrieve, .. }) => {
+                assert!(*retrieve, "wildcards must not switch the dialog to Deploy");
+            }
+            other => panic!("expected transfer confirmation, got {other:?}"),
+        }
         assert!(!is_explicit_component("ApexClass:*"));
         assert!(is_explicit_component("ApexClass:Demo"));
     }

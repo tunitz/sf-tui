@@ -7,9 +7,9 @@ installed on your machine: it does not store credentials, and all authentication
 in its own home directory.
 
 The interface opens on a **Menu**: Retrieve/Deploy Metadata, Create Metadata and Apex Tests.
-Retrieve and Deploy share one Metadata screen — `F3` switches its mode — with project paths and the
-default org pre-filled so you do not retype them. `Esc` returns to the previous screen and `h`
-returns to the Menu; there is no tab bar.
+Retrieve and Deploy share one Metadata screen; you choose the action in the confirmation dialog
+after selecting components. The default org is pre-filled so you do not retype it. `Esc` returns to
+the previous screen and `h` returns to the Menu; there is no tab bar.
 
 - a **unified Metadata screen** for retrieve and deploy, with org browsing for components that are
   not local yet;
@@ -113,24 +113,26 @@ Setup › Apex Test Execution. The Organization screen lists orgs and their deta
 org. `F4` opens the same choice from any screen: pick an org, Enter sets it as `target-org` for
 the project and the header updates immediately.
 
-On the Metadata/Test screens, type the query, press `Enter` to search, `↑↓` move,
-`Space` check/uncheck, then `Enter` again to confirm. Search runs only on `Enter`; typing keeps
-your existing selection, and returning to the screen keeps it too. `Esc` goes back.
+On the Metadata/Test screens, type to search — results update automatically as you type, off the
+UI thread. `↑↓` moves the highlight, `Tab` switches between the search box and the results, and
+`Space` checks a component when the results list is focused. Your checks survive further typing.
 
-On the Metadata screen, `F3` switches between Retrieve and Deploy; checked items never carry over.
-Components that exist only in an org can be pulled in first: press `F6` (Retrieve mode), pick an
-org and one of ApexClass, ApexTrigger, Flow, PermissionSet, CustomObject or
-LightningComponentBundle, then `Enter` to list it. `sftui` runs `sf org list metadata` in the
-background and marks each row **Local** or **Org only**; `Space` checks exact components and
-`F9` adds an exact `Type:FullName` when the name is not listed. Bare types, wildcards and blanks
-are rejected. The retrieve uses the org's username and exact `--metadata Type:FullName` arguments,
-and a successful retrieve rescans the project so new files appear in Deploy and Apex tests.
-Listings are cached per org and type for the session; `F5` refreshes them, and a failed refresh
-never replaces a good listing with an empty one.
+On the Metadata screen, press `Enter` after selecting components to open the confirmation dialog.
+That dialog is where you choose the action: `[r]` **Retrieve** (the default) or `[d]` **Deploy**.
+The same selection can be retrieved or deployed without searching again. Components that exist
+only in an org can be pulled in first: press `F6`, pick an org and one of ApexClass, ApexTrigger,
+Flow, PermissionSet, CustomObject or LightningComponentBundle, then `Enter` to list it. `sftui`
+runs `sf org list metadata` in the background and marks each row **Local** or **Org only**; `Space`
+checks exact components and `F9` adds an exact `Type:FullName` when the name is not listed. Bare
+types, wildcards and blanks are rejected. Org-only components can only be retrieved — trying to
+deploy them is refused with a clear message. The retrieve uses the org's username and exact
+`--metadata Type:FullName` arguments, and a successful retrieve rescans the project so new files
+appear in Deploy and Apex tests. Listings are cached per org and type for the session; `F5`
+refreshes them, and a failed refresh never replaces a good listing with an empty one.
 
-The confirmation dialog shows every selected component as a checkbox: `Space` toggles, `↑↓` moves,
-`c` shows the exact command, `v/t/w` toggle deploy options, `g` cycles orgs, `Enter` runs and `Esc`
-goes back.
+The confirmation dialog shows every selected component as a checkbox: `Space` unchecks/rechecks,
+`↑↓` moves, `[r]`/`[d]` choose Retrieve or Deploy, `c` shows the exact command, `v/t/w` toggle
+deploy options (Deploy only), `g` cycles orgs, `Enter` runs and `Esc` goes back.
 
 Every command result is rendered human-readable immediately: status, counts, one `[✓]`/`[✗]` row
 per requested metadata item, color-coded metric chips, progress bars and section headers. The

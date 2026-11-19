@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.25] - 2026-11-20
+
+### Changed
+
+- The Metadata screen is now mode-neutral: search and select components first, then choose Retrieve or Deploy in the confirmation dialog with `[r]`/`[d]`. The same selection can be used for either action without re-searching, and components can still be unchecked in the dialog.
+- Org-only components discovered with `F6` are Retrieve-only; selecting Deploy for them is refused with a clear message.
+
 ## [0.1.24] - 2026-11-20
 
 ### Added

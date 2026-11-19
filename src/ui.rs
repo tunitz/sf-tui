@@ -444,18 +444,18 @@ const KEYMAP: &[KeyBinding] = &[
         help: "refresh component search and the active org listing",
     },
     KeyBinding {
-        cap: "F3",
-        hints: &[(HintContext::Transfer, "mode")],
-        order: 4,
-        help_key: "F3",
-        help: "switch Retrieve/Deploy on the Metadata screen; clears selection",
-    },
-    KeyBinding {
         cap: "F6",
         hints: &[(HintContext::Transfer, "browse")],
         order: 5,
         help_key: "F6",
-        help: "browse an org for components missing locally (Retrieve mode)",
+        help: "browse an org for components that exist only in the org",
+    },
+    KeyBinding {
+        cap: "",
+        hints: &[],
+        order: 0,
+        help_key: "r / d (transfer confirm)",
+        help: "choose Retrieve or Deploy in the confirmation dialog",
     },
     KeyBinding {
         cap: "F9",
@@ -1103,17 +1103,8 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(1),
     ])
     .split(area);
-    let title = if state.retrieve {
-        "Retrieve Metadata"
-    } else {
-        "Deploy Metadata"
-    };
-    let mut heading = vec![strong(title, accent(app))];
-    let mode_hint = if state.retrieve {
-        "F3 Deploy · F6 Browse Org · F9 exact name"
-    } else {
-        "F3 Retrieve"
-    };
+    let mut heading = vec![strong("Metadata", accent(app))];
+    let mode_hint = "Enter choose action · F6 Browse Org · F9 exact name";
     heading.push(faint(format!(
         "   {} · org: {}",
         mode_hint,
@@ -3196,12 +3187,23 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
         } => {
             let modal_width = 90u16.min(frame.area().width);
             let path_width = usize::from(modal_width).saturating_sub(6).max(1);
+            let action = if *retrieve {
+                strong("[r] Retrieve", accent(app))
+            } else {
+                faint("[r] Retrieve")
+            };
+            let deploy_action = if *retrieve {
+                faint("[d] Deploy")
+            } else {
+                strong("[d] Deploy", accent(app))
+            };
             let mut lines = vec![
                 Line::from(strong(
                     format!(
-                        "{} {} components to {}",
+                        "{} {} components {} {}",
                         if *retrieve { "Retrieve" } else { "Deploy" },
                         entries.iter().filter(|entry| entry.checked).count(),
+                        if *retrieve { "from" } else { "to" },
                         options
                             .target_org
                             .as_deref()
@@ -3210,9 +3212,10 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                     ),
                     accent(app),
                 )),
+                Line::from(vec![action, Span::raw("   "), deploy_action]),
                 Line::from(" "),
                 Line::from(faint(
-                    "[Enter] run   [Esc] back   [Space] toggle   [c] command   [g] org",
+                    "[Enter] run   [Esc] back   [Space] uncheck   [c] command   [g] org",
                 )),
                 Line::from(" "),
             ];
@@ -3255,7 +3258,6 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, app: &App) {
                     "[v] validate   [t] test level   [w] warnings",
                 )));
             }
-            lines.push(Line::from(faint("[g] org")));
             let height = (lines.len() as u16 + 2).min(frame.area().height.saturating_sub(2));
             let area = centered(frame.area(), modal_width, height);
             frame.render_widget(Clear, area);
