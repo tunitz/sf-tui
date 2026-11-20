@@ -4,6 +4,13 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.27] - 2026-11-20
+
+### Fixed
+
+- Space and arrow keys in the Metadata and Apex Tests pickers no longer change the selection while the query input has focus. Enter searches a pending query and moves focus to the results, so the next Space selects a component or test class.
+- The Windows CI test for Create jobs now uses the synthetic CLI stub instead of a Unix-only executable, so the Windows test job passes.
+
 ## [0.1.25] - 2026-11-20
 
 ### Changed

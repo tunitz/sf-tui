@@ -9478,8 +9478,15 @@ mod tests {
             PathBuf::from("/tmp/sftui-create-success"),
         );
         app.state_root = Some(dir.path().to_path_buf());
+        // `/bin/true` cannot be spawned on Windows, which left the Create job untracked and made
+        // this test fail only in the Windows CI job. Use a harmless CLI stand-in on both platforms.
+        let executable = if cfg!(windows) {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/stub_sf.bat")
+        } else {
+            PathBuf::from("/bin/true")
+        };
         app.startup.installation = Some(crate::sf::detect::SfInstallation {
-            executable: PathBuf::from("/bin/true"),
+            executable,
             source: "test".to_owned(),
         });
         let interactive = CreateDraft::new(
