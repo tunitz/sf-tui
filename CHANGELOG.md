@@ -4,6 +4,12 @@ All notable changes to this project are documented here. Versions stay in `0.1.x
 initial development, from `0.1.0` through `0.1.99`. The `v0.2.x` releases were published in error
 and are superseded by `v0.1.10`.
 
+## [0.1.29] - 2026-11-20
+
+### Fixed
+
+- The Windows synthetic CLI stub now handles quoted arguments and literal percent signs, so all Windows CI tests pass.
+
 ## [0.1.28] - 2026-11-20
 
 ### Changed
