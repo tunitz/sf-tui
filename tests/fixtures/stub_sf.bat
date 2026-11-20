@@ -2,6 +2,8 @@
 REM Synthetic SF CLI stub used by integration tests on Windows.
 REM Contains no real credentials or org data.
 
+set "ARGS=%*"
+
 if "%*"=="version --json" (
   echo {"status":0,"result":{"version":"99.0.0"}}
   exit /b 0
@@ -102,15 +104,15 @@ if "%*"=="project deploy cancel --job-id 0Af000000000002 --target-org test-scrat
   echo {"status":0,"result":{"id":"0Af000000000002","status":"CancelRequested"}}
   exit /b 0
 )
-if "%template generate "*=="%template generate "* (
+if "%ARGS:~0,18%"=="template generate " (
   echo {"status":0,"result":{"generated":true}}
   exit /b 0
 )
-if "%cmdt generate object --type-name%"=="%cmdt generate object --type-name%" (
+if "%ARGS:~0,32%"=="cmdt generate object --type-name" (
   echo {"status":0,"result":{"generated":true}}
   exit /b 0
 )
-if "%schema generate sobject --label%"=="%schema generate sobject --label%" (
+if "%ARGS:~0,31%"=="schema generate sobject --label" (
   echo {"status":0,"result":{"generated":true}}
   exit /b 0
 )
