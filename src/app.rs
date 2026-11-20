@@ -3644,7 +3644,9 @@ impl App {
                     self.notice("No matches — refine the query");
                 } else {
                     state.set_phase(SearchPhase::Idle);
-                    self.notice(format!("{count} matches — Space select · Enter confirm"));
+                    self.notice(format!(
+                        "{count} matches — Tab results · Space select · Enter confirm"
+                    ));
                 }
             }
             Err(SearchError::Indexing) => state.set_phase(SearchPhase::Indexing),
@@ -3656,6 +3658,23 @@ impl App {
         }
     }
 
+    /// Enter in a results picker. An edited query is searched now and focus moves to the results
+    /// so Space selects immediately; an up-to-date query opens the normal confirm dialog. Focus is
+    /// moved only here, never in the debounced reply path, so a pause mid-query cannot turn the
+    /// next Space into a selection.
+    fn enter_in_picker(&mut self, kind: SearchKind) {
+        if self.search_state(kind).needs_search() {
+            self.queue_search(kind);
+            self.search_state_mut(kind).focus = SearchFocus::List;
+            return;
+        }
+        match kind {
+            SearchKind::Transfer => self.open_transfer_confirm(),
+            SearchKind::Tests => self.open_test_confirm(),
+            SearchKind::Create => {}
+        }
+    }
+
     fn transfer_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Tab => {
@@ -3664,12 +3683,18 @@ impl App {
                     SearchFocus::List => SearchFocus::Input,
                 };
             }
-            KeyCode::Up => self.transfer_search.move_cursor(-1),
-            KeyCode::Down => self.transfer_search.move_cursor(1),
+            KeyCode::Up => {
+                self.transfer_search.focus = SearchFocus::List;
+                self.transfer_search.move_cursor(-1);
+            }
+            KeyCode::Down => {
+                self.transfer_search.focus = SearchFocus::List;
+                self.transfer_search.move_cursor(1);
+            }
             KeyCode::Char(' ') if self.transfer_search.focus == SearchFocus::List => {
                 self.transfer_search.toggle_result();
             }
-            KeyCode::Enter => self.open_transfer_confirm(),
+            KeyCode::Enter => self.enter_in_picker(SearchKind::Transfer),
             KeyCode::Backspace => self.edit_search(SearchKind::Transfer, |query| {
                 query.pop();
             }),
@@ -3687,7 +3712,7 @@ impl App {
     fn open_transfer_confirm(&mut self) {
         let checked = self.transfer_search.checked();
         if checked.is_empty() {
-            self.error("Select at least one component with Space");
+            self.error("Select at least one component — focus results with Tab, then Space");
             return;
         }
         let retrieve = self.transfer_action;
@@ -3789,12 +3814,18 @@ impl App {
                     SearchFocus::List => SearchFocus::Input,
                 };
             }
-            KeyCode::Up => self.test_search.move_cursor(-1),
-            KeyCode::Down => self.test_search.move_cursor(1),
+            KeyCode::Up => {
+                self.test_search.focus = SearchFocus::List;
+                self.test_search.move_cursor(-1);
+            }
+            KeyCode::Down => {
+                self.test_search.focus = SearchFocus::List;
+                self.test_search.move_cursor(1);
+            }
             KeyCode::Char(' ') if self.test_search.focus == SearchFocus::List => {
                 self.test_search.toggle_result();
             }
-            KeyCode::Enter => self.open_test_confirm(),
+            KeyCode::Enter => self.enter_in_picker(SearchKind::Tests),
             KeyCode::Backspace => self.edit_search(SearchKind::Tests, |query| {
                 query.pop();
             }),
@@ -3810,7 +3841,7 @@ impl App {
     fn open_test_confirm(&mut self) {
         let checked = self.test_search.checked();
         if checked.is_empty() {
-            self.error("Select at least one test class with Space");
+            self.error("Select at least one test class — focus results with Tab, then Space");
             return;
         }
         let entries = self
@@ -8948,10 +8979,12 @@ mod tests {
         app.tab = Tab::Tests;
         app.test_search.results = vec![SuggestionItem::new("ApexClass:DemoTest", "a.cls")];
         app.test_search.searched_query = Some(String::new());
+        assert_eq!(app.test_search.focus, SearchFocus::Input);
 
         // Typing goes to the input and does not check a result.
         app.handle_key(key(KeyCode::Char('D')));
         assert_eq!(app.test_search.query, "D");
+        assert_eq!(app.test_search.focus, SearchFocus::Input);
         assert!(app.test_search.selected.is_empty());
 
         // Space in the input types a space; it does not check a result.
@@ -8968,6 +9001,138 @@ mod tests {
         app.handle_key(key(KeyCode::Char('X')));
         assert_eq!(app.test_search.focus, SearchFocus::Input);
         assert_eq!(app.test_search.query, "D X");
+
+        // Navigation keys hand focus to the list so the next Space selects.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.test_search.focus, SearchFocus::List);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.test_search.focus, SearchFocus::List);
+    }
+
+    #[test]
+    fn enter_while_dirty_searches_and_focuses_results_without_confirm() {
+        for tab in [Tab::Retrieve, Tab::Tests] {
+            let mut app = test_app();
+            app.tab = tab;
+            let kind = if tab == Tab::Tests {
+                SearchKind::Tests
+            } else {
+                SearchKind::Transfer
+            };
+            // Simulate a typed but not-yet-searched query (the debounced reply has not arrived).
+            app.search_state_mut(kind).query = "Demo".to_owned();
+            app.search_state_mut(kind).mark_edited();
+            assert!(app.search_state(kind).needs_search());
+
+            app.handle_key(key(KeyCode::Enter));
+
+            assert!(
+                app.modal.is_none(),
+                "{tab:?}: Enter on a dirty query must not open confirm"
+            );
+            assert!(
+                app.search.has_pending(kind),
+                "{tab:?}: Enter must run the search"
+            );
+            assert_eq!(
+                app.search_state(kind).focus,
+                SearchFocus::List,
+                "{tab:?}: Enter-driven search focuses the results"
+            );
+            assert_eq!(app.search_state(kind).query, "Demo");
+        }
+    }
+
+    #[test]
+    fn search_reply_does_not_steal_focus_from_the_input() {
+        let mut app = test_app();
+        app.tab = Tab::Retrieve;
+        app.handle_key(key(KeyCode::Char('D')));
+        assert_eq!(app.transfer_search.focus, SearchFocus::Input);
+
+        let request = SearchRequest {
+            kind: SearchKind::Transfer,
+            generation: app.search.generation(SearchKind::Transfer),
+            scope: SearchScope {
+                root: app.suggestion_root(),
+                retrieve: app.transfer_search.retrieve,
+                org: None,
+            },
+            query: "D".to_owned(),
+            cursor_value: None,
+            checked: Vec::new(),
+        };
+        app.on_event(AppEvent::SearchResults(SearchReply {
+            request,
+            outcome: Ok(vec![SuggestionItem::new("ApexClass:Demo", "a.cls")]),
+        }));
+        assert_eq!(app.transfer_search.searched_query.as_deref(), Some("D"));
+        assert_eq!(
+            app.transfer_search.focus,
+            SearchFocus::Input,
+            "a debounced reply must not auto-focus the list"
+        );
+        // Space still types a space after the mid-query pause.
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.transfer_search.query, "D ");
+    }
+
+    #[tokio::test]
+    async fn multi_word_query_results_arrive_after_enter_search() {
+        let mut app = App::new(
+            Startup {
+                installation: None,
+                version: None,
+                current_org: None,
+                notices: Vec::new(),
+            },
+            Config::default(),
+            std::path::PathBuf::from("/tmp/sftui-test"),
+        );
+        app.tab = Tab::Retrieve;
+        install_test_index(
+            &mut app,
+            vec![
+                "ApexClass:DemoController".to_owned(),
+                "ApexClass:DemoTest".to_owned(),
+            ],
+        );
+
+        // A multi-word query: the space is typed into the input, then Enter searches.
+        app.handle_key(key(KeyCode::Char('D')));
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(key(KeyCode::Char('m')));
+        app.handle_key(key(KeyCode::Char('o')));
+        app.handle_key(key(KeyCode::Char(' ')));
+        app.handle_key(key(KeyCode::Char('T')));
+        app.handle_key(key(KeyCode::Char('e')));
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(app.transfer_search.query, "Demo Test");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.transfer_search.focus, SearchFocus::List);
+        assert!(app.modal.is_none());
+
+        tokio::time::sleep(SUGGESTION_DEBOUNCE + Duration::from_millis(40)).await;
+        app.tick().await;
+        let mut applied = false;
+        for _ in 0..40 {
+            if let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_millis(100), app.recv_event()).await
+            {
+                app.on_event(event);
+                if app.transfer_search.searched_query.as_deref() == Some("Demo Test") {
+                    applied = true;
+                    break;
+                }
+            }
+        }
+        assert!(applied, "the multi-word query must return results");
+        assert!(!app.transfer_search.results.is_empty());
+        // Enter-driven focus survives the reply, so Space selects immediately.
+        assert_eq!(app.transfer_search.focus, SearchFocus::List);
+        app.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(app.transfer_search.checked().len(), 1);
     }
 
     #[test]

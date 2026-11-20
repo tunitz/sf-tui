@@ -9,8 +9,8 @@ use ratatui::widgets::{
 };
 
 use crate::app::{
-    App, CreateWizardState, JobDetailView, JobSection, JobsFocus, Modal, ResultItem, Tab,
-    TestHistoryFocus,
+    App, CreateWizardState, JobDetailView, JobSection, JobsFocus, Modal, ResultItem, SearchFocus,
+    Tab, TestHistoryFocus,
 };
 use crate::json_view;
 use crate::sf::create::FieldKey;
@@ -107,6 +107,45 @@ fn pane_block(title: impl Into<String>, app: &App, focused: bool) -> Block<'stat
         } else {
             Style::default().fg(Color::DarkGray)
         })
+}
+
+/// Search field row for a results picker. A focused field shows an accent label and a block
+/// caret; an unfocused field is dimmed so the results pane visibly owns the keyboard.
+fn search_line(
+    placeholder: &str,
+    query: &str,
+    searching: bool,
+    focused: bool,
+    app: &App,
+) -> Line<'static> {
+    let text = if query.is_empty() {
+        placeholder.to_owned()
+    } else {
+        query.to_owned()
+    };
+    let label_style = if focused {
+        Style::default()
+            .fg(accent(app))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let value_style = if focused && !query.is_empty() {
+        Style::default().fg(Color::Reset)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut spans = vec![
+        Span::styled("Search: ", label_style),
+        Span::styled(
+            format!("{text}{}", if searching { " …" } else { "" }),
+            value_style,
+        ),
+    ];
+    if focused {
+        spans.push(Span::styled("▌", Style::default().fg(accent(app))));
+    }
+    Line::from(spans)
 }
 
 fn faint(text: impl Into<String>) -> Span<'static> {
@@ -538,6 +577,16 @@ const KEYMAP: &[KeyBinding] = &[
         help: "raw output · JSON for a finished job",
     },
     KeyBinding {
+        cap: "Tab",
+        hints: &[
+            (HintContext::Transfer, "focus"),
+            (HintContext::Tests, "focus"),
+        ],
+        order: 3,
+        help_key: "Tab (search)",
+        help: "switch focus between the search field and results; Space selects the highlighted result when results have focus; typing returns focus to the search field",
+    },
+    KeyBinding {
         cap: "Space",
         hints: &[
             (HintContext::Transfer, "select"),
@@ -545,7 +594,7 @@ const KEYMAP: &[KeyBinding] = &[
         ],
         order: 3,
         help_key: "Space (search/confirm)",
-        help: "select a component, test class or row",
+        help: "select the highlighted component, test class or row when the results pane has focus",
     },
     KeyBinding {
         cap: "",
@@ -665,12 +714,12 @@ fn keycap_pairs_line(
     let mut used = 0usize;
     for (key, label) in pairs {
         let piece = key.chars().count() + label.chars().count() + 3;
-        let separator = if spans.is_empty() { 0 } else { 2 };
+        let separator = if spans.is_empty() { 0 } else { 1 };
         if used + separator + piece > width {
             break;
         }
         if separator > 0 {
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
             used += separator;
         }
         spans.push(Span::styled(
@@ -761,19 +810,14 @@ fn draw_tests(frame: &mut Frame, area: Rect, app: &App) {
         ));
     }
     frame.render_widget(Line::from(header), sections[0]);
-    let query = if state.query.is_empty() {
-        "type a test class name".to_owned()
-    } else {
-        state.query.clone()
-    };
     frame.render_widget(
-        Line::from(vec![
-            strong("Search: ", accent(app)),
-            Span::styled(
-                format!("{}{}", query, if state.searching { " …" } else { "" }),
-                Style::default().fg(Color::Reset),
-            ),
-        ]),
+        search_line(
+            "type a test class name",
+            &state.query,
+            state.searching,
+            state.focus == SearchFocus::Input,
+            app,
+        ),
         sections[1],
     );
 
@@ -833,7 +877,9 @@ fn render_test_list(
         list_state.select(Some(state.cursor.min(state.results.len() - 1)));
     }
     frame.render_stateful_widget(
-        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        List::new(items)
+            .block(pane_block("Results", app, state.focus == SearchFocus::List))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
         area,
         &mut list_state,
     );
@@ -1117,19 +1163,14 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
     frame.render_widget(Line::from(heading), sections[0]);
-    let query = if state.query.is_empty() {
-        "type a component name".to_owned()
-    } else {
-        state.query.clone()
-    };
     frame.render_widget(
-        Line::from(vec![
-            strong("Search: ", accent(app)),
-            Span::styled(
-                format!("{query}{}", if state.searching { " …" } else { "" }),
-                Style::default().fg(Color::Reset),
-            ),
-        ]),
+        search_line(
+            "type a component name",
+            &state.query,
+            state.searching,
+            state.focus == SearchFocus::Input,
+            app,
+        ),
         sections[1],
     );
     let items: Vec<ListItem> = state
@@ -1169,7 +1210,9 @@ fn draw_transfer(frame: &mut Frame, area: Rect, app: &App) {
         list_state.select(Some(state.cursor.min(state.results.len() - 1)));
     }
     frame.render_stateful_widget(
-        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        List::new(items)
+            .block(pane_block("Results", app, state.focus == SearchFocus::List))
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
         sections[2],
         &mut list_state,
     );
@@ -3707,5 +3750,66 @@ mod tests {
             progress: Some((1, 4)),
         };
         assert!((coverage_percent(&fallback) - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn picker_focus_indicator_renders_in_both_states() {
+        use crate::config::Config;
+        use crate::sf::Startup;
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(
+            Startup {
+                installation: None,
+                version: None,
+                current_org: None,
+                notices: Vec::new(),
+            },
+            Config::default(),
+            std::path::PathBuf::from("/tmp/sftui-ui-test"),
+        );
+        app.tab = Tab::Retrieve;
+        app.transfer_search.query = "Demo".to_owned();
+        app.transfer_search.searched_query = Some("Demo".to_owned());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("terminal");
+
+        // Input focused: an accent caret marks the search field, the results pane is unfocused.
+        app.transfer_search.focus = SearchFocus::Input;
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let input_focused: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            input_focused.contains('▌'),
+            "focused search field must show a caret"
+        );
+        assert!(
+            !input_focused.contains(" Results "),
+            "unfocused results pane must not use the accented title"
+        );
+
+        // List focused: no caret, and the results block shows its accented title.
+        app.transfer_search.focus = SearchFocus::List;
+        terminal.draw(|frame| draw(frame, &app)).expect("draw");
+        let list_focused: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            !list_focused.contains('▌'),
+            "unfocused search field must not show a caret"
+        );
+        assert!(
+            list_focused.contains(" Results "),
+            "focused results pane must show a titled, accented block"
+        );
     }
 }
